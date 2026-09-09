@@ -4,6 +4,14 @@ includes:
 parameters:
     paths:
         - app
+        # Fixtures only, not all of tests/: this makes the fixture model a
+        # real consumer of BelongsToMerchant, so the trait gets analysed —
+        # it has no production user until merchant-owned domain tables land
+        # next phase, and an unanalysed trait is exactly where a tenancy bug
+        # would hide. The rest of tests/ is excluded because Pest's closure
+        # binding ($this in a test closure) isn't statically resolvable and
+        # produces only false positives.
+        - tests/Fixtures
 
     level: 5
 

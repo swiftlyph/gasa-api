@@ -35,11 +35,18 @@ The per-audience middleware groups are filled:
 
 | Group          | Middleware                          |
 | -------------- | ------------------------------------ |
-| `admin.api`    | `auth:sanctum`, `role:platform_admin` |
+| `admin.api`    | `auth:sanctum`, `role:platform_admin`, `AllowsAdminContext` |
 | `company.api`  | `auth:sanctum`, `role:company_admin`  |
 | `employee.api` | `auth:sanctum`, `role:employee`       |
-| `merchant.api` | `auth:sanctum`, `role:merchant`       |
+| `merchant.api` | `auth:sanctum`, `role:merchant`, `EnsureMerchantActive` |
 | `public.api`   | *(none)*                              |
+
+Order matters in the two tenant-aware groups. `AllowsAdminContext` runs
+**after** `role:platform_admin`, so the tenancy bypass is only granted to a
+request that already proved it's an admin. `EnsureMerchantActive` runs
+**after** `role:merchant`, so a non-merchant gets a plain `forbidden`
+rather than `merchant_inactive` — the latter would confirm the route exists
+for merchants and invite probing.
 
 Routes reachable by **any** authenticated role regardless of portal
 (currently `/auth/me`, `/auth/logout`) live in `routes/api/v1/auth.php`,
@@ -112,6 +119,7 @@ header — never a redirect.
 | 401    | `invalid_credentials`  | `/auth/login` — email not found, or wrong password             |
 | 403    | `portal_forbidden`     | `/auth/login` — valid credentials, but wrong `portal` for role  |
 | 403    | `forbidden`            | Authenticated, but role/policy check failed (e.g. wrong portal's `/whoami`) |
+| 403    | `merchant_inactive`    | Merchant portal, but the user has no merchant or theirs isn't `active` |
 | 404    | `not_found`            | Route or model not found                                        |
 | 422    | `validation_failed`    | FormRequest validation failure                                  |
 | 429    | `too_many_attempts`    | `/auth/login` — 6th+ attempt from the same email+IP within a minute |
@@ -141,6 +149,28 @@ wrapping setting. So the actual contract, going forward:
 This is why: don't "fix" a paginated endpoint that returns a wrapped
 shape later — that's correct, expected Laravel behavior, not a
 regression from the `withoutWrapping()` call above.
+
+#### The user payload
+
+`GET /auth/me` and `login`'s `user` return the same flat shape:
+
+```json
+{
+  "id": 1,
+  "name": "Merchant",
+  "email": "merchant@gasa.test",
+  "roles": ["merchant"],
+  "merchant": { "id": 1, "name": "Merchant One", "status": "active" }
+}
+```
+
+`merchant` is `null` for any user with no merchant membership (platform
+admins, company admins, employees). It is **present regardless of status** —
+a `pending` or `suspended` merchant still gets the object, with the status
+that applies. That's deliberate: a suspended merchant is blocked from every
+merchant route with 403 `merchant_inactive`, but `/auth/me` keeps working so
+the frontend can read `merchant.status` and render a suspended screen rather
+than bouncing the user back to login.
 
 ### CORS
 
@@ -200,6 +230,61 @@ per role, idempotent (`updateOrCreate` by email, safe to re-run):
 | `company@gasa.test`     | `password` | `company_admin`  |
 | `employee@gasa.test`    | `password` | `employee`       |
 | `merchant@gasa.test`    | `password` | `merchant`       |
+| `merchant2@gasa.test`   | `password` | `merchant`       |
+| `suspended@gasa.test`   | `password` | `merchant`       |
+
+The three merchant accounts each own one merchant, which is what makes
+cross-tenant behavior checkable by hand:
+
+| Account                 | Merchant             | Status      |
+| ----------------------- | -------------------- | ----------- |
+| `merchant@gasa.test`    | Merchant One         | `active`    |
+| `merchant2@gasa.test`   | Merchant Two         | `active`    |
+| `suspended@gasa.test`   | Suspended Merchant   | `suspended` |
+
+Two active merchants exist on purpose: with only one, correct scoping and
+no scoping at all look identical. `suspended@gasa.test` drives the 403
+`merchant_inactive` path and the frontend's suspended screen.
+
+## Tenancy
+
+Merchant is the first tenant type. Tenant identity **always** derives from
+the authenticated user — nothing in the tenancy path reads request input,
+so a `merchant_id` in a payload is never authoritative.
+
+Any model with a `merchant_id` column gets automatic scoping by applying
+`App\Domains\Shared\Concerns\BelongsToMerchant`, which:
+
+1. adds a global scope restricting every query to the authenticated user's
+   **active** merchant;
+2. stamps `merchant_id` on create, **overwriting** whatever was
+   mass-assigned;
+3. bypasses both, and only, in platform-admin context.
+
+Three rules that are load-bearing rather than incidental:
+
+- **No tenant means no rows, never all rows.** An unauthenticated request,
+  a company admin, or a merchant whose account is pending/suspended matches
+  *zero* rows — the scope applies an always-false condition rather than
+  skipping itself. A missing tenant must never silently widen a query.
+- **The admin bypass is context, not role.** `AllowsAdminContext` sets a
+  flag on the `admin.api` group; the trait checks only that flag and never
+  asks whether a user is an admin. A platform admin hitting a merchant
+  route goes through `merchant.api`, never gets the flag, and stays scoped
+  like anyone else (in practice they get a 403 from `role:merchant` first).
+- **Tenant resolution is lazy.** A global scope is registered once per
+  model class per process, but the authenticated user differs per request,
+  so the merchant id is read at query time — never captured at boot.
+
+`User::merchant()` returns the user's single **active** merchant or null;
+membership itself is the `merchant_user` pivot, never a column on `users`,
+so a user can gain merchant team members later without a schema change.
+
+All of this is enforced by `tests/Feature/TenantLeakageTest.php`, which is
+permanent and only grows: every later phase that adds a tenant-owned table
+adds its cases there rather than starting a new file. Because no
+merchant-owned domain tables exist yet, the trait is tested against a
+test-only fixture (`tests/Fixtures/`) rather than a premature domain model.
 
 ## Local setup
 
@@ -207,17 +292,44 @@ per role, idempotent (`updateOrCreate` by email, safe to re-run):
 composer install
 cp .env.example .env
 php artisan key:generate
+# one-time: the dedicated test database (prompts for the gasa password)
+createdb -h 127.0.0.1 -U gasa -O gasa gasa_api_test
+
 php artisan migrate --seed   # needs a real Postgres connection (see below)
-composer test                # runs the Pest suite (sqlite, no external DB needed)
+composer test                # runs the Pest suite against gasa_api_test
 composer lint                # Pint, style check only
 composer analyse              # Larastan static analysis
 ```
 
 The app expects PostgreSQL 16 (`DB_CONNECTION=pgsql`) and Redis for cache
-and queues in real environments — `php artisan migrate` needs a database
-that actually exists and a role with privileges on it. The Pest suite
-runs against an in-memory SQLite database regardless (see `phpunit.xml`),
-so `composer test` alone needs no external database at all.
+and queues — `php artisan migrate` needs a database that actually exists
+and a role with privileges on it.
+
+### The test database
+
+**The Pest suite runs against real PostgreSQL, not SQLite.** It uses a
+dedicated `gasa_api_test` database (see `phpunit.xml`), which
+`RefreshDatabase` drops every table in on each run — so it must never
+point at a database holding anything you care about, least of all the
+`gasa` development database.
+
+This is deliberate. On SQLite the test database would differ from
+production in exactly the places auth and tenancy depend on:
+
+| Behavior | PostgreSQL | SQLite |
+| -------- | ---------- | ------ |
+| `merchants.status` CHECK constraint | enforced | absent |
+| `citext` case-insensitive email | enforced by the column | emulated by a `lower(email)` index |
+| `LIKE` case sensitivity | case-sensitive | case-insensitive |
+
+Green tests against SQLite would have been green against a *different*
+database than the deployed one. Running on Postgres means a constraint
+violation fails in CI rather than in production.
+
+The `phpunit.xml` values are defaults, not hardcoded — PHPUnit's `env`
+elements don't override a real environment variable unless marked
+`force`, so CI can point `DB_HOST`/`DB_DATABASE` at its own Postgres
+service without editing the file.
 
 ---
 

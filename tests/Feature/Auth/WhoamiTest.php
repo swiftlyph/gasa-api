@@ -1,11 +1,29 @@
 <?php
 
 use App\Domains\Auth\Models\User;
+use App\Domains\Merchant\Models\Merchant;
 use Database\Seeders\RoleSeeder;
 
 beforeEach(function () {
     $this->seed(RoleSeeder::class);
 });
+
+/**
+ * The merchant portal additionally requires an ACTIVE merchant
+ * (EnsureMerchantActive), so merchant users in these tests need one to
+ * reach their own portal. The "no/suspended merchant" paths are covered
+ * in TenantLeakageTest, not here — this file is about role routing.
+ */
+function makeUserWithRole(string $role): User
+{
+    $user = User::factory()->withRole($role)->create();
+
+    if ($role === 'merchant') {
+        Merchant::factory()->ownedBy($user)->create();
+    }
+
+    return $user;
+}
 
 $portals = [
     'admin' => 'platform_admin',
@@ -16,7 +34,7 @@ $portals = [
 
 foreach ($portals as $portal => $role) {
     test("a {$role} can reach /api/v1/{$portal}/whoami", function () use ($portal, $role) {
-        $user = User::factory()->withRole($role)->create();
+        $user = makeUserWithRole($role);
         $token = $user->createToken($portal)->plainTextToken;
 
         $response = $this->withToken($token)->getJson("/api/v1/{$portal}/whoami");
@@ -30,7 +48,7 @@ foreach ($portals as $portal => $role) {
         }
 
         test("a {$role} gets 403 hitting /api/v1/{$otherPortal}/whoami", function () use ($role, $otherPortal) {
-            $user = User::factory()->withRole($role)->create();
+            $user = makeUserWithRole($role);
             $token = $user->createToken('token')->plainTextToken;
 
             $response = $this->withToken($token)->getJson("/api/v1/{$otherPortal}/whoami");

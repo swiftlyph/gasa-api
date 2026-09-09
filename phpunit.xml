@@ -23,8 +23,28 @@
         <env name="BCRYPT_ROUNDS" value="4"/>
         <env name="BROADCAST_CONNECTION" value="null"/>
         <env name="CACHE_STORE" value="array"/>
-        <env name="DB_CONNECTION" value="sqlite"/>
-        <env name="DB_DATABASE" value=":memory:"/>
+        <!--
+            The suite runs against real PostgreSQL, not sqlite, so tests
+            exercise the same database as production: the merchants status
+            CHECK constraint, the citext email column, and Postgres LIKE
+            case semantics all exist here but do NOT exist on sqlite.
+            Green tests on sqlite would be green against a database that
+            differs from the deployed one in exactly the places tenancy and
+            auth care about.
+
+            DB_DATABASE is a DEDICATED database (gasa_api_test), never the
+            development one — RefreshDatabase drops every table in whatever
+            it points at. The name is deliberately project-specific: this
+            box hosts several unrelated apps, and a generic name like
+            "gasa_testing" already belonged to a different schema.
+            See README § Local setup for the one-line create.
+
+            These are defaults, not hardcoded: a real environment variable
+            still wins (forceless `env` elements), so CI can point the
+            suite at its own Postgres service without editing this file.
+        -->
+        <env name="DB_CONNECTION" value="pgsql"/>
+        <env name="DB_DATABASE" value="gasa_api_test"/>
         <env name="DB_URL" value=""/>
         <env name="MAIL_MAILER" value="array"/>
         <env name="QUEUE_CONNECTION" value="sync"/>

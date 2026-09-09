@@ -20,7 +20,7 @@ class AuthController
 
         return response()->json([
             'token' => $result['token']->plainTextToken,
-            'user' => new UserResource($result['user']->load('roles')),
+            'user' => new UserResource($result['user']->load(['roles', 'merchants'])),
         ]);
     }
 
@@ -29,7 +29,7 @@ class AuthController
         /** @var User $user */
         $user = $request->user();
 
-        return new UserResource($user->load('roles'));
+        return new UserResource($user->load(['roles', 'merchants']));
     }
 
     public function logout(Request $request, LogoutAction $action): JsonResponse

@@ -2,6 +2,7 @@
 
 namespace App\Providers;
 
+use App\Domains\Shared\Concerns\TenantContext;
 use Illuminate\Cache\RateLimiting\Limit;
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
@@ -15,7 +16,12 @@ class AppServiceProvider extends ServiceProvider
      */
     public function register(): void
     {
-        //
+        // Request-scoped tenancy state. Singleton so the admin-bypass flag
+        // set by AllowsAdminContext is visible to every global scope in the
+        // same request; the container is rebuilt per request in production,
+        // so it does not leak between them. (Tests share one app across
+        // sequential calls — see TenantContext's note in the test suite.)
+        $this->app->singleton(TenantContext::class);
     }
 
     /**

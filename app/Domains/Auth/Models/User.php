@@ -2,8 +2,11 @@
 
 namespace App\Domains\Auth\Models;
 
+use App\Domains\Merchant\Enums\MerchantStatus;
+use App\Domains\Merchant\Models\Merchant;
 use Database\Factories\UserFactory;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
@@ -62,4 +65,48 @@ class User extends Authenticatable
             'password' => 'hashed',
         ];
     }
+
+    /**
+     * Merchant membership is a pivot, never a column on users — a user may
+     * later belong to several merchants as a team member.
+     *
+     * @return BelongsToMany<Merchant, $this>
+     */
+    public function merchants(): BelongsToMany
+    {
+        return $this->belongsToMany(Merchant::class)
+            ->withPivot('role_in_merchant')
+            ->withTimestamps();
+    }
+
+    /**
+     * The user's single ACTIVE merchant, or null.
+     *
+     * One merchant per user for now; the pivot already supports more, so
+     * this deliberately returns the first active one rather than assuming
+     * exactly one exists. Pending and suspended merchants resolve to null,
+     * which is what makes BelongsToMerchant match nothing and
+     * EnsureMerchantActive return 403 for those accounts.
+     *
+     * Memoized: BelongsToMerchant calls this on every scoped query, so an
+     * unmemoized version would issue a DB round-trip per query. Null is
+     * cached too (via the separate flag) so the no-merchant case doesn't
+     * re-query either.
+     */
+    public function merchant(): ?Merchant
+    {
+        if (! $this->merchantResolved) {
+            $this->resolvedMerchant = $this->merchants()
+                ->where('merchants.status', MerchantStatus::Active->value)
+                ->first();
+
+            $this->merchantResolved = true;
+        }
+
+        return $this->resolvedMerchant;
+    }
+
+    private ?Merchant $resolvedMerchant = null;
+
+    private bool $merchantResolved = false;
 }
