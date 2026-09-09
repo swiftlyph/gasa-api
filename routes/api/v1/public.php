@@ -1,5 +1,6 @@
 <?php
 
+use App\Domains\Auth\Http\Controllers\AuthController;
 use App\Domains\Shared\Http\Controllers\HealthController;
 use Illuminate\Support\Facades\Route;
 
@@ -14,3 +15,7 @@ use Illuminate\Support\Facades\Route;
 */
 
 Route::get('/health', HealthController::class)->name('health');
+
+Route::post('/auth/login', [AuthController::class, 'login'])
+    ->middleware('throttle:login')
+    ->name('auth.login');

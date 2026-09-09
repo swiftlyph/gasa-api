@@ -7,10 +7,12 @@ use Illuminate\Support\Facades\Route;
 | Merchant API Routes
 |--------------------------------------------------------------------------
 |
-| Routes for the merchant audience. Middleware stack filled in a later
-| phase.
+| Routes for the merchant audience, behind auth:sanctum + role:merchant
+| (see bootstrap/app.php).
 |
 */
 
-Route::get('/merchant/_ping', fn () => response()->json(['pong' => 'merchant']))
-    ->name('merchant.ping');
+// Temporary — proves the auth:sanctum + role:merchant stack works.
+// Replaced by real merchant endpoints in a later phase.
+Route::get('/whoami', fn () => response()->json(['portal' => 'merchant']))
+    ->name('merchant.whoami');

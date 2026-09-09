@@ -2,16 +2,24 @@
 
 namespace Database\Factories;
 
-use App\Models\User;
+use App\Domains\Auth\Models\User;
 use Illuminate\Database\Eloquent\Factories\Factory;
 use Illuminate\Support\Facades\Hash;
-use Illuminate\Support\Str;
 
 /**
  * @extends Factory<User>
  */
 class UserFactory extends Factory
 {
+    /**
+     * Factory::modelName() guesses the model from this factory's own
+     * namespace tail (Database\Factories\UserFactory → App\User), which
+     * doesn't exist under our Domains layout. Point it at the real model.
+     *
+     * @var class-string<User>
+     */
+    protected $model = User::class;
+
     /**
      * The current password being used by the factory.
      */
@@ -27,19 +35,18 @@ class UserFactory extends Factory
         return [
             'name' => fake()->name(),
             'email' => fake()->unique()->safeEmail(),
-            'email_verified_at' => now(),
             'password' => static::$password ??= Hash::make('password'),
-            'remember_token' => Str::random(10),
         ];
     }
 
     /**
-     * Indicate that the model's email address should be unverified.
+     * Attach the given role once the user is created. The role must
+     * already exist (see RoleSeeder) — this factory never creates roles.
      */
-    public function unverified(): static
+    public function withRole(string $role): static
     {
-        return $this->state(fn (array $attributes) => [
-            'email_verified_at' => null,
-        ]);
+        return $this->afterCreating(function (User $user) use ($role) {
+            $user->assignRole($role);
+        });
     }
 }

@@ -6,6 +6,7 @@ use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
 use Illuminate\Support\Facades\Route;
+use Spatie\Permission\Middleware\RoleMiddleware;
 
 return Application::configure(basePath: dirname(__DIR__))
     ->withRouting(
@@ -13,32 +14,42 @@ return Application::configure(basePath: dirname(__DIR__))
         commands: __DIR__.'/../routes/console.php',
         health: '/up',
         then: function (): void {
-            Route::prefix('api/v1')
+            Route::prefix('api/v1/admin')
                 ->middleware(['api', 'admin.api'])
                 ->group(base_path('routes/api/v1/admin.php'));
 
-            Route::prefix('api/v1')
+            Route::prefix('api/v1/company')
                 ->middleware(['api', 'company.api'])
                 ->group(base_path('routes/api/v1/company.php'));
 
-            Route::prefix('api/v1')
+            Route::prefix('api/v1/employee')
                 ->middleware(['api', 'employee.api'])
                 ->group(base_path('routes/api/v1/employee.php'));
 
-            Route::prefix('api/v1')
+            Route::prefix('api/v1/merchant')
                 ->middleware(['api', 'merchant.api'])
                 ->group(base_path('routes/api/v1/merchant.php'));
 
             Route::prefix('api/v1')
                 ->middleware(['api', 'public.api'])
                 ->group(base_path('routes/api/v1/public.php'));
+
+            // Shared by every authenticated role — never duplicated per
+            // portal file.
+            Route::prefix('api/v1')
+                ->middleware(['api', 'auth:sanctum'])
+                ->group(base_path('routes/api/v1/auth.php'));
         },
     )
     ->withMiddleware(function (Middleware $middleware): void {
-        $middleware->group('admin.api', []);
-        $middleware->group('company.api', []);
-        $middleware->group('employee.api', []);
-        $middleware->group('merchant.api', []);
+        $middleware->alias([
+            'role' => RoleMiddleware::class,
+        ]);
+
+        $middleware->group('admin.api', ['auth:sanctum', 'role:platform_admin']);
+        $middleware->group('company.api', ['auth:sanctum', 'role:company_admin']);
+        $middleware->group('employee.api', ['auth:sanctum', 'role:employee']);
+        $middleware->group('merchant.api', ['auth:sanctum', 'role:merchant']);
         $middleware->group('public.api', []);
 
         $middleware->api(prepend: [

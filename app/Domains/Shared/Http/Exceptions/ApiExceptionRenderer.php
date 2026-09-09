@@ -5,6 +5,7 @@ namespace App\Domains\Shared\Http\Exceptions;
 use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Auth\AuthenticationException;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
+use Illuminate\Http\Exceptions\ThrottleRequestsException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Validation\ValidationException;
@@ -29,6 +30,7 @@ class ApiExceptionRenderer
     public function render(Throwable $e): JsonResponse
     {
         return match (true) {
+            $e instanceof ApiException => $this->json($e->getMessage(), $e->errorCode(), $e->status(), $e->errors()),
             $e instanceof AuthenticationException => $this->json('Unauthenticated.', 'unauthenticated', 401),
             $e instanceof AuthorizationException => $this->json('This action is unauthorized.', 'forbidden', 403),
             $e instanceof ValidationException => $this->json(
@@ -38,6 +40,11 @@ class ApiExceptionRenderer
                 $e->errors(),
             ),
             $e instanceof ModelNotFoundException => $this->json('Resource not found.', 'not_found', 404),
+            $e instanceof ThrottleRequestsException => $this->json(
+                $e->getMessage() ?: 'Too many attempts.',
+                'too_many_attempts',
+                429,
+            ),
             $e instanceof HttpExceptionInterface => $this->json(
                 $e->getMessage() ?: $this->defaultMessageFor($e->getStatusCode()),
                 $this->codeFor($e->getStatusCode()),

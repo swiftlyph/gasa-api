@@ -35,9 +35,14 @@ return [
     | are able to authenticate the request, Sanctum will use the bearer
     | token that's present on an incoming request for authentication.
     |
+    | Empty here: this API is bearer-token only, consumed cross-origin by
+    | frontends in separate repos — there's no first-party SPA sharing a
+    | session/cookie with this app, so the "web" session guard should
+    | never be checked before the bearer token.
+    |
     */
 
-    'guard' => ['web'],
+    'guard' => [],
 
     /*
     |--------------------------------------------------------------------------
