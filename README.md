@@ -80,6 +80,13 @@ always return **401 JSON** — never a redirect to `/login`. This is enforced
 globally: every `api/*` request forces an `Accept: application/json` header
 and exceptions render as JSON via `bootstrap/app.php`.
 
+> **Not yet exercised by a test.** This phase has no protected routes, so
+> the 401-JSON-never-redirect behavior can't actually be triggered yet.
+> The first phase that adds an `auth:sanctum` route (B2) must add a
+> feature test that hits a protected route with no token and asserts a
+> 401 response matching the error shape above — that's the first moment
+> this claim becomes testable.
+
 ### CORS
 
 Allowed origins are driven by the comma-separated `FRONTEND_ORIGINS` env var
