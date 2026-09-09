@@ -32,6 +32,18 @@ class OrderPolicy
         return $user->merchant() !== null;
     }
 
+    /**
+     * Checkout. There is no order to check ownership against yet, so this
+     * asks the only question that can be asked before one exists: does
+     * this user have an active merchant to sell on behalf of? The order's
+     * tenant is then stamped by BelongsToMerchant from that same user, so
+     * a pass here and the row's merchant_id can't disagree.
+     */
+    public function create(User $user): bool
+    {
+        return $user->merchant() !== null;
+    }
+
     public function view(User $user, Order $order): bool
     {
         return $this->ownsOrder($user, $order);

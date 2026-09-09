@@ -9,14 +9,13 @@ use App\Domains\Merchant\Models\Merchant;
 use App\Domains\Orders\Models\Order;
 use App\Domains\Shared\Concerns\TenantContext;
 use Illuminate\Database\Seeder;
-use Illuminate\Support\Collection;
 
 /**
- * One user per role for local development, plus a demo catalog and order
- * history for the two active merchants. Idempotent throughout —
- * `updateOrCreate` by email/name for users, products and merchants, and
- * orders are skipped entirely for a merchant that already has some, so
- * reseeding never duplicates or errors.
+ * One user per role for local development, plus a demo catalog
+ * (ProductSeeder) and order history for the two active merchants.
+ * Idempotent throughout — `updateOrCreate` by email/name for users,
+ * products and merchants, and orders are skipped entirely for a merchant
+ * that already has some, so reseeding never duplicates or errors.
  */
 class DevSeeder extends Seeder
 {
@@ -68,6 +67,10 @@ class DevSeeder extends Seeder
         // constraint. This is the sanctioned non-request use of the
         // bypass — see TenantContext::runInAdminContext().
         app(TenantContext::class)->runInAdminContext(function () use ($merchantOne, $merchantTwo, $users): void {
+            // Catalogs first: the demo orders below snapshot their lines
+            // from real products, so the menu has to exist before them.
+            $this->call(ProductSeeder::class);
+
             $this->seedCatalogAndOrders($merchantOne, $users['merchant@gasa.test']);
             $this->seedCatalogAndOrders($merchantTwo, $users['merchant2@gasa.test']);
         });
@@ -93,7 +96,8 @@ class DevSeeder extends Seeder
     }
 
     /**
-     * A small menu and a realistic spread of orders for one merchant.
+     * A realistic spread of orders for one merchant, priced off the menu
+     * ProductSeeder just laid down.
      *
      * The states are chosen so a frontend has something to render for
      * every branch it has to handle: an open ticket (pending), a closed
@@ -102,7 +106,13 @@ class DevSeeder extends Seeder
      */
     private function seedCatalogAndOrders(Merchant $merchant, User $cashier): void
     {
-        $products = $this->seedProducts($merchant);
+        // Only the sellable ones: an order priced off an unavailable
+        // product would be a fixture the checkout endpoint could never
+        // have produced.
+        $products = Product::query()
+            ->where('merchant_id', $merchant->getKey())
+            ->where('is_available', true)
+            ->get();
 
         // Idempotency guard. Orders can't be updateOrCreate'd the way the
         // rows above can — each one issues a fresh sequential number from
@@ -122,24 +132,5 @@ class DevSeeder extends Seeder
         $factory()->completed()->split()->withItems(1, $products, 2)->create();
 
         $factory()->voided($cashier)->gcash()->withItems(2, $products)->create();
-    }
-
-    /**
-     * @return Collection<int, Product>
-     */
-    private function seedProducts(Merchant $merchant): Collection
-    {
-        $menu = [
-            ['name' => 'Americano (12oz)', 'price_cents' => 9000],
-            ['name' => 'Cafe Latte (16oz)', 'price_cents' => 13500],
-            ['name' => 'Spanish Latte (16oz)', 'price_cents' => 15000],
-            ['name' => 'Matcha Latte (16oz)', 'price_cents' => 16500],
-            ['name' => 'Cold Brew (22oz)', 'price_cents' => 18000],
-        ];
-
-        return collect($menu)->map(fn (array $item) => Product::updateOrCreate(
-            ['merchant_id' => $merchant->getKey(), 'name' => $item['name']],
-            ['price_cents' => $item['price_cents'], 'currency' => 'PHP', 'is_available' => true],
-        ))->values();
     }
 }

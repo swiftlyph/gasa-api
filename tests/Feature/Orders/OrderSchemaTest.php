@@ -71,14 +71,75 @@ test('the database accepts every value the enums declare', function () {
     // perfectly valid write.
     foreach (OrderStatus::values() as $status) {
         foreach (PaymentMethod::values() as $method) {
+            // A split row has to carry its two halves to satisfy
+            // orders_split_payment_check, and every other method has to
+            // carry neither. Both sides of that are exercised here rather
+            // than only the easy one.
+            $split = $method === PaymentMethod::Split->value
+                ? ['cash_cents' => 4000, 'gcash_cents' => 6000]
+                : [];
+
             DB::table('orders')->insert(rawOrderRow($this->merchant->id, $this->user->id, [
                 'status' => $status,
                 'payment_method' => $method,
+                ...$split,
             ]));
         }
     }
 
     expect(DB::table('orders')->count())->toBe(9);
+});
+
+/**
+ * The split-payment invariant, asserted against the live constraint
+ * rather than the Action that usually upholds it. CheckoutAction turns
+ * these into a clean 422; this proves the database refuses them too, so
+ * anything that ever writes around the Action — a report, a manual data
+ * fix, a future service — cannot leave the books unbalanced.
+ */
+dataset('split constraint violations', [
+    'split whose halves fall short' => ['split', 4000, 5000],
+    'split whose halves overshoot' => ['split', 6000, 6000],
+    'split missing the cash half' => ['split', null, 10000],
+    'split missing the gcash half' => ['split', 10000, null],
+    'split missing both halves' => ['split', null, null],
+    'cash carrying a stray cash amount' => ['cash', 10000, null],
+    'cash carrying a stray gcash amount' => ['cash', null, 10000],
+    'gcash carrying both amounts' => ['gcash', 4000, 6000],
+]);
+
+test('the database rejects a split that does not balance', function (string $method, ?int $cash, ?int $gcash) {
+    expect(fn () => DB::table('orders')->insert(rawOrderRow($this->merchant->id, $this->user->id, [
+        'payment_method' => $method,
+        'subtotal_cents' => 10000,
+        'total_cents' => 10000,
+        'cash_cents' => $cash,
+        'gcash_cents' => $gcash,
+    ])))->toThrow(QueryException::class);
+})->with('split constraint violations');
+
+test('the database accepts a split that balances exactly', function () {
+    // Including an uneven one: the halves need not be equal, only exact.
+    DB::table('orders')->insert(rawOrderRow($this->merchant->id, $this->user->id, [
+        'payment_method' => 'split',
+        'subtotal_cents' => 10000,
+        'total_cents' => 10000,
+        'cash_cents' => 3333,
+        'gcash_cents' => 6667,
+    ]));
+
+    expect(DB::table('orders')->count())->toBe(1);
+});
+
+test('the split constraint holds on update, not just on insert', function () {
+    $order = Order::factory()->forMerchant($this->merchant)->split()->create();
+
+    // Moving the total without moving the halves is the realistic way this
+    // invariant gets broken later: an edit that adjusts one column and
+    // forgets the others.
+    expect(fn () => DB::table('orders')->where('id', $order->id)
+        ->update(['total_cents' => $order->total_cents + 500]))
+        ->toThrow(QueryException::class);
 });
 
 test('an order snapshot survives the product being repriced and renamed', function () {

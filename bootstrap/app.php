@@ -1,6 +1,7 @@
 <?php
 
 use App\Domains\Merchant\Http\Middleware\EnsureMerchantActive;
+use App\Domains\Orders\Console\PruneCheckoutIdempotencyKeysCommand;
 use App\Domains\Shared\Http\Exceptions\ApiExceptionRenderer;
 use App\Domains\Shared\Http\Middleware\AllowsAdminContext;
 use App\Domains\Shared\Http\Middleware\ForceJsonResponse;
@@ -44,6 +45,12 @@ return Application::configure(basePath: dirname(__DIR__))
                 ->group(base_path('routes/api/v1/auth.php'));
         },
     )
+    // Commands live in their domain rather than app/Console/Commands, so
+    // Laravel's directory auto-discovery doesn't find them — each one is
+    // registered here explicitly.
+    ->withCommands([
+        PruneCheckoutIdempotencyKeysCommand::class,
+    ])
     ->withMiddleware(function (Middleware $middleware): void {
         $middleware->alias([
             'role' => RoleMiddleware::class,

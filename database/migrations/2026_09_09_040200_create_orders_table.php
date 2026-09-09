@@ -51,11 +51,14 @@ return new class extends Migration
 
             // Split payments only: how the total was divided. Null for a
             // pure cash or pure gcash order, so "not a split" and "a split
-            // of zero" can't be confused. P2's checkout enforces
-            // cash_cents + gcash_cents === total_cents when the method is
-            // `split`; it is not a CHECK here because the catalog/checkout
-            // phase owns that validation and may need to relax it for
-            // partial refunds.
+            // of zero" can't be confused.
+            //
+            // The rule that cash_cents + gcash_cents === total_cents for a
+            // split (and that both are null otherwise) is enforced by a
+            // CHECK constraint added in
+            // 2026_09_09_050000_add_split_payment_check_to_orders_table —
+            // deferred to that migration because P2's checkout is what
+            // owns writing these columns.
             $table->integer('cash_cents')->nullable();
             $table->integer('gcash_cents')->nullable();
 
