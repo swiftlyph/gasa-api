@@ -13,6 +13,15 @@ parameters:
         # produces only false positives.
         - tests/Fixtures
 
+        # Factories and seeders are application code with real logic in
+        # them — a tenancy bypass, a transaction-scoped counter, states
+        # that must stay internally consistent. Leaving them unanalysed
+        # already cost us once: a closure missing its `use ($users)` made
+        # the seeder pass a null cashier on every order, and the data
+        # still looked right because a fallback quietly covered for it.
+        - database/factories
+        - database/seeders
+
     level: 5
 
     tmpDir: storage/framework/phpstan

@@ -39,7 +39,20 @@ class ApiExceptionRenderer
                 $e->status,
                 $e->errors(),
             ),
-            $e instanceof ModelNotFoundException => $this->json('Resource not found.', 'not_found', 404),
+            // Both the raw exception and the NotFoundHttpException that
+            // Laravel wraps it in on the route-model-binding path. Without
+            // the getPrevious() arm, a missing bound model falls through to
+            // the HttpExceptionInterface case below and renders Laravel's
+            // internal message verbatim — "No query results for model
+            // [App\Domains\Orders\Models\Order] 7", which publishes our
+            // namespace layout to anyone who guesses a URL and contradicts
+            // the documented 404 body.
+            $e instanceof ModelNotFoundException,
+            $e->getPrevious() instanceof ModelNotFoundException => $this->json(
+                'Resource not found.',
+                'not_found',
+                404,
+            ),
             $e instanceof ThrottleRequestsException => $this->json(
                 $e->getMessage() ?: 'Too many attempts.',
                 'too_many_attempts',

@@ -1,5 +1,14 @@
 <?php
 
+use App\Domains\CashSessions\Http\Controllers\CashMovementController;
+use App\Domains\CashSessions\Http\Controllers\CashRemittanceController;
+use App\Domains\CashSessions\Http\Controllers\CashSessionController;
+use App\Domains\CashSessions\Http\Controllers\RegisterController;
+use App\Domains\Orders\Http\Controllers\CheckoutController;
+use App\Domains\Orders\Http\Controllers\KitchenQueueController;
+use App\Domains\Orders\Http\Controllers\MenuController;
+use App\Domains\Orders\Http\Controllers\OrderController;
+use App\Domains\Orders\Http\Controllers\OrderTransitionController;
 use Illuminate\Support\Facades\Route;
 
 /*
@@ -7,8 +16,11 @@ use Illuminate\Support\Facades\Route;
 | Merchant API Routes
 |--------------------------------------------------------------------------
 |
-| Routes for the merchant audience, behind auth:sanctum + role:merchant
-| (see bootstrap/app.php).
+| Routes for the merchant audience, behind auth:sanctum + role:merchant +
+| EnsureMerchantActive (see bootstrap/app.php). Every route here is
+| automatically tenant-scoped: {order} resolves through
+| BelongsToMerchant's global scope, so another merchant's id is a 404
+| rather than a 403 — a 403 would confirm the order exists.
 |
 */
 
@@ -16,3 +28,85 @@ use Illuminate\Support\Facades\Route;
 // Replaced by real merchant endpoints in a later phase.
 Route::get('/whoami', fn () => response()->json(['portal' => 'merchant']))
     ->name('merchant.whoami');
+
+// The POS product list. A read-only projection of the shared `products`
+// table for the till — product management belongs to the catalog module,
+// in its own namespace, and must not be added here.
+Route::get('/menu', MenuController::class)->name('merchant.menu');
+
+// The kitchen screen. A read-only VIEW over pending orders — there is no
+// kitchen queue table and no kitchen-specific status. Completing a ticket
+// goes through the ordinary transition endpoint below, so the transition
+// map stays the only thing that decides what a legal status change is.
+//
+// Polled on a timer (no websockets yet), so both routes are pure reads.
+Route::prefix('kitchen-queue')->name('merchant.kitchen-queue.')->group(function (): void {
+    // Declared before the bare route purely for reading order; neither is
+    // parameterised, so they cannot collide.
+    Route::get('/summary', [KitchenQueueController::class, 'summary'])->name('summary');
+    Route::get('/', [KitchenQueueController::class, 'index'])->name('index');
+});
+
+Route::prefix('orders')->name('merchant.orders.')->group(function (): void {
+    Route::get('/', [OrderController::class, 'index'])->name('index');
+
+    // Checkout. Declared before the /{order} routes purely for reading
+    // order; it can't collide with them, since those are GET/POST on a
+    // parameter segment.
+    Route::post('/', CheckoutController::class)->name('store');
+
+    Route::get('/{order}', [OrderController::class, 'show'])->name('show');
+
+    // POST, not PATCH: these are named operations on an order, not
+    // arbitrary edits to its status field. There is deliberately no route
+    // that sets `status` directly — every status change goes through the
+    // transition map (see App\Domains\Orders\Enums\OrderStatus).
+    Route::post('/{order}/complete', [OrderTransitionController::class, 'complete'])->name('complete');
+    Route::post('/{order}/void', [OrderTransitionController::class, 'void'])->name('void');
+});
+
+// Note for later phases: there is NO DELETE route for an order, and there
+// must never be one. Orders are financial records — voiding is the
+// reversal, and it is terminal.
+
+// Registers. Listing only this phase — see App\Domains\CashSessions\
+// Models\Register's docblock for why there is no register CRUD here.
+Route::get('/registers', [RegisterController::class, 'index'])->name('merchant.registers.index');
+
+// Cash sessions, movements and remittances (P4). A cash session is a
+// till-shift: opened with a float, closed with a count. Movements and
+// remittances are always created against an explicit session, never
+// addressed on their own, which is why their routes are nested under
+// /cash-sessions/{cashSession}/... rather than living at their own
+// top-level prefix.
+Route::prefix('cash-sessions')->name('merchant.cash-sessions.')->group(function (): void {
+    Route::post('/', [CashSessionController::class, 'open'])->name('open');
+    Route::get('/', [CashSessionController::class, 'index'])->name('index');
+
+    // MUST be declared before /{cashSession}: unlike the static routes
+    // elsewhere in this file, this one really would collide the other way
+    // round — Laravel matches routes in declaration order, so "current"
+    // would otherwise be swallowed by {cashSession} and looked up as if
+    // it were an id.
+    Route::get('/current', [CashSessionController::class, 'current'])->name('current');
+
+    Route::get('/{cashSession}', [CashSessionController::class, 'show'])->name('show');
+    Route::post('/{cashSession}/close', [CashSessionController::class, 'close'])->name('close');
+
+    Route::post('/{cashSession}/movements', [CashMovementController::class, 'store'])
+        ->name('movements.store');
+
+    Route::post('/{cashSession}/remittances', [CashRemittanceController::class, 'store'])
+        ->name('remittances.store');
+});
+
+// Remittance confirmation lives at its own top-level route rather than
+// nested under a session, because confirming addresses the remittance
+// itself, not the session it belongs to — mirroring how order transitions
+// are addressed by {order}, not by some parent resource.
+Route::post('/remittances/{remittance}/confirm', [CashRemittanceController::class, 'confirm'])
+    ->name('merchant.remittances.confirm');
+
+// Note for later phases: there is no DELETE anywhere in this group either.
+// A cash session, a movement, and a remittance are all financial records —
+// the same "never deleted" rule that governs orders.
