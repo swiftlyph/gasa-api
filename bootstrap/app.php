@@ -7,6 +7,7 @@ use App\Domains\Shared\Http\Middleware\ForceJsonResponse;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
+use Illuminate\Routing\Middleware\SubstituteBindings;
 use Illuminate\Support\Facades\Route;
 use Spatie\Permission\Middleware\RoleMiddleware;
 
@@ -58,6 +59,26 @@ return Application::configure(basePath: dirname(__DIR__))
         // non-merchant gets the role middleware's "forbidden" rather than
         // "merchant_inactive" — the latter would leak that the route exists
         // for merchants and invite probing.
+        // Both gatekeepers must run BEFORE route-model binding.
+        //
+        // Laravel's priority list puts SubstituteBindings after
+        // authentication but ahead of any middleware it doesn't know
+        // about, which included these two. The effect was invisible until
+        // the first merchant route with a {model} parameter landed: a
+        // suspended merchant hitting /merchant/orders/{order} had the
+        // binding resolved first, matched nothing (their tenant is null,
+        // by design), and got a 404 — while /merchant/orders, with no
+        // binding, correctly returned 403 merchant_inactive. Same
+        // middleware group, two different answers, and the frontend can't
+        // render its suspended screen from the 404.
+        //
+        // Inserted before SubstituteBindings in this order, so the
+        // documented sequence auth -> role -> active-merchant -> binding
+        // holds on every route: a non-merchant still gets a plain
+        // `forbidden` rather than `merchant_inactive`.
+        $middleware->prependToPriorityList(SubstituteBindings::class, RoleMiddleware::class);
+        $middleware->prependToPriorityList(SubstituteBindings::class, EnsureMerchantActive::class);
+
         $middleware->group('admin.api', ['auth:sanctum', 'role:platform_admin', AllowsAdminContext::class]);
         $middleware->group('company.api', ['auth:sanctum', 'role:company_admin']);
         $middleware->group('employee.api', ['auth:sanctum', 'role:employee']);

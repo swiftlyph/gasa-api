@@ -36,4 +36,48 @@ class TenantContext
     {
         return $this->adminContext;
     }
+
+    /**
+     * Runs $callback in admin context, restoring the previous state
+     * afterwards even if it throws.
+     *
+     * This exists for the one legitimate case the middleware can't cover:
+     * code that writes rows for a CHOSEN merchant with no authenticated
+     * user at all — seeders and model factories. Without it a factory
+     * cannot create a row for Merchant Two, because the trait's `creating`
+     * hook would stamp the current tenant (none) and the NOT NULL
+     * constraint would reject it.
+     *
+     * Strict rules, because this is the only programmatic way past
+     * tenancy:
+     *
+     * - NEVER call this from a controller, an Action, or anything else
+     *   reachable by an HTTP request. The only request-time route into
+     *   admin context is AllowsAdminContext on the admin.api group, which
+     *   runs after role:platform_admin — that ordering is the guarantee,
+     *   and calling this in request code would quietly bypass it.
+     * - It grants a bypass, not an identity: callers still have to set
+     *   merchant_id explicitly on every row they create.
+     *
+     * Save-and-restore rather than enable-and-disable so nesting works
+     * (a seeder wrapping factories that wrap themselves) and so a
+     * genuinely-admin request never has its context switched off by an
+     * inner call.
+     *
+     * @template TReturn
+     *
+     * @param  callable(): TReturn  $callback
+     * @return TReturn
+     */
+    public function runInAdminContext(callable $callback): mixed
+    {
+        $previous = $this->adminContext;
+        $this->adminContext = true;
+
+        try {
+            return $callback();
+        } finally {
+            $this->adminContext = $previous;
+        }
+    }
 }

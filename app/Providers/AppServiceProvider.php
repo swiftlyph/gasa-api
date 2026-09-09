@@ -4,6 +4,7 @@ namespace App\Providers;
 
 use App\Domains\Shared\Concerns\TenantContext;
 use Illuminate\Cache\RateLimiting\Limit;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
 use Illuminate\Support\Facades\RateLimiter;
@@ -29,6 +30,20 @@ class AppServiceProvider extends ServiceProvider
      */
     public function boot(): void
     {
+        // Mass assignment that would silently DROP an attribute now
+        // throws instead. Enabled in every environment, including
+        // production: the failure mode it replaces is a write that looks
+        // like it succeeded and lost a column, which is far worse than a
+        // 500 on the one request that had the bug. The audit found two of
+        // exactly that shape.
+        //
+        // This is a typo guard, not a security boundary — it makes a
+        // misspelled key ("total_cent") explode instead of vanishing. It
+        // does NOT make $fillable lists safe to feed raw request input:
+        // that rule is unchanged (Actions build payloads themselves; see
+        // the note on Order::$fillable).
+        Model::preventSilentlyDiscardingAttributes();
+
         // API Resources return flat shapes (no implicit "data" wrapper) so
         // every response matches the documented shapes exactly. Note this
         // only flattens SINGLE resources — a paginated ResourceCollection
