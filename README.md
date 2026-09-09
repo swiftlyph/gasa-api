@@ -124,6 +124,24 @@ fields (e.g. `portal` not one of the four allowed values) still return
 422 `validation_failed` via the `LoginRequest` FormRequest, since that
 genuinely is a request-shape problem.
 
+### Response shapes
+
+`JsonResource::withoutWrapping()` is enabled globally
+(`AppServiceProvider`), but it only flattens **single** resources — a
+resource **collection with pagination** wraps regardless, because
+Laravel forces a `data` key whenever there's extra `with()`/`additional`
+data to merge in (pagination adds `links`/`meta`), independent of the
+wrapping setting. So the actual contract, going forward:
+
+- **Single resource** (`/auth/me`, `login`'s `user`, any future `show`
+  endpoint): flat object — `{ id, name, email, ... }`, no `data` key.
+- **Paginated list** (any future `index` endpoint): always
+  `{ data: [...], links: {...}, meta: {...} }`.
+
+This is why: don't "fix" a paginated endpoint that returns a wrapped
+shape later — that's correct, expected Laravel behavior, not a
+regression from the `withoutWrapping()` call above.
+
 ### CORS
 
 Allowed origins are driven by the comma-separated `FRONTEND_ORIGINS` env var

@@ -24,7 +24,11 @@ class AppServiceProvider extends ServiceProvider
     public function boot(): void
     {
         // API Resources return flat shapes (no implicit "data" wrapper) so
-        // every response matches the documented shapes exactly.
+        // every response matches the documented shapes exactly. Note this
+        // only flattens SINGLE resources — a paginated ResourceCollection
+        // still wraps as { data, links, meta } regardless of this call,
+        // because Laravel forces that wrapper whenever pagination info is
+        // merged in. See README § Response shapes before "fixing" that.
         JsonResource::withoutWrapping();
 
         // 5 attempts/minute keyed on email+IP so one leaked password can't

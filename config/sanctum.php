@@ -40,6 +40,18 @@ return [
     | session/cookie with this app, so the "web" session guard should
     | never be checked before the bearer token.
     |
+    | DO NOT restore ['web'] here. We hit a real bug from it: with 'web'
+    | set, Sanctum checks Auth::guard('web')->user() (session-based)
+    | before falling back to the bearer token. In our first pass, a
+    | request authenticated via 'web' returned a *different* answer than
+    | the bearer-token path would have — e.g. /auth/me appeared logged
+    | in via a stale session guard state instead of actually validating
+    | the token on the request. This API has no session/cookie auth at
+    | all, so 'web' should never be in the guard list to begin with.
+    | (Separately — see tests/TestCase.php — Laravel's RequestGuard also
+    | caches the resolved user per guard *instance*, which is a related
+    | but distinct issue that affects the "sanctum" guard itself too.)
+    |
     */
 
     'guard' => [],
