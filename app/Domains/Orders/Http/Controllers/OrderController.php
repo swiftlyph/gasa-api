@@ -5,16 +5,15 @@ namespace App\Domains\Orders\Http\Controllers;
 use App\Domains\Orders\Http\Requests\IndexOrdersRequest;
 use App\Domains\Orders\Http\Resources\OrderResource;
 use App\Domains\Orders\Models\Order;
+use App\Domains\Orders\Support\MerchantDay;
 use App\Http\Controllers\Controller;
-use Carbon\CarbonImmutable;
-use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\Resources\Json\AnonymousResourceCollection;
 use Illuminate\Pagination\LengthAwarePaginator;
 
 /**
  * Read side of the merchant order list. Thin by construction: no business
  * logic, no writes — transitions live in OrderTransitionController and
- * creation arrives with P2's checkout.
+ * creation in CheckoutController.
  *
  * Tenancy is not handled here and must not be: BelongsToMerchant's global
  * scope already restricts both the list query and route-model binding to
@@ -48,7 +47,10 @@ class OrderController extends Controller
         }
 
         if ($date = $request->validated('date')) {
-            $this->scopeToDay($query, $date);
+            // Day boundaries live in MerchantDay, not here: the kitchen
+            // queue asks the same question, and the two must agree about
+            // where midnight is.
+            MerchantDay::constrain($query, MerchantDay::startOf($date));
         }
 
         $orders = $query->paginate($request->validated('per_page', 25))
@@ -62,29 +64,5 @@ class OrderController extends Controller
         $this->authorize('view', $order);
 
         return new OrderResource($order->load(['items.addOns']));
-    }
-
-    /**
-     * Restricts to a single calendar day.
-     *
-     * A half-open range (>= start, < next day) rather than whereDate():
-     * whereDate wraps the column in a function, which discards the
-     * (merchant_id, created_at) index, and a BETWEEN with an inclusive end
-     * would double-count anything landing exactly at midnight.
-     *
-     * "Merchant-local" is the app timezone for now. When merchants get
-     * their own timezone column this is the one place that changes —
-     * which is why the boundaries are built here rather than inlined.
-     *
-     * @param  Builder<Order>  $query
-     */
-    private function scopeToDay(Builder $query, string $date): void
-    {
-        $timezone = config('app.timezone');
-
-        $start = CarbonImmutable::createFromFormat('Y-m-d', $date, $timezone)->startOfDay();
-
-        $query->where('created_at', '>=', $start)
-            ->where('created_at', '<', $start->addDay());
     }
 }

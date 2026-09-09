@@ -1,10 +1,14 @@
 <?php
 
 use App\Domains\Auth\Models\User;
+use App\Domains\Catalog\Models\Product;
 use App\Domains\Merchant\Models\Merchant;
+use App\Domains\Orders\Models\CheckoutIdempotencyKey;
 use App\Domains\Orders\Models\Order;
+use App\Domains\Shared\Support\MenuCache;
 use Database\Seeders\RoleSeeder;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Route;
 use Tests\Concerns\CreatesMerchantFixtureTable;
@@ -28,6 +32,10 @@ uses(CreatesMerchantFixtureTable::class);
 beforeEach(function () {
     $this->seed(RoleSeeder::class);
     $this->createMerchantFixtureTable();
+
+    // Cold cache per test: the menu cases below assert who warmed what,
+    // and a value surviving from a previous test would make them lie.
+    Cache::flush();
 
     $this->merchantOneUser = User::factory()->withRole('merchant')->create();
     $this->merchantOne = Merchant::factory()
@@ -419,4 +427,454 @@ test('a spoofed merchant_id on an order write is ignored', function () {
     $stored = Order::withoutGlobalScope('merchant')->find($order->id);
 
     expect($stored->merchant_id)->toBe($this->merchantOne->id);
+});
+
+/*
+|--------------------------------------------------------------------------
+| CHECKOUT AND MENU (phase P2)
+|--------------------------------------------------------------------------
+|
+| Checkout is the first endpoint that WRITES money-bearing rows from client
+| input, and the menu is the first cached read. Those are the two shapes a
+| tenancy bug takes: a write filed under the wrong merchant, and a cache
+| entry served to the wrong one.
+|
+| The audited system had the second bug for real — one global product cache
+| key, so whichever merchant warmed it served their menu and their prices
+| to every other shop on the platform.
+|
+*/
+
+test('checking out with another merchant\'s product is a 422, never a cross-tenant sale', function () {
+    $foreign = Product::factory()->create([
+        'merchant_id' => $this->merchantTwo->id,
+        'name' => 'Barako Brew (12oz)',
+        'price_cents' => 9500,
+    ]);
+
+    $token = $this->merchantOneUser->createToken('merchant')->plainTextToken;
+
+    // 422 product_unavailable, NOT 404 and NOT 403: all three of "no such
+    // product", "not yours" and "unavailable" answer identically, so a
+    // merchant cannot enumerate a competitor's catalog by posting ids and
+    // reading which error comes back.
+    $this->withToken($token)
+        ->postJson('/api/v1/merchant/orders', [
+            'payment_method' => 'cash',
+            'items' => [['product_id' => $foreign->id, 'quantity' => 1]],
+        ])
+        ->assertStatus(422)
+        ->assertJsonPath('code', 'product_unavailable');
+
+    expect(Order::withoutGlobalScope('merchant')->count())->toBe(0);
+});
+
+test('a foreign product id and a nonexistent one are indistinguishable', function () {
+    $foreign = Product::factory()->create(['merchant_id' => $this->merchantTwo->id]);
+
+    $token = $this->merchantOneUser->createToken('merchant')->plainTextToken;
+
+    $post = fn (int $productId) => $this->withToken($token)->postJson('/api/v1/merchant/orders', [
+        'payment_method' => 'cash',
+        'items' => [['product_id' => $productId, 'quantity' => 1]],
+    ]);
+
+    $foreignResponse = $post($foreign->id);
+    $missingResponse = $post(999999);
+
+    // Same status, same code, same message — only the echoed id differs,
+    // and that is an id the caller just sent us.
+    expect($foreignResponse->status())->toBe($missingResponse->status())
+        ->and($foreignResponse->json('code'))->toBe($missingResponse->json('code'))
+        ->and($foreignResponse->json('message'))->toBe($missingResponse->json('message'));
+});
+
+test('a mixed basket of own and foreign products sells nothing at all', function () {
+    $own = Product::factory()->create([
+        'merchant_id' => $this->merchantOne->id,
+        'price_cents' => 14000,
+    ]);
+
+    $foreign = Product::factory()->create(['merchant_id' => $this->merchantTwo->id]);
+
+    $token = $this->merchantOneUser->createToken('merchant')->plainTextToken;
+
+    $this->withToken($token)
+        ->postJson('/api/v1/merchant/orders', [
+            'payment_method' => 'cash',
+            'items' => [
+                ['product_id' => $own->id, 'quantity' => 1],
+                ['product_id' => $foreign->id, 'quantity' => 1],
+            ],
+        ])
+        ->assertStatus(422)
+        ->assertJsonPath('code', 'product_unavailable');
+
+    // Not even the legitimate half is sold — all or nothing.
+    expect(Order::withoutGlobalScope('merchant')->count())->toBe(0)
+        ->and(DB::table('order_items')->count())->toBe(0);
+});
+
+test('a checkout is filed under the caller\'s merchant regardless of the payload', function () {
+    $own = Product::factory()->create([
+        'merchant_id' => $this->merchantOne->id,
+        'price_cents' => 14000,
+    ]);
+
+    $token = $this->merchantOneUser->createToken('merchant')->plainTextToken;
+
+    // A spoofed tenant id in the body, exactly as a malicious client would
+    // send it.
+    $this->withToken($token)
+        ->postJson('/api/v1/merchant/orders', [
+            'payment_method' => 'cash',
+            'merchant_id' => $this->merchantTwo->id,
+            'items' => [['product_id' => $own->id, 'quantity' => 1]],
+        ])
+        ->assertCreated();
+
+    $order = Order::withoutGlobalScope('merchant')->firstOrFail();
+
+    expect($order->merchant_id)->toBe($this->merchantOne->id)
+        ->and($order->created_by_user_id)->toBe($this->merchantOneUser->id);
+});
+
+test('an order created by checkout is invisible to the other merchant', function () {
+    $own = Product::factory()->create([
+        'merchant_id' => $this->merchantOne->id,
+        'price_cents' => 14000,
+    ]);
+
+    $created = $this->withToken($this->merchantOneUser->createToken('merchant')->plainTextToken)
+        ->postJson('/api/v1/merchant/orders', [
+            'payment_method' => 'cash',
+            'items' => [['product_id' => $own->id, 'quantity' => 1]],
+        ])
+        ->assertCreated()
+        ->json('id');
+
+    $tokenTwo = $this->merchantTwoUser->createToken('merchant')->plainTextToken;
+
+    $this->withToken($tokenTwo)->getJson('/api/v1/merchant/orders')
+        ->assertOk()
+        ->assertJsonPath('meta.total', 0);
+
+    $this->withToken($tokenTwo)->getJson("/api/v1/merchant/orders/{$created}")
+        ->assertStatus(404);
+});
+
+test('the menu never serves one merchant another merchant\'s products', function () {
+    Product::factory()->create([
+        'merchant_id' => $this->merchantOne->id,
+        'name' => 'Cafe Latte (16oz)',
+        'price_cents' => 14000,
+    ]);
+
+    Product::factory()->create([
+        'merchant_id' => $this->merchantTwo->id,
+        'name' => 'Barako Brew (12oz)',
+        'price_cents' => 9500,
+    ]);
+
+    // Merchant One warms the cache first. Under a global cache key this is
+    // the request that would poison it for everyone.
+    $this->withToken($this->merchantOneUser->createToken('merchant')->plainTextToken)
+        ->getJson('/api/v1/merchant/menu')
+        ->assertOk()
+        ->assertJsonPath('data.0.name', 'Cafe Latte (16oz)');
+
+    $response = $this->withToken($this->merchantTwoUser->createToken('merchant')->plainTextToken)
+        ->getJson('/api/v1/merchant/menu')
+        ->assertOk();
+
+    expect(collect($response->json('data'))->pluck('name')->all())
+        ->toBe(['Barako Brew (12oz)'])
+        ->and(Cache::has(MenuCache::key($this->merchantOne->id, false)))->toBeTrue()
+        ->and(Cache::has(MenuCache::key($this->merchantTwo->id, false)))->toBeTrue();
+});
+
+test('a suspended merchant gets 403 merchant_inactive on checkout and the menu', function () {
+    $user = User::factory()->withRole('merchant')->create();
+    $merchant = Merchant::factory()->suspended()->ownedBy($user)->create(['name' => 'Suspended Merchant']);
+
+    $product = Product::factory()->create(['merchant_id' => $merchant->id]);
+
+    $token = $user->createToken('merchant')->plainTextToken;
+
+    $this->withToken($token)->getJson('/api/v1/merchant/menu')
+        ->assertStatus(403)
+        ->assertJson(['code' => 'merchant_inactive']);
+
+    $this->withToken($token)->postJson('/api/v1/merchant/orders', [
+        'payment_method' => 'cash',
+        'items' => [['product_id' => $product->id, 'quantity' => 1]],
+    ])
+        ->assertStatus(403)
+        ->assertJson(['code' => 'merchant_inactive']);
+
+    expect(Order::withoutGlobalScope('merchant')->count())->toBe(0);
+});
+
+test('an unauthenticated checkout or menu request is 401 JSON, never a redirect', function () {
+    $response = $this->postJson('/api/v1/merchant/orders', [
+        'payment_method' => 'cash',
+        'items' => [['product_id' => 1, 'quantity' => 1]],
+    ])->assertStatus(401)->assertJson(['code' => 'unauthenticated']);
+
+    expect($response->headers->get('Location'))->toBeNull();
+
+    $this->getJson('/api/v1/merchant/menu')
+        ->assertStatus(401)
+        ->assertJson(['code' => 'unauthenticated']);
+});
+
+test('a platform admin token is rejected by checkout and the menu too', function () {
+    $admin = User::factory()->withRole('platform_admin')->create();
+    $token = $admin->createToken('admin')->plainTextToken;
+
+    $this->withToken($token)->getJson('/api/v1/merchant/menu')
+        ->assertStatus(403)
+        ->assertJson(['code' => 'forbidden']);
+
+    $this->withToken($token)->postJson('/api/v1/merchant/orders', [
+        'payment_method' => 'cash',
+        'items' => [['product_id' => 1, 'quantity' => 1]],
+    ])
+        ->assertStatus(403)
+        ->assertJson(['code' => 'forbidden']);
+});
+
+/*
+|--------------------------------------------------------------------------
+| IDEMPOTENCY KEYS (phase P2.1)
+|--------------------------------------------------------------------------
+|
+| Keys are client-generated, so two merchants WILL eventually pick the same
+| value — by coincidence with UUIDs, or immediately if a POS ships with a
+| lazy default. A key that resolved across tenants would answer one shop's
+| checkout with another shop's order, which is the worst possible failure
+| for this feature: silent, and about money.
+|
+| The guarantee has two halves, both asserted below: BelongsToMerchant on
+| the model (merchant B's lookup of A's key finds nothing) and
+| UNIQUE (merchant_id, key) rather than UNIQUE (key) (B may insert it).
+|
+*/
+
+test('one merchant\'s idempotency key never resolves to another\'s order', function () {
+    $sharedKey = 'shared-key-both-tablets-generated-0001';
+
+    $productOne = Product::factory()->create([
+        'merchant_id' => $this->merchantOne->id,
+        'name' => 'Cafe Latte (16oz)',
+        'price_cents' => 14000,
+    ]);
+
+    $productTwo = Product::factory()->create([
+        'merchant_id' => $this->merchantTwo->id,
+        'name' => 'Barako Brew (12oz)',
+        'price_cents' => 9500,
+    ]);
+
+    $checkout = fn (User $user, int $productId) => $this
+        ->withToken($user->createToken('merchant')->plainTextToken)
+        ->withHeaders(['Idempotency-Key' => $sharedKey])
+        ->postJson('/api/v1/merchant/orders', [
+            'payment_method' => 'cash',
+            'items' => [['product_id' => $productId, 'quantity' => 1]],
+        ]);
+
+    $one = $checkout($this->merchantOneUser, $productOne->id)->assertCreated();
+
+    // Merchant Two sends the SAME key value. It must be treated as unseen
+    // — a fresh 201 for their own order, not a 200 replaying Merchant
+    // One's, and not a 409 either (which would leak that the key exists).
+    $two = $checkout($this->merchantTwoUser, $productTwo->id)->assertCreated();
+
+    expect($two->json('id'))->not->toBe($one->json('id'))
+        ->and($two->json('total_cents'))->toBe(9500)
+        ->and($one->json('total_cents'))->toBe(14000)
+        // Both sequences start at 1: the key did not cross tenants any
+        // more than the numbering does.
+        ->and($one->json('order_number'))->toBe('ORD-000001')
+        ->and($two->json('order_number'))->toBe('ORD-000001')
+        ->and($two->headers->get('Idempotent-Replayed'))->toBeNull();
+
+    // Two rows, same key value, different tenants — which is exactly what
+    // UNIQUE (merchant_id, key) is for.
+    $rows = CheckoutIdempotencyKey::withoutGlobalScope('merchant')
+        ->where('key', $sharedKey)
+        ->get();
+
+    expect($rows)->toHaveCount(2)
+        ->and($rows->pluck('merchant_id')->sort()->values()->all())
+        ->toBe(collect([$this->merchantOne->id, $this->merchantTwo->id])->sort()->values()->all());
+});
+
+test('each merchant replays only their own order from the shared key', function () {
+    $sharedKey = 'shared-key-both-tablets-generated-0002';
+
+    $productOne = Product::factory()->create([
+        'merchant_id' => $this->merchantOne->id,
+        'price_cents' => 14000,
+    ]);
+
+    $productTwo = Product::factory()->create([
+        'merchant_id' => $this->merchantTwo->id,
+        'price_cents' => 9500,
+    ]);
+
+    $checkout = fn (User $user, int $productId) => $this
+        ->withToken($user->createToken('merchant')->plainTextToken)
+        ->withHeaders(['Idempotency-Key' => $sharedKey])
+        ->postJson('/api/v1/merchant/orders', [
+            'payment_method' => 'cash',
+            'items' => [['product_id' => $productId, 'quantity' => 1]],
+        ]);
+
+    $oneId = $checkout($this->merchantOneUser, $productOne->id)->assertCreated()->json('id');
+    $twoId = $checkout($this->merchantTwoUser, $productTwo->id)->assertCreated()->json('id');
+
+    // Now both retry. Each must get their OWN order back.
+    $checkout($this->merchantOneUser, $productOne->id)
+        ->assertOk()
+        ->assertJsonPath('id', $oneId);
+
+    $checkout($this->merchantTwoUser, $productTwo->id)
+        ->assertOk()
+        ->assertJsonPath('id', $twoId);
+
+    expect(Order::withoutGlobalScope('merchant')->count())->toBe(2);
+});
+
+test('a suspended merchant is still 403, key or no key', function () {
+    $user = User::factory()->withRole('merchant')->create();
+    $merchant = Merchant::factory()->suspended()->ownedBy($user)->create(['name' => 'Suspended Merchant']);
+    $product = Product::factory()->create(['merchant_id' => $merchant->id]);
+
+    $token = $user->createToken('merchant')->plainTextToken;
+
+    $body = [
+        'payment_method' => 'cash',
+        'items' => [['product_id' => $product->id, 'quantity' => 1]],
+    ];
+
+    // EnsureMerchantActive runs ahead of everything here, so an
+    // idempotency key must not become a way to get further into the
+    // request than a suspended account otherwise could — no key row, no
+    // order, no reservation.
+    $this->withToken($token)->postJson('/api/v1/merchant/orders', $body)
+        ->assertStatus(403)
+        ->assertJson(['code' => 'merchant_inactive']);
+
+    $this->withToken($token)
+        ->withHeaders(['Idempotency-Key' => 'suspended-merchant-attempt-0001'])
+        ->postJson('/api/v1/merchant/orders', $body)
+        ->assertStatus(403)
+        ->assertJson(['code' => 'merchant_inactive']);
+
+    expect(Order::withoutGlobalScope('merchant')->count())->toBe(0)
+        ->and(CheckoutIdempotencyKey::withoutGlobalScope('merchant')->count())->toBe(0);
+});
+
+/*
+|--------------------------------------------------------------------------
+| KITCHEN QUEUE (phase P3)
+|--------------------------------------------------------------------------
+|
+| The queue is a view over orders, so it inherits BelongsToMerchant's
+| scoping for free — which is exactly why it is worth asserting. A view
+| that quietly forgot to be a scoped query would put another shop's drinks
+| on this shop's kitchen screen, and unlike a leaked order list, staff
+| would ACT on it: they would make the drinks.
+|
+*/
+
+test('the kitchen queue shows only the calling merchant\'s pending orders', function () {
+    $mine = Order::factory()->forMerchant($this->merchantOne)->pending()->withItems(2)->create();
+    $theirs = Order::factory()->forMerchant($this->merchantTwo)->pending()->withItems(2)->create();
+
+    $tokenOne = $this->merchantOneUser->createToken('merchant')->plainTextToken;
+    $tokenTwo = $this->merchantTwoUser->createToken('merchant')->plainTextToken;
+
+    $one = $this->withToken($tokenOne)->getJson('/api/v1/merchant/kitchen-queue')->assertOk();
+    $two = $this->withToken($tokenTwo)->getJson('/api/v1/merchant/kitchen-queue')->assertOk();
+
+    expect(collect($one->json('data'))->pluck('id')->all())->toBe([$mine->id])
+        ->and(collect($two->json('data'))->pluck('id')->all())->toBe([$theirs->id]);
+});
+
+test('all=1 widens the day, never the tenant', function () {
+    // The obvious way to get this wrong: treat "show me everything" as
+    // dropping every filter rather than only the date one.
+    Order::factory()->forMerchant($this->merchantOne)->pending()
+        ->create(['created_at' => now()->subDays(3)]);
+    Order::factory()->forMerchant($this->merchantTwo)->pending()
+        ->create(['created_at' => now()->subDays(3)]);
+
+    $token = $this->merchantOneUser->createToken('merchant')->plainTextToken;
+
+    $response = $this->withToken($token)
+        ->getJson('/api/v1/merchant/kitchen-queue?all=1')
+        ->assertOk();
+
+    expect($response->json('data'))->toHaveCount(1)
+        ->and(Order::withoutGlobalScope('merchant')->count())->toBe(2);
+});
+
+test('the kitchen summary counts only the calling merchant\'s queue', function () {
+    Order::factory()->forMerchant($this->merchantOne)->pending()->count(2)->create();
+    Order::factory()->forMerchant($this->merchantTwo)->pending()->count(5)->create();
+
+    $tokenOne = $this->merchantOneUser->createToken('merchant')->plainTextToken;
+
+    // An aggregate is the easiest place to lose a tenant scope, because
+    // the wrong answer is still a plausible-looking number.
+    $this->withToken($tokenOne)
+        ->getJson('/api/v1/merchant/kitchen-queue/summary')
+        ->assertOk()
+        ->assertJsonPath('pending_count', 2);
+
+    $tokenTwo = $this->merchantTwoUser->createToken('merchant')->plainTextToken;
+
+    $this->withToken($tokenTwo)
+        ->getJson('/api/v1/merchant/kitchen-queue/summary')
+        ->assertOk()
+        ->assertJsonPath('pending_count', 5);
+});
+
+test('a suspended merchant gets 403 merchant_inactive on both kitchen endpoints', function () {
+    $user = User::factory()->withRole('merchant')->create();
+    $merchant = Merchant::factory()->suspended()->ownedBy($user)->create(['name' => 'Suspended Merchant']);
+
+    Order::factory()->forMerchant($merchant, $user)->pending()->create();
+
+    $token = $user->createToken('merchant')->plainTextToken;
+
+    foreach (['/api/v1/merchant/kitchen-queue', '/api/v1/merchant/kitchen-queue/summary'] as $uri) {
+        $this->withToken($token)->getJson($uri)
+            ->assertStatus(403)
+            ->assertJson(['code' => 'merchant_inactive']);
+    }
+});
+
+test('an unauthenticated kitchen request is 401 JSON, never a redirect', function () {
+    foreach (['/api/v1/merchant/kitchen-queue', '/api/v1/merchant/kitchen-queue/summary'] as $uri) {
+        $response = $this->getJson($uri)
+            ->assertStatus(401)
+            ->assertJson(['code' => 'unauthenticated']);
+
+        expect($response->headers->get('Location'))->toBeNull();
+    }
+});
+
+test('a platform admin token is rejected by the kitchen endpoints', function () {
+    $admin = User::factory()->withRole('platform_admin')->create();
+    $token = $admin->createToken('admin')->plainTextToken;
+
+    foreach (['/api/v1/merchant/kitchen-queue', '/api/v1/merchant/kitchen-queue/summary'] as $uri) {
+        $this->withToken($token)->getJson($uri)
+            ->assertStatus(403)
+            ->assertJson(['code' => 'forbidden']);
+    }
 });

@@ -151,6 +151,10 @@ header — never a redirect.
 | 404    | `not_found`            | Route or model not found                                        |
 | 422    | `validation_failed`    | FormRequest validation failure                                  |
 | 422    | `invalid_transition`   | Order status change the transition map forbids (e.g. completing a voided order) |
+| 422    | `product_unavailable`  | Checkout referenced a product that is missing, not the caller's, or flagged unavailable — `errors.product_ids` lists them |
+| 422    | `discount_exceeds_subtotal` | Checkout discount is larger than the server-computed subtotal   |
+| 422    | `split_mismatch`       | Split payment whose `cash_cents` + `gcash_cents` don't equal the server-computed total |
+| 409    | `idempotency_key_reuse` | Checkout reused an `Idempotency-Key` with a different request body |
 | 429    | `too_many_attempts`    | `/auth/login` — 6th+ attempt from the same email+IP within a minute |
 | 500    | `server_error`         | Unhandled exception (message hidden unless `APP_DEBUG=true`)    |
 
@@ -170,10 +174,17 @@ Laravel forces a `data` key whenever there's extra `with()`/`additional`
 data to merge in (pagination adds `links`/`meta`), independent of the
 wrapping setting. So the actual contract, going forward:
 
-- **Single resource** (`/auth/me`, `login`'s `user`, any future `show`
-  endpoint): flat object — `{ id, name, email, ... }`, no `data` key.
-- **Paginated list** (any future `index` endpoint): always
-  `{ data: [...], links: {...}, meta: {...} }`.
+- **Single resource** (`/auth/me`, `login`'s `user`, any `show` endpoint,
+  and the 201 from checkout): flat object — `{ id, name, email, ... }`, no
+  `data` key.
+- **Paginated list** (`/merchant/orders`, any future `index` endpoint):
+  always `{ data: [...], links: {...}, meta: {...} }`.
+- **Unpaginated list** (`/merchant/menu`, `/merchant/kitchen-queue`):
+  `{ data: [...] }` — a `data` key so every list endpoint looks alike to a
+  client, but no `links`/`meta`, because there are no pages to link to.
+- **Scalar summary** (`/merchant/kitchen-queue/summary`): a flat object of
+  the values themselves — `{ pending_count, oldest_waiting_seconds }`. No
+  `data` wrapper, because there is no collection to wrap.
 
 This is why: don't "fix" a paginated endpoint that returns a wrapped
 shape later — that's correct, expected Laravel behavior, not a
@@ -352,11 +363,13 @@ Two active merchants exist on purpose: with only one, correct scoping and
 no scoping at all look identical. `suspended@gasa.test` drives the 403
 `merchant_inactive` path and the frontend's suspended screen.
 
-`DevSeeder` also gives **both active merchants** a five-item menu and six
-orders each, in mixed states (pending / completed / voided) across all
-three payment methods, so the POS and kitchen frontends have something
-realistic to demo against and cross-tenant scoping is visible by eye. Both
-merchants' sequences start at `ORD-000001`. Orders are skipped for a
+`DevSeeder` also gives **both active merchants** an eight-item menu (via
+`ProductSeeder`, one item deliberately unavailable) and six orders each, in
+mixed states (pending / completed / voided) across all three payment
+methods, so the POS and kitchen frontends have something realistic to demo
+against and cross-tenant scoping is visible by eye. The two menus are
+different from each other on purpose. Both merchants' sequences start at
+`ORD-000001`. Orders are skipped for a
 merchant that already has some, which is what keeps re-seeding idempotent
 — unlike the rows above they can't be `updateOrCreate`d, since each one
 draws a fresh number from the merchant's counter.
@@ -418,12 +431,16 @@ through factories and the dev seeder.
 
 | Method | Route                                    | Notes                                   |
 | ------ | ---------------------------------------- | --------------------------------------- |
+| `GET`  | `/api/v1/merchant/menu`                  | POS product list; `?include_unavailable=1` |
+| `GET`  | `/api/v1/merchant/kitchen-queue`         | Pending orders, oldest first, today by default; `?all=1` |
+| `GET`  | `/api/v1/merchant/kitchen-queue/summary` | `{ pending_count, oldest_waiting_seconds }` |
 | `GET`  | `/api/v1/merchant/orders`                | Paginated, newest first; `?status=`, `?date=YYYY-MM-DD`, `?per_page=` (max 100) |
+| `POST` | `/api/v1/merchant/orders`                | Checkout — creates a paid order, returns 201; honours an `Idempotency-Key` header |
 | `GET`  | `/api/v1/merchant/orders/{order}`        | Single, flat                            |
 | `POST` | `/api/v1/merchant/orders/{order}/complete` | Returns the updated order             |
 | `POST` | `/api/v1/merchant/orders/{order}/void`   | Returns the updated order               |
 
-There is **no** `POST /orders` yet and **no** `DELETE`, ever — see below.
+There is **no** `DELETE`, ever — see "Orders are never deleted" below.
 
 ### The status machine
 
@@ -449,12 +466,179 @@ transaction. Two taps on a POS "complete" button, or a completing terminal
 racing a voiding manager, would otherwise both pass the guard and the
 second write would silently overwrite the first.
 
+### Checkout
+
+`POST /api/v1/merchant/orders` is the one endpoint that creates an order.
+The client sends **what was ordered, never what it costs**:
+
+```json
+{
+  "payment_method": "split",
+  "cash_cents": 10000,
+  "gcash_cents": 17000,
+  "discount_cents": 5000,
+  "items": [
+    {
+      "product_id": 3,
+      "quantity": 2,
+      "add_ons": [{ "name": "Extra shot", "price_cents": 2000 }]
+    }
+  ]
+}
+```
+
+It responds `201` with the same flat order payload `GET` returns (see
+§ Response shapes), so a POS can print the receipt without a second
+request.
+
+**Prices are looked up server-side and snapshotted.** There is no
+per-item price field in the request, `CheckoutRequest` defines no rule for
+one (so `validated()` strips it), and `CheckoutAction` never reads one —
+every `unit_price_cents` comes from the `products` table. The audited
+system took unit prices straight from the payload, which let a tampered
+request set its own; this is the fix, deliberately enforced in two
+independent places.
+
+The arithmetic, in order:
+
+```
+line_total_cents = (product.price_cents + Σ add_on.price_cents) × quantity
+subtotal_cents   = Σ line_total_cents
+total_cents      = subtotal_cents − discount_cents
+```
+
+Add-ons are priced **per unit** — two lattes each with an extra shot is
+two extra shots.
+
+Everything is validated **before** an order number is drawn, so a rejected
+basket never burns a sequence number; anything that fails afterwards rolls
+back inside the same transaction, counter increment included.
+
+Rejections (all `422`, see the error table):
+
+| Cause | Code |
+| ----- | ---- |
+| Product missing, not yours, or `is_available = false` | `product_unavailable` |
+| `discount_cents` > computed subtotal | `discount_exceeds_subtotal` |
+| Split halves don't equal the computed total | `split_mismatch` |
+| Malformed shape (bad quantity, unknown method, split half missing or ≤ 0, split amount on a non-split order) | `validation_failed` |
+
+A basket is **all-or-nothing**: one unavailable line rejects the whole
+order rather than quietly selling the rest, because a customer who paid
+for three drinks should not get a receipt for two.
+
+> **TODO — add-on prices are client-supplied.** There is no add-on catalog
+> table yet (it belongs to the catalog module), so `add_ons` are accepted
+> as `{ name, price_cents }` straight from the request. This is the one
+> place a client still names a price. The risk is bounded, not removed:
+> `CheckoutRequest` caps add-ons at 5 per line, requires a non-empty name
+> ≤ 100 chars, and requires `price_cents` between 0 and 1,000,000 (₱10,000).
+> When the catalog module adds a real add-on table, resolve them in
+> `CheckoutAction` exactly as products are resolved and delete this note.
+
+### Idempotency
+
+The POS runs on tablets over shop wifi. A cashier double-taps "charge", or
+the response to a successful checkout never arrives and the tablet retries
+— and the customer is charged twice for one coffee. Checkout therefore
+accepts a client-generated key that lets the server recognise a repeat
+attempt.
+
+```http
+POST /api/v1/merchant/orders
+Idempotency-Key: a3f1c8e2-0d4b-4a71-9f2e-8c1d6b5a4e30
+```
+
+A **header**, not a body field: it identifies the *attempt*, not what is
+being sold, and it must stay out of the request fingerprint. An
+`idempotency_key` in the body is ignored. The key is opaque (any string,
+8–255 characters — a UUID is the expected shape) and is scoped per
+merchant, so two shops picking the same value never see each other's
+orders.
+
+Four outcomes:
+
+| Situation | Response |
+| --------- | -------- |
+| **No header** | Unchanged — `201`, a new order every time. Idempotency is opt-in per request. |
+| **Key unseen** | `201` with the new order. The key is reserved in the same transaction. |
+| **Key seen, same body** | `200` with the **original** order, plus `Idempotent-Replayed: true`. Nothing is created and the order counter does not move. |
+| **Key seen, different body** | `409` `idempotency_key_reuse`. |
+
+A replay answers `200`, never `201`, because a POS retrying after a lost
+response has to distinguish "your order went through the first time" from
+"you have just made a second one". The `Idempotent-Replayed` header says
+the same thing for clients that prefer a header; its absence means the
+order was created by this request.
+
+The `409` is deliberately loud. Serving the original order would answer a
+request for two lattes with a receipt for one americano and the cashier
+would never know; creating a new order would defeat the mechanism
+entirely. A client hitting it has a real bug — almost always one key
+reused across checkouts.
+
+**How it stays correct**
+
+- **Reserve first, then sell.** The key row is inserted *before* pricing
+  runs, so a concurrent duplicate collides on the unique index
+  immediately — before any product lookup and before a number is drawn
+  from the merchant's counter.
+- **One transaction, so failure unreserves.** If the basket turns out to
+  be invalid (`product_unavailable`, say), the rollback takes the
+  reservation with it. **A failed checkout does not burn the key** — the
+  cashier fixes the order and retries with the same one.
+- **`UNIQUE (merchant_id, key)` is the concurrency arbiter.** Two
+  simultaneous requests both try to insert; Postgres lets exactly one
+  through, and the loser catches the violation and returns the winner's
+  order rather than erroring or checking out again. There is no
+  check-then-act window, because the check *is* the insert.
+
+**The fingerprint** is a SHA-256 of the *normalised* payload — payment
+method, split amounts, discount, and the lines, with add-ons sorted within
+a line and lines sorted within the basket. Hashing the raw body would be
+wrongly strict: a tablet that rebuilds its JSON on retry can legitimately
+emit the same basket with different key order, different whitespace, or
+`discount_cents` omitted instead of `0`, and every one of those would come
+back as a `409` for a mistake nobody made. Sorting the lines means two
+baskets differing *only* in line order are one request — intended, since
+they sell the same drinks for the same money.
+
+**Retention.** Keys are useful for the life of a retry and dead after
+that, so `checkout_idempotency_keys` is swept on a schedule:
+
+```bash
+php artisan orders:prune-idempotency-keys            # default: 24 hours
+php artisan orders:prune-idempotency-keys --hours=6
+```
+
+Scheduled hourly in `routes/console.php`; it needs a running scheduler
+(`* * * * * php artisan schedule:run`). The default window is **24 hours**
+— far beyond any real retry, short enough that the table stays roughly one
+day of sales. Pruning never touches the orders themselves; a retry
+arriving a day late is simply treated as a new checkout, which is the
+right answer by then anyway.
+
+> **For the POS frontend — the one rule that matters.** Generate **one key
+> per checkout attempt**, at the moment the cashier commits to the sale,
+> and **resend that same key on every retry** of that attempt. Generating
+> a fresh key on retry defeats the entire mechanism and produces exactly
+> the double charge it exists to prevent. Generate a new key only when the
+> cashier starts a genuinely new sale — a customer really can buy the same
+> coffee twice, and two different keys with identical bodies correctly
+> produce two orders.
+
 ### Payment
 
-Counter-service model: **orders are paid at creation**. `payment_method` is
-`cash | gcash | split`, and for `split` the `cash_cents` + `gcash_cents`
-columns sum to `total_cents` (validated by P2's checkout; the columns exist
-now). They stay `null` for non-split orders.
+Counter-service model — confirmed with the shop: **the cashier collects
+payment before placing the order**, so orders are paid at creation and
+there is no async capture step. `payment_method` is `cash | gcash | split`.
+
+For `split`, `cash_cents` + `gcash_cents` must equal `total_cents` and both
+must be positive; for anything else both stay `null` (sending one is a
+422, not a silent drop). This is enforced in three places on purpose:
+`CheckoutRequest` for shape, `CheckoutAction` for the sum against the
+server-computed total, and the `orders_split_payment_check` constraint in
+the database, which catches anything that ever writes around the Action.
 
 There is deliberately **no `payment_status` column**. The audited system
 carried both a status and a payment_status, they drifted into combinations
@@ -506,14 +690,162 @@ the only thing separating a mis-keyed order from theft.
 system had no such column, so once an order closed there was no answer to
 "who rang this up?" — the first question asked when a till is short.
 
+### The kitchen queue
+
+Two endpoints for the kitchen screen. Both are **views over `orders`** —
+there is no `kitchen_queue` table and no kitchen-specific status column.
+"In the queue" means `status = pending` and nothing else, so an order
+cannot be closed on the till and still open in the kitchen, which is the
+failure mode of every design that duplicates state.
+
+```
+GET /api/v1/merchant/kitchen-queue
+GET /api/v1/merchant/kitchen-queue/summary
+```
+
+```json
+{
+  "data": [
+    {
+      "id": 41,
+      "order_number": "ORD-000012",
+      "created_at": "2026-09-09T10:02:11.000000Z",
+      "waiting_seconds": 214,
+      "items": [
+        { "id": 88, "product_name": "Cafe Latte (16oz)", "quantity": 2, "add_ons": ["Extra shot"] }
+      ]
+    }
+  ]
+}
+```
+
+**Completion goes through the existing transition endpoint** —
+`POST /merchant/orders/{order}/complete`. This phase adds no second way to
+finish an order, so `OrderStatus`' transition map stays the only authority
+on what a legal status change is. Voiding removes a ticket the same way.
+
+The flow is deliberately **binary**: pending, then done. `preparing` and
+`ready` were left out because the audited shop never used them;
+`OrderStatus` is built so they can be *inserted* later if a real kitchen
+asks for them.
+
+| Property | Behaviour |
+| -------- | --------- |
+| **Ordering** | **FIFO — oldest first**, the opposite of the orders list. Tie-broken on `id`, so two tickets rung up in the same second don't shuffle between polls. |
+| **Scope** | **Today** in the app timezone by default. `?all=1` drops the date filter — and only the date filter; it never widens the tenant. |
+| **Pagination** | None. A barista cannot page through drinks. |
+| **Cap** | `200` tickets (`KitchenQueueController::MAX_QUEUE_SIZE`). |
+| **Money** | **Absent entirely.** No prices, no totals, no payment method. |
+
+`?all=1` exists because the audited system silently lost work: an order
+rung up at 23:58 vanished from the queue two minutes later, and a queue
+left open overnight came back empty in the morning with drinks still
+unmade. Today-by-default keeps the screen small; `all=1` is how the
+kitchen finds anything that fell off the edge of a day.
+
+`waiting_seconds` is **computed server-side** from `created_at`. A kitchen
+tablet's clock can be minutes off, and "this order has been waiting 14
+minutes" derived from a skewed clock is confidently wrong — and it drives
+whether staff apologise to a customer. Every ticket in one response is
+measured from the same instant, so orders created in the same second never
+report different ages.
+
+`KitchenOrderResource` is a **separate class** from `OrderResource`, not
+`OrderResource` with flags. Different audience, different question: the
+merchant's order list is a financial record, a kitchen ticket is a work
+instruction. The kitchen screen is also the most-displayed and
+least-access-controlled surface in the shop — often visible over the
+counter — so it carries no money at all.
+
+**The cap.** 200 is far beyond any real counter-service backlog, so in
+practice it never truncates; it exists so the worst case is a large
+response rather than an unbounded one. Because the queue is oldest-first,
+truncation drops the *newest* tickets and keeps the front of the line.
+The summary's `pending_count` is **uncapped**, so a screen comparing it to
+`data.length` can always tell it is seeing a truncated view.
+
+`oldest_waiting_seconds` is `null` on an empty queue, never `0` — "nothing
+has been waiting" and "something has been waiting no time at all" are
+different facts, and a badge that turns red past a threshold must not
+confuse them.
+
+#### Polling
+
+There are no websockets yet, so the kitchen screen polls. Recommended
+intervals:
+
+| Endpoint | Interval |
+| -------- | -------- |
+| `/merchant/kitchen-queue` | **15s** |
+| `/merchant/kitchen-queue/summary` | **30s** |
+
+Both are built for it. They are pure reads with no cache mutation; items
+and add-ons are eager loaded, so the query count is **flat in the size of
+the queue** rather than `1 + 2N` (asserted in
+`tests/Feature/Orders/KitchenQueueTest.php`); the summary answers with a
+*single* aggregate query that loads no models and never touches
+`order_items`; and the ordering is total, so two polls a second apart
+return the same tickets in the same order.
+
+> One caveat worth knowing before adding more pollers: every
+> **authenticated** request writes `personal_access_tokens.last_used_at`
+> (Sanctum, platform-wide — not specific to these endpoints). At the
+> intervals above that is a few thousand small updates per screen per day.
+> Harmless at coffee-shop scale, but it is the reason these endpoints are
+> not literally write-free, and it is worth remembering if polling ever
+> gets more aggressive.
+
+### The POS menu, and its cache
+
+`GET /api/v1/merchant/menu` is what the till draws its tiles from: `id`,
+`name`, `price_cents`, `price_formatted`, `currency`, `is_available`.
+Available items only by default; `?include_unavailable=1` returns
+everything, for a manager screen that needs to see the greyed-out ones.
+
+It is a **read-only projection** of the shared `products` table, owned by
+the POS lane and living in `App\Domains\Orders` for that reason. Product
+management — categories, images, availability rules — belongs to the
+catalog module and will arrive in its own namespace. Nothing in the POS
+lane writes to `products`.
+
+**The cache key is namespaced by merchant, and nothing may bypass that.**
+
+```
+merchant:{merchant_id}:menu:available
+merchant:{merchant_id}:menu:all
+```
+
+`App\Domains\Shared\Support\MenuCache` is the only place those keys are
+constructed, and neither of its methods can produce one without a merchant
+id. This is not stylistic: the audited system cached its product list under
+a single global key (`pos_products`), so whichever merchant warmed the
+cache served their menu — prices included — to every other shop on the
+platform. That bug is invisible on a dev box with one merchant in it, which
+is why `tests/Feature/Orders/MenuTest.php` and the leakage suite both use
+two, and assert the key shape as well as the behaviour.
+
+> **For the catalog module:** any write that creates, updates, deletes, or
+> changes the price or availability of a product **must** call
+> `MenuCache::forget($product->merchant_id)`. A model observer on `Product`
+> is the obvious home for it. `forget()` clears every variant of that
+> merchant's menu and touches no one else's. The 60-second TTL is a safety
+> net for a missed invalidation, not a substitute for one — `ProductSeeder`
+> shows the intended shape.
+
 ### The products table is a shared contract
 
 `products` is a deliberately minimal table (`merchant_id`, `name`,
 `price_cents`, `currency`, `is_available`) created here only because orders
-need something to FK against and P2's checkout needs a server-side price to
+need something to FK against and checkout needs a server-side price to
 read. **The catalog module owns it** and extends it with its own
-migrations; Orders never widens it, and `App\Domains\Catalog\Models\Product`
-stays a bare model with no controller, policy, or resource.
+migrations; the POS lane never widens it, and
+`App\Domains\Catalog\Models\Product` stays a bare model with no controller,
+policy, or resource.
+
+`ProductSeeder` fills it with demo menus — data only, not a module. The two
+merchants get **deliberately different** catalogs: identical ones would make
+a cross-tenant leak invisible, since a menu endpoint serving the wrong
+merchant's products would still look perfectly correct on screen.
 
 ## Local setup
 
@@ -533,6 +865,14 @@ composer analyse              # Larastan static analysis
 The app expects PostgreSQL 16 (`DB_CONNECTION=pgsql`) and Redis for cache
 and queues — `php artisan migrate` needs a database that actually exists
 and a role with privileges on it.
+
+Deployments also need a scheduler entry, or nothing in
+`routes/console.php` ever runs — today that means checkout idempotency
+keys are never pruned and the table grows forever:
+
+```
+* * * * * cd /path/to/gasa-api && php artisan schedule:run >> /dev/null 2>&1
+```
 
 ### The test database
 

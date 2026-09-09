@@ -1,5 +1,8 @@
 <?php
 
+use App\Domains\Orders\Http\Controllers\CheckoutController;
+use App\Domains\Orders\Http\Controllers\KitchenQueueController;
+use App\Domains\Orders\Http\Controllers\MenuController;
 use App\Domains\Orders\Http\Controllers\OrderController;
 use App\Domains\Orders\Http\Controllers\OrderTransitionController;
 use Illuminate\Support\Facades\Route;
@@ -22,8 +25,32 @@ use Illuminate\Support\Facades\Route;
 Route::get('/whoami', fn () => response()->json(['portal' => 'merchant']))
     ->name('merchant.whoami');
 
+// The POS product list. A read-only projection of the shared `products`
+// table for the till — product management belongs to the catalog module,
+// in its own namespace, and must not be added here.
+Route::get('/menu', MenuController::class)->name('merchant.menu');
+
+// The kitchen screen. A read-only VIEW over pending orders — there is no
+// kitchen queue table and no kitchen-specific status. Completing a ticket
+// goes through the ordinary transition endpoint below, so the transition
+// map stays the only thing that decides what a legal status change is.
+//
+// Polled on a timer (no websockets yet), so both routes are pure reads.
+Route::prefix('kitchen-queue')->name('merchant.kitchen-queue.')->group(function (): void {
+    // Declared before the bare route purely for reading order; neither is
+    // parameterised, so they cannot collide.
+    Route::get('/summary', [KitchenQueueController::class, 'summary'])->name('summary');
+    Route::get('/', [KitchenQueueController::class, 'index'])->name('index');
+});
+
 Route::prefix('orders')->name('merchant.orders.')->group(function (): void {
     Route::get('/', [OrderController::class, 'index'])->name('index');
+
+    // Checkout. Declared before the /{order} routes purely for reading
+    // order; it can't collide with them, since those are GET/POST on a
+    // parameter segment.
+    Route::post('/', CheckoutController::class)->name('store');
+
     Route::get('/{order}', [OrderController::class, 'show'])->name('show');
 
     // POST, not PATCH: these are named operations on an order, not
