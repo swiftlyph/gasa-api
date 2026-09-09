@@ -160,6 +160,7 @@ header — never a redirect.
 | 422    | `remittance_exceeds_cash` | A remittance amount exceeds the session's currently expected cash on hand |
 | 422    | `remittance_already_confirmed` | Confirming a remittance that is already confirmed                |
 | 403    | `confirmation_requires_second_user` | Confirming a remittance you created yourself                |
+| 422    | `range_too_large`      | A report's `?from=`/`?to=` spans more than 366 days (see § Reporting) |
 | 429    | `too_many_attempts`    | `/auth/login` — 6th+ attempt from the same email+IP within a minute |
 | 500    | `server_error`         | Unhandled exception (message hidden unless `APP_DEBUG=true`)    |
 
@@ -185,12 +186,15 @@ wrapping setting. So the actual contract, going forward:
 - **Paginated list** (`/merchant/orders`, `/merchant/cash-sessions`, any
   future `index` endpoint): always `{ data: [...], links: {...}, meta: {...} }`.
 - **Unpaginated list** (`/merchant/menu`, `/merchant/kitchen-queue`,
-  `/merchant/registers`): `{ data: [...] }` — a `data` key so every list
-  endpoint looks alike to a client, but no `links`/`meta`, because there
-  are no pages to link to.
-- **Scalar summary** (`/merchant/kitchen-queue/summary`): a flat object of
-  the values themselves — `{ pending_count, oldest_waiting_seconds }`. No
-  `data` wrapper, because there is no collection to wrap.
+  `/merchant/registers`, `/merchant/reports/sales-by-day`,
+  `/merchant/reports/top-items`): `{ data: [...] }` — a `data` key so every
+  list endpoint looks alike to a client, but no `links`/`meta`, because
+  there are no pages to link to.
+- **Scalar summary** (`/merchant/kitchen-queue/summary`,
+  `/merchant/reports/sales-summary`): a flat object of the values
+  themselves — `{ pending_count, oldest_waiting_seconds }`,
+  `{ orders_count, ... }`. No `data` wrapper, because there is no
+  collection to wrap.
 - **Nullable single resource** (`/merchant/cash-sessions/current`):
   `{ "data": null }` when nothing matches — a cash session's "current" can
   legitimately not exist (no till opened yet), which is a different fact
@@ -1064,6 +1068,140 @@ remittance_already_confirmed`.
 > `attachment_path` column exists on `cash_remittances` so a later upload
 > feature only has to add behaviour, not schema, but no endpoint writes it
 > yet, and it stays `null` on every row.
+
+## Reporting
+
+Date-range reporting over `orders`. **Scope: date-range only.**
+Session-scoped reporting — a true Z-report per cash session — is
+deliberately **out of scope** here; it belongs to a later phase now that
+P4's session model exists, and would answer a different question ("what
+happened in this till shift") from everything below ("what happened in
+this date range").
+
+| Method | Route                                    | Notes                        |
+| ------ | ----------------------------------------- | ----------------------------- |
+| `GET`  | `/api/v1/merchant/reports/sales-summary`  | One row of aggregate figures for the range |
+| `GET`  | `/api/v1/merchant/reports/sales-by-day`   | One row per local day, zero-filled |
+| `GET`  | `/api/v1/merchant/reports/top-items`      | Best sellers, from order line snapshots |
+
+Every endpoint is **read-only** (Sanctum's `last_used_at` aside — see §
+Polling) and takes the same `?from=`/`?to=` pair, handled once by
+`ReportDateRangeRequest`:
+
+- **Inclusive**, both ends: `?from=2026-09-01&to=2026-09-03` covers three
+  whole calendar days.
+- Resolved through **MerchantDay** — see § Day boundaries. A day belongs
+  to the report exactly as it belongs to the orders list and the kitchen
+  queue; this is the reason Part A's day-boundary fix mattered beyond the
+  two endpoints that shipped it originally.
+- **Both default to today** when omitted, so every report answers
+  something with no query string at all rather than 422ing or scanning
+  the whole table.
+- Capped at **366 days** (`ReportDateRangeRequest::MAX_RANGE_DAYS`) — a
+  leap year's worth of daily figures, generous for "how did last year
+  compare" without leaving the aggregate queries unbounded. Beyond it:
+  `422 range_too_large`, its own code because both dates are individually
+  valid — this is a request for more aggregation than this phase serves
+  without caching, not a malformed request. `from > to` is a plain `422
+  validation_failed`.
+
+**Accounting rules, the same across every report below:**
+
+- **Voided orders never contribute to revenue.** Every `gross_cents` /
+  `discount_cents` / `net_cents` / payment-method figure excludes them.
+  Their count is reported separately (`voided_count` on the summary) so
+  "how many sales" and "how many voids" stay two different numbers.
+- **Pending orders DO count as revenue.** This is a counter-service shop:
+  the customer paid at creation (see § Payment), and "not yet completed"
+  describes the drink, not the sale.
+- **A split order's `cash_cents`/`gcash_cents` land in their own
+  buckets**, summing to the order's total exactly once — never the full
+  total double-counted into both. This is the same accounting
+  `ReconcileCashSessionAction` already uses for cash-session reconciliation
+  (see § Reconciliation) — reporting and reconciliation must never disagree
+  about what a split order contributed.
+
+**Efficiency.** Every report is a **small, fixed number of aggregate SQL
+queries** — conditional aggregates (`FILTER (WHERE ...)`, native to
+Postgres 16) rather than one query per figure, and never orders loaded
+into PHP to be summed by hand. Query counts are asserted flat in the size
+of the dataset in `tests/Feature/Reports/ReportingTest.php`. No new index
+was needed: `(merchant_id, created_at)` and `(merchant_id, status,
+created_at)` (added for the kitchen queue — see its migration) already
+cover every range scan these queries run; `order_items.order_id` (existing)
+covers the join `top-items` performs back to `orders`.
+
+### GET /merchant/reports/sales-summary
+
+```json
+{
+  "orders_count": 4,
+  "completed_count": 2,
+  "voided_count": 1,
+  "gross_cents": 23000,
+  "gross_formatted": "₱230.00",
+  "discount_cents": 500,
+  "discount_formatted": "₱5.00",
+  "net_cents": 22500,
+  "net_formatted": "₱225.00",
+  "by_payment_method": {
+    "cash": { "count": 1, "amount_cents": 13000, "amount_formatted": "₱130.00" },
+    "gcash": { "count": 1, "amount_cents": 9500, "amount_formatted": "₱95.00" },
+    "split": { "count": 1, "amount_cents": 8000, "amount_formatted": "₱80.00" }
+  },
+  "average_order_cents": 7500,
+  "average_order_formatted": "₱75.00"
+}
+```
+
+A flat object (no `data` wrapper) — a scalar summary, matching the shape
+`/merchant/kitchen-queue/summary` already established (see § Response
+shapes). `by_payment_method.{cash,gcash}.count` is how many orders were
+paid **purely** that way — a split order counts once, under `split`, not
+under both — but its money still lands in all three `amount_cents`
+figures, since the drawer and the gcash settlement both genuinely
+received their share. `average_order_cents` divides `net_cents` by
+`orders_count - voided_count`: the average size of a sale that actually
+happened, not diluted by orders that were reversed.
+
+### GET /merchant/reports/sales-by-day
+
+```json
+{
+  "data": [
+    { "date": "2026-09-01", "orders_count": 12, "net_cents": 184000, "net_formatted": "₱1,840.00" },
+    { "date": "2026-09-02", "orders_count": 0, "net_cents": 0, "net_formatted": "₱0.00" },
+    { "date": "2026-09-03", "orders_count": 9, "net_cents": 121500, "net_formatted": "₱1,215.00" }
+  ]
+}
+```
+
+One row **per local calendar day in the range, ordered ascending**, days
+with no sales present as a **zero row** rather than absent — a chart built
+on rows that silently skip empty days lies about the gap. Grouping happens
+in the same query as the aggregation (`created_at` shifted into
+merchant-local wall-clock time before truncating to a date), not by
+pulling every order into PHP; empty days are filled in afterward over a
+range bounded by the same 366-day cap that bounds the query itself.
+
+### GET /merchant/reports/top-items
+
+```json
+{
+  "data": [
+    { "product_name": "Cafe Latte (16oz)", "quantity_sold": 142, "net_cents": 2130000, "net_formatted": "₱21,300.00" },
+    { "product_name": "Americano (12oz)", "quantity_sold": 98, "net_cents": 882000, "net_formatted": "₱8,820.00" }
+  ]
+}
+```
+
+Ordered by `quantity_sold` descending, `?limit=` (default 10, max 50).
+Grouped by `product_name` **as stored on the order line** — the SNAPSHOT
+(see § Line items are snapshots) — never by `product_id`. A renamed
+product still reports under the name it sold as at the time; a deleted
+product (`product_id` set `NULL`) still reports in full, because this
+report never joins back to `products` for anything. Voided orders'
+lines are excluded entirely — a canceled sale sold nothing.
 
 ## Local setup
 
