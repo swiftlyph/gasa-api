@@ -1,6 +1,9 @@
 <?php
 
 use App\Domains\Auth\Models\User;
+use App\Domains\CashSessions\Models\CashRemittance;
+use App\Domains\CashSessions\Models\CashSession;
+use App\Domains\CashSessions\Models\Register;
 use App\Domains\Catalog\Models\Product;
 use App\Domains\Merchant\Models\Merchant;
 use App\Domains\Orders\Models\CheckoutIdempotencyKey;
@@ -876,5 +879,157 @@ test('a platform admin token is rejected by the kitchen endpoints', function () 
         $this->withToken($token)->getJson($uri)
             ->assertStatus(403)
             ->assertJson(['code' => 'forbidden']);
+    }
+});
+
+/*
+|--------------------------------------------------------------------------
+| CASH SESSIONS (phase P4)
+|--------------------------------------------------------------------------
+|
+| Registers, cash sessions, movements and remittances are all
+| BelongsToMerchant, so the primary guarantee is the same one already
+| proven above. What is worth asserting on purpose here: a session,
+| movement or remittance id from the other merchant is a 404 through
+| every one of the new endpoints — not just the obvious "list" ones — and
+| that opening a session on merchant two's register, or confirming merchant
+| two's remittance, is impossible even by id.
+*/
+
+test('a merchant only sees their own registers', function () {
+    $mine = Register::factory()->forMerchant($this->merchantOne)->create(['name' => 'Front Counter']);
+    Register::factory()->forMerchant($this->merchantTwo)->create(['name' => 'Front Counter']);
+
+    $token = $this->merchantOneUser->createToken('merchant')->plainTextToken;
+
+    $response = $this->withToken($token)->getJson('/api/v1/merchant/registers')->assertOk();
+
+    expect(collect($response->json('data'))->pluck('id')->all())->toBe([$mine->id]);
+});
+
+test('a merchant cannot open a session on another merchant\'s register', function () {
+    $foreignRegister = Register::factory()->forMerchant($this->merchantTwo)->create();
+
+    $token = $this->merchantOneUser->createToken('merchant')->plainTextToken;
+
+    // findOrFail inside OpenCashSessionAction resolves through the same
+    // tenant-scoped query every other lookup does, so a foreign register
+    // id is a 404 — never a 403, which would confirm it exists.
+    $this->withToken($token)
+        ->postJson('/api/v1/merchant/cash-sessions', [
+            'register_id' => $foreignRegister->id,
+            'opening_float_cents' => 10000,
+        ])
+        ->assertStatus(404);
+
+    expect(CashSession::withoutGlobalScope('merchant')->count())->toBe(0);
+});
+
+test('one merchant\'s open session is invisible to the other, even by id', function () {
+    $registerOne = Register::factory()->forMerchant($this->merchantOne)->create();
+    $session = CashSession::factory()
+        ->forMerchant($this->merchantOne, $registerOne, $this->merchantOneUser)
+        ->open()
+        ->create();
+
+    $tokenTwo = $this->merchantTwoUser->createToken('merchant')->plainTextToken;
+
+    $this->withToken($tokenTwo)->getJson("/api/v1/merchant/cash-sessions/{$session->id}")
+        ->assertStatus(404);
+
+    $this->withToken($tokenTwo)->postJson("/api/v1/merchant/cash-sessions/{$session->id}/close", [
+        'counted_cash_cents' => 0,
+    ])->assertStatus(404);
+
+    $this->withToken($tokenTwo)->postJson("/api/v1/merchant/cash-sessions/{$session->id}/movements", [
+        'type' => 'cash_in',
+        'amount_cents' => 1000,
+        'reason' => 'Attempted cross-tenant movement',
+    ])->assertStatus(404);
+
+    $this->withToken($tokenTwo)->postJson("/api/v1/merchant/cash-sessions/{$session->id}/remittances", [
+        'amount_cents' => 1000,
+    ])->assertStatus(404);
+});
+
+test('GET current for merchant two never returns merchant one\'s open session', function () {
+    $registerOne = Register::factory()->forMerchant($this->merchantOne)->create();
+    CashSession::factory()
+        ->forMerchant($this->merchantOne, $registerOne, $this->merchantOneUser)
+        ->open()
+        ->create();
+
+    // Merchant Two has no register at all yet — current must answer
+    // "nothing open," never reach across and find Merchant One's session
+    // because it happens to be the only open one in the table.
+    $registerTwo = Register::factory()->forMerchant($this->merchantTwo)->create();
+
+    $tokenTwo = $this->merchantTwoUser->createToken('merchant')->plainTextToken;
+
+    $this->withToken($tokenTwo)
+        ->getJson('/api/v1/merchant/cash-sessions/current')
+        ->assertOk()
+        ->assertJsonPath('data', null);
+
+    expect($registerTwo->cashSessions()->count())->toBe(0);
+});
+
+test('a merchant cannot confirm another merchant\'s remittance', function () {
+    $registerOne = Register::factory()->forMerchant($this->merchantOne)->create();
+    $session = CashSession::factory()
+        ->forMerchant($this->merchantOne, $registerOne, $this->merchantOneUser)
+        ->open()
+        ->create(['opening_float_cents' => 100000]);
+
+    $remittance = CashRemittance::factory()
+        ->forSession($session, $this->merchantOneUser)
+        ->create(['amount_cents' => 5000]);
+
+    $tokenTwo = $this->merchantTwoUser->createToken('merchant')->plainTextToken;
+
+    // 404, not 403 confirmation_requires_second_user: merchant two is not
+    // "the wrong confirmer," the remittance simply does not exist as far
+    // as their tenant scope is concerned, and the two answers must not be
+    // distinguishable from the outside.
+    $this->withToken($tokenTwo)
+        ->postJson("/api/v1/merchant/remittances/{$remittance->id}/confirm")
+        ->assertStatus(404);
+
+    expect($remittance->fresh()->status->value)->toBe('pending');
+});
+
+test('a suspended merchant gets 403 merchant_inactive on every cash-session endpoint', function () {
+    $user = User::factory()->withRole('merchant')->create();
+    $merchant = Merchant::factory()->suspended()->ownedBy($user)->create(['name' => 'Suspended Merchant']);
+    $register = Register::factory()->forMerchant($merchant)->create();
+
+    $token = $user->createToken('merchant')->plainTextToken;
+
+    $this->withToken($token)->getJson('/api/v1/merchant/registers')
+        ->assertStatus(403)->assertJson(['code' => 'merchant_inactive']);
+
+    $this->withToken($token)->postJson('/api/v1/merchant/cash-sessions', ['opening_float_cents' => 1000])
+        ->assertStatus(403)->assertJson(['code' => 'merchant_inactive']);
+
+    $this->withToken($token)->getJson('/api/v1/merchant/cash-sessions')
+        ->assertStatus(403)->assertJson(['code' => 'merchant_inactive']);
+
+    $this->withToken($token)->getJson('/api/v1/merchant/cash-sessions/current')
+        ->assertStatus(403)->assertJson(['code' => 'merchant_inactive']);
+
+    expect($register->cashSessions()->count())->toBe(0);
+});
+
+test('an unauthenticated cash-session request is 401 JSON, never a redirect', function () {
+    foreach ([
+        '/api/v1/merchant/registers',
+        '/api/v1/merchant/cash-sessions',
+        '/api/v1/merchant/cash-sessions/current',
+    ] as $uri) {
+        $response = $this->getJson($uri)
+            ->assertStatus(401)
+            ->assertJson(['code' => 'unauthenticated']);
+
+        expect($response->headers->get('Location'))->toBeNull();
     }
 });

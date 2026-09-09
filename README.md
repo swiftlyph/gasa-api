@@ -155,6 +155,11 @@ header — never a redirect.
 | 422    | `discount_exceeds_subtotal` | Checkout discount is larger than the server-computed subtotal   |
 | 422    | `split_mismatch`       | Split payment whose `cash_cents` + `gcash_cents` don't equal the server-computed total |
 | 409    | `idempotency_key_reuse` | Checkout reused an `Idempotency-Key` with a different request body |
+| 409    | `session_already_open` | Opening a cash session on a register that already has one open        |
+| 422    | `session_closed`       | A movement, remittance, or second close attempted on a closed cash session |
+| 422    | `remittance_exceeds_cash` | A remittance amount exceeds the session's currently expected cash on hand |
+| 422    | `remittance_already_confirmed` | Confirming a remittance that is already confirmed                |
+| 403    | `confirmation_requires_second_user` | Confirming a remittance you created yourself                |
 | 429    | `too_many_attempts`    | `/auth/login` — 6th+ attempt from the same email+IP within a minute |
 | 500    | `server_error`         | Unhandled exception (message hidden unless `APP_DEBUG=true`)    |
 
@@ -177,14 +182,19 @@ wrapping setting. So the actual contract, going forward:
 - **Single resource** (`/auth/me`, `login`'s `user`, any `show` endpoint,
   and the 201 from checkout): flat object — `{ id, name, email, ... }`, no
   `data` key.
-- **Paginated list** (`/merchant/orders`, any future `index` endpoint):
-  always `{ data: [...], links: {...}, meta: {...} }`.
-- **Unpaginated list** (`/merchant/menu`, `/merchant/kitchen-queue`):
-  `{ data: [...] }` — a `data` key so every list endpoint looks alike to a
-  client, but no `links`/`meta`, because there are no pages to link to.
+- **Paginated list** (`/merchant/orders`, `/merchant/cash-sessions`, any
+  future `index` endpoint): always `{ data: [...], links: {...}, meta: {...} }`.
+- **Unpaginated list** (`/merchant/menu`, `/merchant/kitchen-queue`,
+  `/merchant/registers`): `{ data: [...] }` — a `data` key so every list
+  endpoint looks alike to a client, but no `links`/`meta`, because there
+  are no pages to link to.
 - **Scalar summary** (`/merchant/kitchen-queue/summary`): a flat object of
   the values themselves — `{ pending_count, oldest_waiting_seconds }`. No
   `data` wrapper, because there is no collection to wrap.
+- **Nullable single resource** (`/merchant/cash-sessions/current`):
+  `{ "data": null }` when nothing matches — a cash session's "current" can
+  legitimately not exist (no till opened yet), which is a different fact
+  from "not found," so this is a 200 with a null payload, never a 404.
 
 This is why: don't "fix" a paginated endpoint that returns a wrapped
 shape later — that's correct, expected Laravel behavior, not a
@@ -264,6 +274,46 @@ never needs a follow-up `GET`.
 "split"`, where they sum exactly to `total_cents`. `product_id` is `null`
 once the catalog entry is deleted — the line still renders in full, which
 is the whole point (see § Orders).
+
+#### The cash session payload
+
+Open, close, `current`, `show`, and the history list all return this
+shape (the list wraps it in `{ data, links, meta }`):
+
+```json
+{
+  "id": 3,
+  "register_id": 1,
+  "status": "open",
+  "opening_float_cents": 100000,
+  "opening_float_formatted": "₱1,000.00",
+  "opened_by_user_id": 4,
+  "closed_by_user_id": null,
+  "opened_at": "2026-09-10T08:00:00.000000Z",
+  "closed_at": null,
+  "notes": null,
+  "reconciliation": {
+    "opening_float_cents": 100000,
+    "cash_sales_cents": 14000,
+    "voided_cash_cents": 0,
+    "cash_in_cents": 0,
+    "cash_out_cents": 0,
+    "confirmed_remittances_cents": 0,
+    "expected_cash_cents": 114000,
+    "counted_cash_cents": null,
+    "variance_cents": null
+  },
+  "movements": [],
+  "remittances": []
+}
+```
+
+`reconciliation` is **always present**, but what it reports depends on
+`status` — see § Cash sessions for the full formula and why the figures
+differ between an open and a closed session. `movements`/`remittances`
+are only present when the endpoint loads them (`current` and `show` do;
+the paginated history list does not, to keep a page of sessions from
+turning into N+1 nested collections).
 
 ### Money
 
@@ -846,6 +896,129 @@ policy, or resource.
 merchants get **deliberately different** catalogs: identical ones would make
 a cross-tenant leak invisible, since a menu endpoint serving the wrong
 merchant's products would still look perfectly correct on screen.
+
+## Cash sessions
+
+Counter-service shops collect cash, and a till has to be reconciled: does
+what's physically in the drawer match what the system says was rung up?
+The audited system answered that with one cash session per calendar day
+for the entire deployment, cash movements appended to a growing free-text
+blob, and remittances confirmable by whoever created them. All three are
+rejected designs here.
+
+| Method | Route                                              | Notes |
+| ------ | --------------------------------------------------- | ----- |
+| `GET`  | `/api/v1/merchant/registers`                         | Listing only; `is_default` marks the merchant's default |
+| `POST` | `/api/v1/merchant/cash-sessions`                     | Open a session: `{ register_id?, opening_float_cents, notes? }` |
+| `GET`  | `/api/v1/merchant/cash-sessions`                     | Paginated history; `?status=`, `?register_id=`, `?from=`, `?to=` |
+| `GET`  | `/api/v1/merchant/cash-sessions/current`             | The open session for a register (or the default); `{ "data": null }` when nothing is open |
+| `GET`  | `/api/v1/merchant/cash-sessions/{cashSession}`       | One session, with its movements, remittances, and reconciliation |
+| `POST` | `/api/v1/merchant/cash-sessions/{cashSession}/movements` | Record cash in/out: `{ type, amount_cents, reason }` |
+| `POST` | `/api/v1/merchant/cash-sessions/{cashSession}/close` | `{ counted_cash_cents, notes? }` — snapshots expected, computes variance |
+| `POST` | `/api/v1/merchant/cash-sessions/{cashSession}/remittances` | Create a pending remittance: `{ amount_cents, note? }` |
+| `POST` | `/api/v1/merchant/remittances/{remittance}/confirm`  | Confirm — must be a different user than the creator |
+
+There is **no** `DELETE` anywhere in this group either: a session, a
+movement, and a remittance are all financial records, the same rule that
+governs orders.
+
+### Registers
+
+A `registers` table exists from day one, with **one default register
+seeded per merchant** — a single-till shop never notices it exists. "The
+default" is the merchant's oldest active register
+(`App\Domains\CashSessions\Support\DefaultRegister`), not a stored flag:
+that needs no uniqueness rule and no transfer-of-default logic when a
+register is retired. There is no register CRUD beyond listing this phase —
+creating and retiring registers is a merchant-settings concern for later.
+
+### The cash session lifecycle
+
+```
+open ──▶ closed   (terminal)
+```
+
+One transition, and it never reverses — closing is not "paused," and
+there is no reopen. `App\Domains\CashSessions\Enums\CashSessionStatus`
+mirrors the pattern `OrderStatus` sets: a backed enum whose shape is the
+typed view of the database's own CHECK constraint.
+
+**Only one open session per register at a time**, enforced by a
+**PARTIAL UNIQUE INDEX** — `UNIQUE (register_id) WHERE status = 'open'` —
+not just a validation check. A composite unique index on
+`(register_id, status)` can't express this: it would also forbid a
+register from ever having two *closed* sessions in its history, which is
+the ordinary case on day two. Opening a second session on an already-open
+register is `409 session_already_open`; two different registers on one
+merchant can each hold their own open session with no conflict.
+
+### The cash ledger
+
+`cash_movements` is a normalised row per movement — `type` (`cash_in` |
+`cash_out`), `amount_cents` (always positive; the type alone carries
+direction), and `reason` — never appended text. Rejected on a closed
+session with `422 session_closed`.
+
+### Reconciliation
+
+`App\Domains\CashSessions\Actions\ReconcileCashSessionAction` is **the
+single authority** on expected cash, and the figure is **derived, every
+time it's asked for** — never a running total that could drift from its
+own inputs. The formula, in the order its terms are summed:
+
+```
+expected_cash =
+    opening_float
+  + cash sales attributed to the session
+  − voided orders' cash contribution
+  + cash_in movements − cash_out movements
+  − confirmed remittances
+```
+
+"Cash sales" means the **cash portion only**: a pure-cash order's full
+`total_cents`, plus a split order's `cash_cents` half. **GCash never
+counts**, in either direction — gcash settles electronically and never
+touches the physical till, so a voided gcash order changes nothing here,
+while a voided cash order subtracts back out exactly the cash portion it
+had contributed. Only **confirmed** remittances subtract; a pending one is
+a claim, not proof, and counting it early would make the drawer look short
+of cash it still physically holds.
+
+On an **open** session this figure is computed live on every read (`GET
+.../current`, `GET .../{cashSession}`). On a **closed** session,
+`expected_cash_cents`, `counted_cash_cents` and `variance_cents` are the
+values **frozen at close** by `CloseCashSessionAction` — a later
+correction on some other still-open session can never reach back and
+change a closed session's history. `variance_cents = counted − expected`:
+positive is an over, negative is a short, and it is never stored as an
+absolute value — a shop needs to know which direction it went.
+
+### Checkout attribution
+
+`CheckoutAction` stamps `orders.cash_session_id` from the **open session
+on the register in context** (an optional `register_id` on checkout,
+defaulting to the merchant's default register). If no session is open,
+**checkout still succeeds with a null session** — a cashier who forgot to
+open the till must not be blocked from selling. Existing orders (pre-P4)
+stay null and are **not backfilled**: there is no session a backfill could
+correctly assign them to, and a guess would fabricate an audit trail for
+sales that never went through one.
+
+### Remittances and segregation of duties
+
+A remittance is cash physically taken out of the till. It is created
+`pending` and can only be moved to `confirmed` by a **different user**
+than the one who created it — `403 confirmation_requires_second_user`
+otherwise — enforced in `ConfirmRemittanceAction`, not left as a UI
+convention a client could skip. The amount may not exceed the session's
+**live** expected cash at the moment of creation (`422
+remittance_exceeds_cash`); confirming twice is `422
+remittance_already_confirmed`.
+
+> **TODO — attachment uploads are out of scope this phase.** The
+> `attachment_path` column exists on `cash_remittances` so a later upload
+> feature only has to add behaviour, not schema, but no endpoint writes it
+> yet, and it stays `null` on every row.
 
 ## Local setup
 

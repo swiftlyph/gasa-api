@@ -111,6 +111,16 @@ class CheckoutRequest extends FormRequest
 
             'discount_cents' => ['sometimes', 'integer', 'min:0'],
 
+            // P4: which till this sale is rung up on, for cash-session
+            // attribution only — see CheckoutAction::resolveOpenCashSessionId().
+            // Optional; omitted means the merchant's default register.
+            // Not Rule::exists() scoped to the merchant: tenancy is
+            // BelongsToMerchant's job via the scoped Register lookup in
+            // the Action, not a validation rule's — a foreign or unknown
+            // id there simply resolves to no open session, exactly like
+            // "no register configured" would.
+            'register_id' => ['sometimes', 'integer', 'min:1'],
+
             // `list`, not just `array`: a JSON object ({"0": {...}}) would
             // otherwise pass, arrive with string keys, and quietly become a
             // basket whose ordering the client controls. A basket is a
@@ -151,11 +161,20 @@ class CheckoutRequest extends FormRequest
      * inside the hashed payload would make every attempt unique and the
      * whole mechanism inert.
      *
+     * `register_id` (P4) rides along in this same payload rather than
+     * being split out like the key: CheckoutFingerprint::normalise()
+     * only reads the fields that change what is sold or charged and
+     * silently ignores everything else, so register_id already has no
+     * effect on the fingerprint without needing its own exclusion here —
+     * which is correct, since which till a sale is rung up on isn't part
+     * of "is this the same order."
+     *
      * @return array{
      *     payment_method: string,
      *     cash_cents?: int|null,
      *     gcash_cents?: int|null,
      *     discount_cents?: int|null,
+     *     register_id?: int,
      *     items: list<array{
      *         product_id: int,
      *         quantity: int,
@@ -171,6 +190,7 @@ class CheckoutRequest extends FormRequest
          *     cash_cents?: int|null,
          *     gcash_cents?: int|null,
          *     discount_cents?: int|null,
+         *     register_id?: int,
          *     items: list<array{product_id: int, quantity: int, add_ons?: list<array{name: string, price_cents: int}>}>
          * } $payload
          */

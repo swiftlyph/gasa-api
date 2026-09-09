@@ -3,6 +3,12 @@
 namespace Database\Seeders;
 
 use App\Domains\Auth\Models\User;
+use App\Domains\CashSessions\Actions\CloseCashSessionAction;
+use App\Domains\CashSessions\Actions\ConfirmRemittanceAction;
+use App\Domains\CashSessions\Actions\ReconcileCashSessionAction;
+use App\Domains\CashSessions\Enums\CashMovementType;
+use App\Domains\CashSessions\Models\CashSession;
+use App\Domains\CashSessions\Models\Register;
 use App\Domains\Catalog\Models\Product;
 use App\Domains\Merchant\Enums\MerchantStatus;
 use App\Domains\Merchant\Models\Merchant;
@@ -37,6 +43,12 @@ class DevSeeder extends Seeder
             // Suspended merchant: drives the 403 merchant_inactive path and
             // the frontend's suspended screen.
             ['email' => 'suspended@gasa.test', 'name' => 'Suspended Merchant Owner', 'role' => 'merchant'],
+
+            // P4: a second staff member on Merchant One, so remittance
+            // confirmation (which REQUIRES a different user than the
+            // creator) has someone real to demo against rather than only
+            // being exercisable in tests.
+            ['email' => 'cashier@gasa.test', 'name' => 'Merchant One Cashier', 'role' => 'merchant'],
         ];
 
         $users = [];
@@ -56,6 +68,13 @@ class DevSeeder extends Seeder
         $merchantTwo = $this->seedMerchant('Merchant Two', MerchantStatus::Active, $users['merchant2@gasa.test']);
         $this->seedMerchant('Suspended Merchant', MerchantStatus::Suspended, $users['suspended@gasa.test']);
 
+        // P4's second staff member, attached as a plain member rather than
+        // owner — syncWithoutDetaching keeps this idempotent alongside the
+        // owner pivot seedMerchant() already wrote.
+        $merchantOne->users()->syncWithoutDetaching([
+            $users['cashier@gasa.test']->id => ['role_in_merchant' => 'cashier'],
+        ]);
+
         // Both active merchants get a catalog and order history. BOTH, not
         // just one: the kitchen and POS frontends demo against this data,
         // and with a single merchant seeded, "correctly scoped" and "not
@@ -73,6 +92,20 @@ class DevSeeder extends Seeder
 
             $this->seedCatalogAndOrders($merchantOne, $users['merchant@gasa.test']);
             $this->seedCatalogAndOrders($merchantTwo, $users['merchant2@gasa.test']);
+
+            // P4: a default register per merchant, plus cash-session
+            // history so the reconciliation screens have live and closed
+            // examples to demo against — after orders, since Merchant
+            // One's open session below attributes a fresh sale to itself.
+            $registerOne = $this->seedDefaultRegister($merchantOne);
+            $this->seedDefaultRegister($merchantTwo);
+
+            // Only Merchant One demos the closed/confirmed history: doing
+            // it needs a SECOND user to confirm the remittance, and
+            // Merchant Two has only its single owner seeded above.
+            $this->seedClosedCashSession($registerOne, $users['merchant@gasa.test'], $users['cashier@gasa.test']);
+
+            $this->seedOpenCashSession($registerOne, $users['merchant@gasa.test']);
         });
     }
 
@@ -132,5 +165,100 @@ class DevSeeder extends Seeder
         $factory()->completed()->split()->withItems(1, $products, 2)->create();
 
         $factory()->voided($cashier)->gcash()->withItems(2, $products)->create();
+    }
+
+    /**
+     * One default register per merchant. updateOrCreate on
+     * (merchant_id, name) — the pair the table's own unique index is
+     * built on — so re-seeding never duplicates.
+     */
+    private function seedDefaultRegister(Merchant $merchant): Register
+    {
+        return Register::query()->updateOrCreate(
+            ['merchant_id' => $merchant->getKey(), 'name' => 'Front Counter'],
+            ['is_active' => true],
+        );
+    }
+
+    /**
+     * A closed, reconciled session with a float, a cash_in, a cash_out,
+     * and a remittance CONFIRMED by a second user — the full lifecycle a
+     * frontend needs to render every field of the session payload against
+     * something real, including the fields (confirmed_by_user_id,
+     * variance_cents) that only ever appear once something has happened.
+     *
+     * Idempotent the same way orders are: sessions aren't updateOrCreate-
+     * able (opening one is a real event with its own id), so re-running
+     * skips a register that already has one.
+     */
+    private function seedClosedCashSession(Register $register, User $opener, User $confirmer): void
+    {
+        if ($register->cashSessions()->exists()) {
+            return;
+        }
+
+        $session = CashSession::factory()
+            ->forMerchant($register->merchant, $register, $opener)
+            ->open()
+            ->create(['opening_float_cents' => 500000]); // ₱5,000.00
+
+        $session->movements()->create([
+            'merchant_id' => $register->merchant_id,
+            'type' => CashMovementType::CashIn,
+            'amount_cents' => 100000, // ₱1,000.00 change fund top-up
+            'reason' => 'Change fund top-up',
+            'created_by_user_id' => $opener->getKey(),
+        ]);
+
+        $session->movements()->create([
+            'merchant_id' => $register->merchant_id,
+            'type' => CashMovementType::CashOut,
+            'amount_cents' => 25000, // ₱250.00
+            'reason' => 'Petty cash for cleaning supplies',
+            'created_by_user_id' => $opener->getKey(),
+        ]);
+
+        $remittance = $session->remittances()->create([
+            'merchant_id' => $register->merchant_id,
+            'amount_cents' => 300000, // ₱3,000.00 bank drop
+            'note' => 'End-of-day bank drop',
+            'created_by_user_id' => $opener->getKey(),
+        ]);
+
+        // Through the real Action, not a direct assignment: $confirmer is
+        // a genuine second user here (the seeded cashier), so this
+        // exercises the same segregation-of-duties path production does,
+        // matching how OrderFactory issues numbers through
+        // GenerateOrderNumberAction rather than inventing its own.
+        app(ConfirmRemittanceAction::class)->execute($remittance, $confirmer);
+
+        // Counted a small amount SHORT of expected, so the demo shows a
+        // non-zero variance — an exact match everywhere would hide the
+        // one field (variance_cents) this whole feature exists to compute.
+        $expectedCashCents = app(ReconcileCashSessionAction::class)->expectedCashCents($session);
+
+        app(CloseCashSessionAction::class)->execute(
+            $session,
+            ['counted_cash_cents' => $expectedCashCents - 5000], // ₱50.00 short
+            $opener,
+        );
+    }
+
+    /**
+     * A currently-open session for the frontend to poll against — the
+     * only state that shows a LIVE (not yet snapshotted) reconciliation
+     * figure. Skipped if the register already has an open one, matching
+     * the partial-unique-index invariant this whole domain is built on.
+     */
+    private function seedOpenCashSession(Register $register, User $opener): void
+    {
+        if ($register->cashSessions()->where('status', 'open')->exists()) {
+            return;
+        }
+
+        CashSession::factory()
+            ->forMerchant($register->merchant, $register, $opener)
+            ->open()
+            ->create(['opening_float_cents' => 500000]);
     }
 }

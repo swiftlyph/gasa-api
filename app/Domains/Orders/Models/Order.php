@@ -3,6 +3,7 @@
 namespace App\Domains\Orders\Models;
 
 use App\Domains\Auth\Models\User;
+use App\Domains\CashSessions\Models\CashSession;
 use App\Domains\Orders\Enums\OrderStatus;
 use App\Domains\Orders\Enums\PaymentMethod;
 use App\Domains\Orders\Policies\OrderPolicy;
@@ -47,6 +48,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
  * @property int|null $cash_cents
  * @property int|null $gcash_cents
  * @property int $created_by_user_id
+ * @property int|null $cash_session_id
  * @property CarbonInterface|null $completed_at
  * @property CarbonInterface|null $voided_at
  * @property int|null $voided_by_user_id
@@ -88,6 +90,12 @@ class Order extends Model
         'cash_cents',
         'gcash_cents',
         'created_by_user_id',
+
+        // P4: which till session (if any) this sale was rung up in. Set
+        // by CheckoutAction only — never client-supplied — and stays null
+        // for every order created before P4 (not backfilled; see
+        // add_cash_session_id_to_orders_table).
+        'cash_session_id',
     ];
 
     /**
@@ -112,6 +120,7 @@ class Order extends Model
             'total_cents' => 'integer',
             'cash_cents' => 'integer',
             'gcash_cents' => 'integer',
+            'cash_session_id' => 'integer',
             'completed_at' => 'datetime',
             'voided_at' => 'datetime',
         ];
@@ -141,5 +150,17 @@ class Order extends Model
     public function voidedBy(): BelongsTo
     {
         return $this->belongsTo(User::class, 'voided_by_user_id');
+    }
+
+    /**
+     * The till session this sale was rung up in, if any was open at the
+     * time (P4). Null for every order created before P4, and for any
+     * order rung up on a till nobody opened — see CheckoutAction.
+     *
+     * @return BelongsTo<CashSession, $this>
+     */
+    public function cashSession(): BelongsTo
+    {
+        return $this->belongsTo(CashSession::class);
     }
 }

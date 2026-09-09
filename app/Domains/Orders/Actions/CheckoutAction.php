@@ -3,6 +3,10 @@
 namespace App\Domains\Orders\Actions;
 
 use App\Domains\Auth\Models\User;
+use App\Domains\CashSessions\Exceptions\NoRegisterConfigured;
+use App\Domains\CashSessions\Models\CashSession;
+use App\Domains\CashSessions\Models\Register;
+use App\Domains\CashSessions\Support\DefaultRegister;
 use App\Domains\Catalog\Models\Product;
 use App\Domains\Orders\Enums\OrderStatus;
 use App\Domains\Orders\Enums\PaymentMethod;
@@ -59,6 +63,7 @@ class CheckoutAction
      *     cash_cents?: int|null,
      *     gcash_cents?: int|null,
      *     discount_cents?: int|null,
+     *     register_id?: int|null,
      *     items: list<array{
      *         product_id: int,
      *         quantity: int,
@@ -68,6 +73,11 @@ class CheckoutAction
      *              rules are what make these list<…> rather than
      *              array<array-key, …>: a JSON object would otherwise pass
      *              `array` validation and arrive with string keys.
+     *              `register_id` (P4) is optional and defaults to the
+     *              merchant's default register (see DefaultRegister) —
+     *              it only decides WHICH register's open session, if any,
+     *              the sale is attributed to; it never affects pricing or
+     *              whether the checkout succeeds.
      */
     public function execute(array $payload, User $cashier): Order
     {
@@ -82,6 +92,8 @@ class CheckoutAction
         }
 
         return DB::transaction(function () use ($payload, $cashier, $merchant): Order {
+            $cashSessionId = $this->resolveOpenCashSessionId($payload, $merchant->getKey());
+
             $products = $this->resolveSellableProducts($payload['items']);
 
             [$lines, $subtotalCents] = $this->buildLines($payload['items'], $products);
@@ -113,6 +125,11 @@ class CheckoutAction
                 'gcash_cents' => $gcashCents,
                 'created_by_user_id' => $cashier->getKey(),
 
+                // Null when no session is open on the register in context
+                // — a shop that forgot to open the till must not be
+                // blocked from selling (see resolveOpenCashSessionId()).
+                'cash_session_id' => $cashSessionId,
+
                 // merchant_id is intentionally absent: BelongsToMerchant
                 // stamps it from the authenticated user and overwrites
                 // anything set here, so passing one would only be
@@ -133,6 +150,51 @@ class CheckoutAction
 
             return $order;
         });
+    }
+
+    /**
+     * The open session (if any) on the register in context, so the sale
+     * can be attributed to it. Register selection defaults to the
+     * merchant's default register (see DefaultRegister) when the payload
+     * doesn't name one.
+     *
+     * Returns null, and NEVER throws, when there is no register to
+     * attribute to or no session open on it — a shop that forgot to open
+     * the till, or has no register configured at all (every merchant
+     * fixture created before P4, in particular), must not be blocked from
+     * selling. This is the one place P4 touches checkout, and it is
+     * deliberately just an attribution stamp: it has no opinion on
+     * pricing, discounts, or whether the checkout itself succeeds.
+     *
+     * @param  array{register_id?: int|null, ...}  $payload
+     */
+    private function resolveOpenCashSessionId(array $payload, int $merchantId): ?int
+    {
+        try {
+            $register = isset($payload['register_id'])
+                ? Register::query()->find($payload['register_id'])
+                : DefaultRegister::for($merchantId);
+        } catch (NoRegisterConfigured) {
+            // Deliberately caught rather than propagated: checkout is not
+            // where "this merchant has no register" should ever surface —
+            // see the class docblock above.
+            return null;
+        }
+
+        if ($register === null) {
+            // A register_id that doesn't resolve (foreign, or simply
+            // wrong) is treated exactly like "no register named" would be
+            // treated if this merchant had none at all: no session to
+            // attribute to, sale proceeds regardless. Checkout is not the
+            // place to validate a register id — that would make an
+            // unrelated typo block a sale.
+            return null;
+        }
+
+        return CashSession::query()
+            ->where('register_id', $register->getKey())
+            ->where('status', 'open')
+            ->value('id');
     }
 
     /**

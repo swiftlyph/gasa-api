@@ -1,5 +1,9 @@
 <?php
 
+use App\Domains\CashSessions\Http\Controllers\CashMovementController;
+use App\Domains\CashSessions\Http\Controllers\CashRemittanceController;
+use App\Domains\CashSessions\Http\Controllers\CashSessionController;
+use App\Domains\CashSessions\Http\Controllers\RegisterController;
 use App\Domains\Orders\Http\Controllers\CheckoutController;
 use App\Domains\Orders\Http\Controllers\KitchenQueueController;
 use App\Domains\Orders\Http\Controllers\MenuController;
@@ -64,3 +68,45 @@ Route::prefix('orders')->name('merchant.orders.')->group(function (): void {
 // Note for later phases: there is NO DELETE route for an order, and there
 // must never be one. Orders are financial records — voiding is the
 // reversal, and it is terminal.
+
+// Registers. Listing only this phase — see App\Domains\CashSessions\
+// Models\Register's docblock for why there is no register CRUD here.
+Route::get('/registers', [RegisterController::class, 'index'])->name('merchant.registers.index');
+
+// Cash sessions, movements and remittances (P4). A cash session is a
+// till-shift: opened with a float, closed with a count. Movements and
+// remittances are always created against an explicit session, never
+// addressed on their own, which is why their routes are nested under
+// /cash-sessions/{cashSession}/... rather than living at their own
+// top-level prefix.
+Route::prefix('cash-sessions')->name('merchant.cash-sessions.')->group(function (): void {
+    Route::post('/', [CashSessionController::class, 'open'])->name('open');
+    Route::get('/', [CashSessionController::class, 'index'])->name('index');
+
+    // MUST be declared before /{cashSession}: unlike the static routes
+    // elsewhere in this file, this one really would collide the other way
+    // round — Laravel matches routes in declaration order, so "current"
+    // would otherwise be swallowed by {cashSession} and looked up as if
+    // it were an id.
+    Route::get('/current', [CashSessionController::class, 'current'])->name('current');
+
+    Route::get('/{cashSession}', [CashSessionController::class, 'show'])->name('show');
+    Route::post('/{cashSession}/close', [CashSessionController::class, 'close'])->name('close');
+
+    Route::post('/{cashSession}/movements', [CashMovementController::class, 'store'])
+        ->name('movements.store');
+
+    Route::post('/{cashSession}/remittances', [CashRemittanceController::class, 'store'])
+        ->name('remittances.store');
+});
+
+// Remittance confirmation lives at its own top-level route rather than
+// nested under a session, because confirming addresses the remittance
+// itself, not the session it belongs to — mirroring how order transitions
+// are addressed by {order}, not by some parent resource.
+Route::post('/remittances/{remittance}/confirm', [CashRemittanceController::class, 'confirm'])
+    ->name('merchant.remittances.confirm');
+
+// Note for later phases: there is no DELETE anywhere in this group either.
+// A cash session, a movement, and a remittance are all financial records —
+// the same "never deleted" rule that governs orders.
