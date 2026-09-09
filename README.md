@@ -516,6 +516,51 @@ transaction. Two taps on a POS "complete" button, or a completing terminal
 racing a voiding manager, would otherwise both pass the guard and the
 second write would silently overwrite the first.
 
+### Day boundaries
+
+Every "calendar day" question in the merchant API — the orders list'
+`?date=`, the kitchen queue's default "today", cash session history's
+`?from=`/`?to=`, and every reporting endpoint's date range — resolves
+through **one class**: `App\Domains\Orders\Support\MerchantDay`. Nowhere
+else decides where midnight is.
+
+"Merchant-local" is `config('merchant.day_timezone')`
+(`MERCHANT_DAY_TIMEZONE`, default `Asia/Manila`) — a **dedicated** setting,
+deliberately not `config('app.timezone')` (which stays `UTC`, correctly,
+for logging and storage). Conflating the two was a real production bug: a
+merchant in UTC+8 asking for "today" got UTC's today instead of theirs, so
+an order placed at 2:28 AM local — unambiguously "this morning" to
+everyone in the shop — was filed under the previous UTC calendar date. A
+merchant's "today" order count read 0 while the kitchen queue's own
+"today" (which happened to share the same underlying bug, just
+consistently) also silently disagreed with what a human would call today.
+
+There is no per-merchant timezone column yet, so every merchant currently
+shares this one value; when that column exists,
+`MerchantDay::timezone()` is the one call site that changes.
+
+**A second rule, easy to miss and worth stating on purpose:** every
+`timestamp` column a day boundary is compared against (`orders.created_at`,
+`cash_sessions.opened_at`) is `timestamp WITHOUT TIME ZONE` — naive UTC
+wall-clock digits, since `app.timezone` is `UTC` and that is what plain
+`now()` writes. Both Eloquent's date casting and the query grammar
+stringify a `Carbon` instance by its **own** wall-clock digits with no
+offset, so a `Asia/Manila`-zoned boundary bound straight into a query (or
+written straight into a model attribute) is compared/stored as if those
+digits were already UTC — silently several hours wrong, with no error.
+`MerchantDay::forQuery()` converts a merchant-local instant to its UTC
+equivalent, and is **required** at every point a value from this class
+touches a query binding or a model attribute — `MerchantDay::constrain()`
+already does this internally; any call site working with boundaries
+directly (as `CashSessionController`'s `?from=`/`?to=` does) must call it
+explicitly.
+
+Regression-tested at the moment the bug actually manifests: time frozen at
+00:30 merchant-local, which is the *previous* UTC calendar date. See
+`tests/Feature/Orders/OrderListTest.php`,
+`tests/Feature/Orders/KitchenQueueTest.php`, and the reporting tests below
+— all three must agree an order created then is "today."
+
 ### Checkout
 
 `POST /api/v1/merchant/orders` is the one endpoint that creates an order.
@@ -782,7 +827,7 @@ asks for them.
 | Property | Behaviour |
 | -------- | --------- |
 | **Ordering** | **FIFO — oldest first**, the opposite of the orders list. Tie-broken on `id`, so two tickets rung up in the same second don't shuffle between polls. |
-| **Scope** | **Today** in the app timezone by default. `?all=1` drops the date filter — and only the date filter; it never widens the tenant. |
+| **Scope** | **Today** in the merchant day timezone by default (see § Day boundaries). `?all=1` drops the date filter — and only the date filter; it never widens the tenant. |
 | **Pagination** | None. A barista cannot page through drinks. |
 | **Cap** | `200` tickets (`KitchenQueueController::MAX_QUEUE_SIZE`). |
 | **Money** | **Absent entirely.** No prices, no totals, no payment method. |

@@ -6,6 +6,7 @@ use App\Domains\Merchant\Models\Merchant;
 use App\Domains\Orders\Http\Controllers\KitchenQueueController;
 use App\Domains\Orders\Models\Order;
 use App\Domains\Orders\Models\OrderItem;
+use App\Domains\Orders\Support\MerchantDay;
 use Carbon\CarbonImmutable;
 use Database\Seeders\RoleSeeder;
 use Illuminate\Support\Facades\DB;
@@ -22,7 +23,7 @@ beforeEach(function () {
 
     // A fixed mid-morning instant, well clear of midnight so "today"
     // boundaries are never accidentally the thing under test.
-    CarbonImmutable::setTestNow(CarbonImmutable::parse('2026-09-09 10:00:00', config('app.timezone')));
+    CarbonImmutable::setTestNow(CarbonImmutable::parse('2026-09-09 10:00:00', config('merchant.day_timezone')));
 
     $this->user = User::factory()->withRole('merchant')->create();
     $this->merchant = Merchant::factory()->ownedBy($this->user)->create(['name' => 'Merchant One']);
@@ -167,9 +168,15 @@ test('yesterday is hidden by default and visible with all=1', function () {
     $today = Order::factory()->forMerchant($this->merchant)->pending()
         ->create(['created_at' => now()->subHours(2)]);
 
-    // 23:58 yesterday — the exact case the audited system silently lost.
+    // 23:58 yesterday, merchant-local — the exact case the audited system
+    // silently lost. Built from MerchantDay::startOfToday(), not a bare
+    // now()->startOfDay(): the merchant day timezone need not be UTC, and
+    // this fixture must mean "yesterday to the shop," not "yesterday UTC."
+    // forQuery() is required here too, not just on query bindings — a raw
+    // merchant-local Carbon written straight into created_at is stored by
+    // its own wall-clock digits, not converted (see MerchantDay).
     $lastNight = Order::factory()->forMerchant($this->merchant)->pending()
-        ->create(['created_at' => now()->startOfDay()->subMinutes(2)]);
+        ->create(['created_at' => MerchantDay::forQuery(MerchantDay::startOfToday()->subMinutes(2))]);
 
     expect(collect(($this->queue)()->assertOk()->json('data'))->pluck('id')->all())
         ->toBe([$today->id]);
@@ -180,9 +187,25 @@ test('yesterday is hidden by default and visible with all=1', function () {
         ->toBe([$lastNight->id, $today->id]);
 });
 
+test('the day-boundary regression: an order at 00:30 local (previous UTC date) is today', function () {
+    // Same production bug as OrderListTest's regression case: 00:30 in the
+    // merchant day timezone (Asia/Manila, UTC+8) is 16:30 the PREVIOUS day
+    // in UTC. The kitchen queue's "today" must agree with the orders
+    // list's "today" — they share MerchantDay precisely so this can't
+    // drift into two disagreeing notions of today.
+    CarbonImmutable::setTestNow(CarbonImmutable::parse('2026-09-10 00:30:00', config('merchant.day_timezone')));
+
+    $order = Order::factory()->forMerchant($this->merchant)->pending()->create(['created_at' => now()]);
+
+    expect(collect(($this->queue)()->assertOk()->json('data'))->pluck('id')->all())
+        ->toBe([$order->id]);
+
+    CarbonImmutable::setTestNow(CarbonImmutable::parse('2026-09-09 10:00:00', config('merchant.day_timezone')));
+});
+
 test('an order created exactly at midnight is today, not yesterday', function () {
     $midnight = Order::factory()->forMerchant($this->merchant)->pending()
-        ->create(['created_at' => now()->startOfDay()]);
+        ->create(['created_at' => MerchantDay::forQuery(MerchantDay::startOfToday())]);
 
     // Half-open range: >= start of today, < start of tomorrow. An
     // inclusive BETWEEN would put this order in both days.
@@ -266,7 +289,7 @@ test('an empty queue summarises as zero and null, not zero and zero', function (
 
 test('the summary respects all=1 exactly as the queue does', function () {
     Order::factory()->forMerchant($this->merchant)->pending()
-        ->create(['created_at' => now()->startOfDay()->subMinutes(2)]);
+        ->create(['created_at' => MerchantDay::forQuery(MerchantDay::startOfToday()->subMinutes(2))]);
 
     // The badge and the screen must never describe different sets.
     ($this->summary)()->assertOk()->assertJsonPath('pending_count', 0);

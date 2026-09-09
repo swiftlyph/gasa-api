@@ -67,13 +67,16 @@ class CashSessionController extends Controller
 
         // Day boundaries via MerchantDay, not inlined here — the same
         // reasoning as OrderController's ?date= filter: this endpoint and
-        // the orders list must agree about where midnight is.
+        // the orders list must agree about where midnight is. forQuery()
+        // converts the merchant-local boundary to UTC before it is bound
+        // into SQL — opened_at, like created_at, is naive-UTC storage; see
+        // MerchantDay's docblock.
         if ($from = $request->validated('from')) {
-            $query->where('opened_at', '>=', MerchantDay::startOf($from));
+            $query->where('opened_at', '>=', MerchantDay::forQuery(MerchantDay::startOf($from)));
         }
 
         if ($to = $request->validated('to')) {
-            $query->where('opened_at', '<', MerchantDay::startOf($to)->addDay());
+            $query->where('opened_at', '<', MerchantDay::forQuery(MerchantDay::startOf($to)->addDay()));
         }
 
         $sessions = $query->paginate($request->validated('per_page', 25))

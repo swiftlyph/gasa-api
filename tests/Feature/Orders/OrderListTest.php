@@ -4,6 +4,7 @@ use App\Domains\Auth\Models\User;
 use App\Domains\Catalog\Models\Product;
 use App\Domains\Merchant\Models\Merchant;
 use App\Domains\Orders\Models\Order;
+use Carbon\CarbonImmutable;
 use Database\Seeders\RoleSeeder;
 
 /**
@@ -103,6 +104,24 @@ test('the date filter selects a single merchant-local day', function () {
         ->getJson('/api/v1/merchant/orders?date='.$today->format('Y-m-d'))
         ->assertOk()
         ->assertJsonPath('meta.total', 2);
+});
+
+test('the day-boundary regression: an order at 00:30 local (previous UTC date) is today', function () {
+    // 00:30 in the merchant day timezone (Asia/Manila, UTC+8) is 16:30 the
+    // PREVIOUS day in UTC. If ?date= (or the default "today") ever resolves
+    // its boundary in UTC instead of merchant-local time, this order falls
+    // out of "today" — the exact production bug this test guards against.
+    CarbonImmutable::setTestNow(CarbonImmutable::parse('2026-09-10 00:30:00', config('merchant.day_timezone')));
+
+    $order = Order::factory()->forMerchant($this->merchant)->create(['created_at' => now()]);
+
+    $this->withToken($this->token)
+        ->getJson('/api/v1/merchant/orders?date=2026-09-10')
+        ->assertOk()
+        ->assertJsonPath('meta.total', 1)
+        ->assertJsonPath('data.0.id', $order->id);
+
+    CarbonImmutable::setTestNow();
 });
 
 test('a malformed date is a 422', function () {
