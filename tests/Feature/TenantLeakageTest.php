@@ -1227,6 +1227,38 @@ test('adding a team member with an email from another merchant never attaches th
     expect($this->merchantOne->users()->where('users.id', $this->merchantTwoUser->id)->exists())->toBeFalse();
 });
 
+/**
+ * P8: permissions are ADDITIVE to tenant ownership, never a substitute
+ * for it — a manager of merchant one holds orders.void (see
+ * RolePresets), but merchant two's order is outside their tenant
+ * entirely. BelongsToMerchant's global scope makes it 404 before
+ * OrderPolicy::void is ever reached, exactly like an owner would get —
+ * see PermissionsTest.php for the full role/permission matrix; this is
+ * the one place that matrix crosses a tenant boundary, which belongs
+ * here rather than there.
+ */
+test('P8: a manager of merchant one cannot void merchant two\'s order — 404, never 403, even though they hold orders.void', function () {
+    $managerOne = User::factory()->withRole('merchant')->create();
+    $this->merchantOne->users()->attach($managerOne->id, ['role_in_merchant' => 'manager']);
+
+    $productTwo = Product::factory()->create(['merchant_id' => $this->merchantTwo->id, 'price_cents' => 5000]);
+
+    $orderTwoId = $this->withToken($this->merchantTwoUser->createToken('merchant')->plainTextToken)
+        ->postJson('/api/v1/merchant/orders', [
+            'payment_method' => 'cash',
+            'items' => [['product_id' => $productTwo->id, 'quantity' => 1]],
+        ])
+        ->assertCreated()
+        ->json('id');
+
+    $this->withToken($managerOne->createToken('merchant')->plainTextToken)
+        ->postJson("/api/v1/merchant/orders/{$orderTwoId}/void")
+        ->assertStatus(404)
+        ->assertJson(['code' => 'not_found']);
+
+    expect(Order::withoutGlobalScope('merchant')->find($orderTwoId)->status->value)->toBe('pending');
+});
+
 test('a suspended merchant gets 403 merchant_inactive on profile and team endpoints', function () {
     $user = User::factory()->withRole('merchant')->create();
     Merchant::factory()->suspended()->ownedBy($user)->create(['name' => 'Suspended Merchant']);
