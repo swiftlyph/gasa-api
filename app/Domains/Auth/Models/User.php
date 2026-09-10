@@ -2,11 +2,15 @@
 
 namespace App\Domains\Auth\Models;
 
+use App\Domains\Merchant\Enums\MerchantPermission;
 use App\Domains\Merchant\Enums\MerchantStatus;
+use App\Domains\Merchant\Enums\RoleInMerchant;
 use App\Domains\Merchant\Models\Merchant;
+use App\Domains\Merchant\Support\RolePresets;
 use Database\Factories\UserFactory;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Database\Eloquent\Relations\Pivot;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
@@ -106,7 +110,75 @@ class User extends Authenticatable
         return $this->resolvedMerchant;
     }
 
+    /**
+     * This user's role_in_merchant on their single ACTIVE merchant, or
+     * null when merchant() is null (no active merchant at all).
+     *
+     * Reads the pivot off the SAME row merchant() already resolved and
+     * memoized, rather than issuing a second query — the pivot is always
+     * loaded alongside the related model on a BelongsToMany, so no extra
+     * round-trip is needed.
+     */
+    public function roleInMerchant(): ?RoleInMerchant
+    {
+        $merchant = $this->merchant();
+
+        if ($merchant === null) {
+            return null;
+        }
+
+        // Merchant declares no `pivot` property of its own — same reason
+        // TeamMemberResource reads it via getAttribute() rather than
+        // magic property access (see its docblock), one level up:
+        // Model::getAttribute() here (not Pivot::getAttribute(), since
+        // PHPStan already knows $merchant's own type and would flag
+        // ->pivot the same way it flags the property) returns a plain
+        // `mixed`, so this second getAttribute() call needs one too.
+        /** @var Pivot $pivot */
+        $pivot = $merchant->getAttribute('pivot');
+
+        /** @var string $role */
+        $role = $pivot->getAttribute('role_in_merchant');
+
+        return RoleInMerchant::from($role);
+    }
+
+    /**
+     * This user's merchant permissions, resolved from role_in_merchant
+     * via RolePresets. Empty (never null) when there is no active
+     * merchant — a user with no permissions and a user with no merchant
+     * both mean "can do nothing here," and callers (e.g. UserResource)
+     * shouldn't need to special-case which one it was.
+     *
+     * Memoized the same way merchant() is: a merchant-portal request may
+     * check several permissions in one policy chain (tenant ownership,
+     * then a specific ability), and each check would otherwise re-derive
+     * the same set.
+     *
+     * @return array<int, string>
+     */
+    public function merchantPermissions(): array
+    {
+        if ($this->resolvedPermissions === null) {
+            $role = $this->roleInMerchant();
+
+            $this->resolvedPermissions = $role === null ? [] : RolePresets::valuesFor($role);
+        }
+
+        return $this->resolvedPermissions;
+    }
+
+    public function hasMerchantPermission(MerchantPermission $permission): bool
+    {
+        return in_array($permission->value, $this->merchantPermissions(), true);
+    }
+
     private ?Merchant $resolvedMerchant = null;
 
     private bool $merchantResolved = false;
+
+    /**
+     * @var array<int, string>|null
+     */
+    private ?array $resolvedPermissions = null;
 }
