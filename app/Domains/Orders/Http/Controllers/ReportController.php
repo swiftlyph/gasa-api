@@ -18,10 +18,11 @@ use Illuminate\Http\JsonResponse;
  * nothing that ever gets written back (Sanctum's last_used_at aside, which
  * is platform-wide and not specific to this controller).
  *
- * Session-scoped reporting (a true Z-report per cash session) is
- * explicitly OUT OF SCOPE here — see README § Reporting. Everything below
- * answers "what happened in this date range," never "what happened in
- * this till shift."
+ * Session-scoped reporting (a true Z-report per cash session) lives in
+ * App\Domains\CashSessions\Reports\ZReportReport / CashSessionController::
+ * zReport() instead (P9) — see README § Shift report & receipt.
+ * Everything below answers "what happened in this date range," never
+ * "what happened in this till shift."
  *
  * All three actions share ReportDateRangeRequest for `from`/`to` — see its
  * docblock for the range rules and cap. Authorization goes through

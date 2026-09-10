@@ -1100,11 +1100,10 @@ remittance_already_confirmed`.
 ## Reporting
 
 Date-range reporting over `orders`. **Scope: date-range only.**
-Session-scoped reporting — a true Z-report per cash session — is
-deliberately **out of scope** here; it belongs to a later phase now that
-P4's session model exists, and would answer a different question ("what
-happened in this till shift") from everything below ("what happened in
-this date range").
+Session-scoped reporting — a true Z-report per cash session — lives in
+§ Shift report & receipt below (P9), and answers a different question
+("what happened in this till shift") from everything in this section
+("what happened in this date range").
 
 | Method | Route                                    | Notes                        |
 | ------ | ----------------------------------------- | ----------------------------- |
@@ -1230,6 +1229,161 @@ product still reports under the name it sold as at the time; a deleted
 product (`product_id` set `NULL`) still reports in full, because this
 report never joins back to `products` for anything. Voided orders'
 lines are excluded entirely — a canceled sale sold nothing.
+
+## Shift report & receipt
+
+Two read-only endpoints (P9), composing what P4–P8 already built rather
+than adding new business logic:
+
+| Method | Route                                        | Notes |
+| ------ | --------------------------------------------- | ----- |
+| `GET`  | `/api/v1/merchant/cash-sessions/{cashSession}/z-report` | One printable summary of a till shift; `?limit=` on `top_items` (default 10, max 50) |
+| `GET`  | `/api/v1/merchant/orders/{order}/receipt`     | Printable receipt data for one order — no PDF, no printer driver |
+
+Both are **read-only** (Sanctum's `last_used_at` aside — see § Polling),
+gated by the SAME permission their read-only sibling already uses
+(`drawer.view` for the Z-report, matching `GET /cash-sessions/{id}`;
+`orders.view` for the receipt, matching `GET /orders/{id}`) rather than a
+new permission of their own — a Z-report and a receipt are reads over a
+resource someone can already see, not a distinct capability.
+
+### The Z-report (per session, not per day)
+
+`GET /cash-sessions/{cashSession}/z-report` answers "what happened in
+THIS till shift" — every figure is attributed by `cash_session_id`,
+**never** by a date range or calendar day. This is the deliberate
+difference from every report in § Reporting above: an order rung up just
+before midnight belongs to the session that was open when it was created,
+not to whichever calendar day it lands on, so this endpoint uses no
+`MerchantDay` boundary at all. Works identically on an **open** session
+(every figure computed live) and a **closed** one (sales/top-items
+recomputed from immutable order data return the same answer every time;
+the cash block's `expected_cash`/`counted_cash`/`variance` are the values
+FROZEN at close — see § Reconciliation).
+
+```json
+{
+  "session": {
+    "id": 42,
+    "register_id": 3,
+    "register_name": "Front Counter",
+    "opened_by_user_id": 7,
+    "opened_at": "2026-09-10T06:00:00.000000Z",
+    "closed_by_user_id": null,
+    "closed_at": null,
+    "status": "open"
+  },
+  "float": { "opening_float_cents": 100000, "opening_float_formatted": "₱1,000.00" },
+  "sales": {
+    "orders_count": 4, "completed_count": 0, "pending_count": 3, "voided_count": 1,
+    "gross_cents": 30000, "gross_formatted": "₱300.00",
+    "discounts_cents": 0, "discounts_formatted": "₱0.00",
+    "net_cents": 30000, "net_formatted": "₱300.00",
+    "by_payment_method": {
+      "cash": { "count": 1, "amount_cents": 14000, "amount_formatted": "₱140.00" },
+      "gcash": { "count": 1, "amount_cents": 16000, "amount_formatted": "₱160.00" },
+      "split": { "count": 1, "amount_cents": 10000, "amount_formatted": "₱100.00" }
+    }
+  },
+  "top_items": [
+    { "product_name": "Cafe Latte (16oz)", "quantity_sold": 3, "net_cents": 30000, "net_formatted": "₱300.00" }
+  ],
+  "cash": {
+    "cash_sales_gross_cents": 24000, "cash_sales_gross_formatted": "₱240.00",
+    "voided_cash_cents": 10000, "voided_cash_formatted": "₱100.00",
+    "cash_in_cents": 20000, "cash_in_formatted": "₱200.00",
+    "cash_out_cents": 5000, "cash_out_formatted": "₱50.00",
+    "confirmed_remittances_cents": 30000, "confirmed_remittances_formatted": "₱300.00",
+    "expected_cash_cents": 99000, "expected_cash_formatted": "₱990.00",
+    "counted_cash_cents": null, "counted_cash_formatted": null,
+    "variance_cents": null, "variance_formatted": null
+  },
+  "movements": [ /* CashMovementResource, compact */ ],
+  "remittances": [ /* CashRemittanceResource, compact */ ],
+  "generated_at": "2026-09-10T14:32:00.000000Z"
+}
+```
+
+`sales` uses the **same accounting rules** as § Reporting's sales-summary
+(voided excluded from revenue, pending included, a split order's
+`cash_cents`/`gcash_cents` landing in the `cash`/`gcash` buckets exactly
+once each, in addition to its own `split` bucket) — a Z-report and
+sales-summary reading the same orders must never disagree about what they
+were worth. `top_items` uses the same snapshot-name grouping as
+top-items, voided lines excluded, scoped to this session
+(`cash_session_id`) instead of a date range.
+
+`cash` is `App\Domains\CashSessions\Actions\ReconcileCashSessionAction`'s
+own output, **reused, never re-derived** — the same reasoning as
+`GET /cash-sessions/{cashSession}`'s `reconciliation` block (see §
+Reconciliation): two implementations of a money formula would eventually
+disagree, so there is exactly one.
+
+**Orders with a `NULL cash_session_id` are not part of any Z-report.**
+They exist when a shop sells with no drawer open (see § Checkout
+attribution) — `cash_session_id` simply has nothing to attribute them to.
+They are NOT lost, though: § Reporting's date-range reports still capture
+them, since those key off `created_at`, not the session.
+
+### The receipt
+
+`GET /orders/{order}/receipt` composes the merchant's profile with one
+order's stored data — data only, no PDF/HTML rendering and no printer
+integration; the frontend renders and prints it.
+
+```json
+{
+  "merchant": {
+    "name": "Merchant One", "legal_name": "Merchant One Food Corp.",
+    "address_line1": "123 Rizal St", "address_line2": "Unit 4",
+    "city": "Cebu City", "postal_code": "6000", "phone": "+63 917 000 0000",
+    "tax_identifier": "123-456-789-000",
+    "receipt_header": "Thank you for visiting!",
+    "receipt_footer": "No refunds after 24 hours."
+  },
+  "order": {
+    "id": 91, "order_number": "ORD-000123", "status": "completed",
+    "created_at": "2026-09-10T06:12:00.000000Z",
+    "voided": false, "voided_at": null,
+    "cashier_name": "Alice Cashier",
+    "lines": [
+      {
+        "product_name": "Cafe Latte (16oz)", "quantity": 2,
+        "unit_price_cents": 12000, "unit_price_formatted": "₱120.00",
+        "line_total_cents": 24000, "line_total_formatted": "₱240.00",
+        "add_ons": [{ "name": "Extra shot", "price_cents": 3000, "price_formatted": "₱30.00" }]
+      }
+    ],
+    "subtotal_cents": 24000, "subtotal_formatted": "₱240.00",
+    "discount_cents": 2000, "discount_formatted": "₱20.00",
+    "total_cents": 22000, "total_formatted": "₱220.00",
+    "payment_method": "cash", "cash_cents": null, "gcash_cents": null
+  },
+  "generated_at": "2026-09-10T14:32:00.000000Z"
+}
+```
+
+A **VOIDED** order still returns `200` with this same shape — **never a
+`404`** — carrying `"voided": true` and its `voided_at` timestamp, front
+and center rather than buried in `"status": "voided"`: a reprint of a
+voided slip is an ordinary, expected action (proof for the customer that
+it was reversed), so the endpoint must always answer, prominently.
+
+**Snapshot discipline, read carefully — the two halves of this payload
+follow OPPOSITE rules on purpose:**
+
+- The `order` block is entirely the order's OWN stored snapshots — line
+  names, unit prices, add-ons, totals, payment split — exactly like
+  `OrderResource` (see § Line items are snapshots). A renamed or deleted
+  product, or a repriced catalog, never changes a past receipt.
+- The `merchant` block is read from the merchant profile **AS IT IS
+  NOW**, not as it was at sale time. Reprinting a receipt after the shop
+  edits its profile (a new `receipt_footer`, a corrected `tax_identifier`)
+  shows the **current** header/footer — this is intended, not a bug:
+  snapshotting the profile per order is explicitly out of scope this
+  phase. A shop that changes its printed letterhead mid-shift will see
+  old and new receipts differ if reprinted side by side; there is no
+  endpoint that freezes the profile at sale time.
 
 ## Merchant profile & team members
 

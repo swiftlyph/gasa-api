@@ -1157,6 +1157,81 @@ test('a platform admin token is rejected by the report endpoints', function () {
 
 /*
 |--------------------------------------------------------------------------
+| Z-REPORT & RECEIPT (phase P9)
+|--------------------------------------------------------------------------
+|
+| Both endpoints resolve their {cashSession}/{order} through the same
+| BelongsToMerchant-scoped route-model binding every other tenant-owned
+| resource in this file uses, and both reuse an EXISTING Policy method
+| (CashSessionPolicy::view, OrderPolicy::view) rather than declaring a new
+| one — so the primary guarantee is the one already proven above for
+| GET /cash-sessions/{id} and GET /orders/{id}. What's worth asserting on
+| purpose: a foreign session/order id is a 404 through THESE two new
+| routes specifically, not just the ones that shipped earlier.
+*/
+
+test('merchant two cannot reach merchant one\'s Z-report by id — 404', function () {
+    $registerOne = Register::factory()->forMerchant($this->merchantOne)->create();
+    $session = CashSession::factory()
+        ->forMerchant($this->merchantOne, $registerOne, $this->merchantOneUser)
+        ->open()
+        ->create();
+
+    $tokenTwo = $this->merchantTwoUser->createToken('merchant')->plainTextToken;
+
+    $this->withToken($tokenTwo)
+        ->getJson("/api/v1/merchant/cash-sessions/{$session->id}/z-report")
+        ->assertStatus(404);
+});
+
+test('merchant two cannot reach merchant one\'s receipt by id — 404', function () {
+    $order = Order::factory()->forMerchant($this->merchantOne, $this->merchantOneUser)->completed()->create();
+
+    $tokenTwo = $this->merchantTwoUser->createToken('merchant')->plainTextToken;
+
+    $this->withToken($tokenTwo)
+        ->getJson("/api/v1/merchant/orders/{$order->id}/receipt")
+        ->assertStatus(404);
+});
+
+test('a suspended merchant gets 403 merchant_inactive on the Z-report and receipt endpoints', function () {
+    $user = User::factory()->withRole('merchant')->create();
+    $merchant = Merchant::factory()->suspended()->ownedBy($user)->create(['name' => 'Suspended Merchant']);
+    $token = $user->createToken('merchant')->plainTextToken;
+
+    $register = Register::withoutGlobalScope('merchant')->where('merchant_id', $merchant->id)->firstOrFail();
+    $session = CashSession::factory()->forMerchant($merchant, $register, $user)->open()->create();
+    $order = Order::factory()->forMerchant($merchant, $user)->completed()->create();
+
+    $this->withToken($token)->getJson("/api/v1/merchant/cash-sessions/{$session->id}/z-report")
+        ->assertStatus(403)->assertJson(['code' => 'merchant_inactive']);
+
+    $this->withToken($token)->getJson("/api/v1/merchant/orders/{$order->id}/receipt")
+        ->assertStatus(403)->assertJson(['code' => 'merchant_inactive']);
+});
+
+test('an unauthenticated request to the Z-report or receipt endpoints is 401 JSON, never a redirect', function () {
+    $registerOne = Register::factory()->forMerchant($this->merchantOne)->create();
+    $session = CashSession::factory()
+        ->forMerchant($this->merchantOne, $registerOne, $this->merchantOneUser)
+        ->open()
+        ->create();
+    $order = Order::factory()->forMerchant($this->merchantOne, $this->merchantOneUser)->completed()->create();
+
+    foreach ([
+        "/api/v1/merchant/cash-sessions/{$session->id}/z-report",
+        "/api/v1/merchant/orders/{$order->id}/receipt",
+    ] as $uri) {
+        $response = $this->getJson($uri)
+            ->assertStatus(401)
+            ->assertJson(['code' => 'unauthenticated']);
+
+        expect($response->headers->get('Location'))->toBeNull();
+    }
+});
+
+/*
+|--------------------------------------------------------------------------
 | MERCHANT PROFILE & TEAM MEMBERS (P7)
 |--------------------------------------------------------------------------
 |

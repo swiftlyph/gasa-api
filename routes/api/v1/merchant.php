@@ -81,6 +81,10 @@ Route::prefix('orders')->name('merchant.orders.')->group(function (): void {
 
     Route::get('/{order}', [OrderController::class, 'show'])->name('show');
 
+    // P9: printable receipt data — no PDF, no printer driver. Always 200,
+    // even for a voided order (see OrderController::receipt's docblock).
+    Route::get('/{order}/receipt', [OrderController::class, 'receipt'])->name('receipt');
+
     // POST, not PATCH: these are named operations on an order, not
     // arbitrary edits to its status field. There is deliberately no route
     // that sets `status` directly — every status change goes through the
