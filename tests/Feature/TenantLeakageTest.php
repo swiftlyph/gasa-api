@@ -1265,3 +1265,49 @@ test('a newly created merchant always has a default register', function () {
         ->and($register->name)->toBe('Front Counter')
         ->and($register->is_active)->toBeTrue();
 });
+
+/*
+|--------------------------------------------------------------------------
+| P5 — PLATFORM ADMIN
+|--------------------------------------------------------------------------
+|
+| A merchant token gets 403 on every admin route, and audit_logs — which
+| carries no tenant scope of its own — is unreachable anywhere outside
+| admin.api. Complements 'the same admin token on a merchant route is
+| still 403 from the role middleware' above, which already covers the
+| other direction.
+*/
+
+test('a merchant token gets 403 on every admin route', function () {
+    $token = $this->merchantOneUser->createToken('merchant')->plainTextToken;
+
+    $probeMerchant = Merchant::factory()->create();
+
+    foreach ([
+        ['GET', '/api/v1/admin/whoami'],
+        ['GET', '/api/v1/admin/merchants'],
+        ['GET', "/api/v1/admin/merchants/{$probeMerchant->id}"],
+        ['POST', '/api/v1/admin/merchants'],
+        ['PATCH', "/api/v1/admin/merchants/{$probeMerchant->id}/status"],
+        ['POST', "/api/v1/admin/merchants/{$probeMerchant->id}/resend-invite"],
+        ['GET', '/api/v1/admin/audit-logs'],
+    ] as [$method, $uri]) {
+        $this->withToken($token)->json($method, $uri)
+            ->assertStatus(403)
+            ->assertJson(['code' => 'forbidden']);
+    }
+});
+
+test('audit logs are unreachable outside admin.api', function () {
+    // No merchant.api or public.api route exposes audit_logs at all —
+    // the only route that can read the table is GET /admin/audit-logs,
+    // and an unauthenticated or merchant-portal caller can't reach it.
+    $this->getJson('/api/v1/admin/audit-logs')
+        ->assertStatus(401)
+        ->assertJson(['code' => 'unauthenticated']);
+
+    $merchantToken = $this->merchantOneUser->createToken('merchant')->plainTextToken;
+    $this->withToken($merchantToken)->getJson('/api/v1/admin/audit-logs')
+        ->assertStatus(403)
+        ->assertJson(['code' => 'forbidden']);
+});
