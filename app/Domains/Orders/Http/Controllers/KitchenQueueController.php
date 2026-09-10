@@ -66,7 +66,7 @@ class KitchenQueueController extends Controller
      */
     public function index(IndexKitchenQueueRequest $request): JsonResponse
     {
-        $this->authorize('viewAny', Order::class);
+        $this->authorize('viewKitchenQueue', Order::class);
 
         // One instant for the whole response, so every ticket's
         // waiting_seconds is measured from the same clock reading.
@@ -103,7 +103,7 @@ class KitchenQueueController extends Controller
      */
     public function summary(IndexKitchenQueueRequest $request): JsonResponse
     {
-        $this->authorize('viewAny', Order::class);
+        $this->authorize('viewKitchenQueue', Order::class);
 
         // toBase(): the tenant global scope is applied, then the query
         // drops to the base builder so the aggregate comes back as a plain

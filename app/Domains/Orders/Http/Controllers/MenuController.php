@@ -4,6 +4,8 @@ namespace App\Domains\Orders\Http\Controllers;
 
 use App\Domains\Auth\Models\User;
 use App\Domains\Catalog\Models\Product;
+use App\Domains\Merchant\Enums\MerchantPermission;
+use App\Domains\Merchant\Exceptions\PermissionDenied;
 use App\Domains\Orders\Http\Requests\IndexMenuRequest;
 use App\Domains\Orders\Http\Resources\MenuItemResource;
 use App\Domains\Shared\Support\MenuCache;
@@ -20,12 +22,16 @@ use Illuminate\Http\JsonResponse;
  * own namespace. Nothing here writes to products, and nothing here should
  * grow into product CRUD.
  *
- * No Policy call, unlike the order endpoints, and that is a considered
- * difference rather than an omission: there is no object to authorize.
- * The route is reachable only by an active merchant (merchant.api), and
- * the query is tenant-scoped by BelongsToMerchant, so "which products"
- * has exactly one possible answer — the caller's own. An id-addressed
- * product route would need a policy; this one has no id to check.
+ * No Policy CLASS, unlike the order endpoints — there is still no object
+ * to authorize against (an id-addressed product route would need one;
+ * this one has no id to check), and the route is reachable only by an
+ * active merchant (merchant.api) with the query tenant-scoped by
+ * BelongsToMerchant. P8 adds one more question on top of that: does this
+ * ROLE hold menu.view? Checked directly against
+ * User::hasMerchantPermission() rather than via $this->authorize() (no
+ * model/policy exists to dispatch to), throwing PermissionDenied
+ * explicitly on failure — the same shape TeamController already uses for
+ * TeamMemberPolicy calls that can't go through $this->authorize() either.
  */
 class MenuController extends Controller
 {
@@ -41,6 +47,10 @@ class MenuController extends Controller
 
         if ($merchant === null) {
             return response()->json(['data' => []]);
+        }
+
+        if (! $user->hasMerchantPermission(MerchantPermission::MenuView)) {
+            throw new PermissionDenied(MerchantPermission::MenuView);
         }
 
         $includeUnavailable = $request->boolean('include_unavailable');

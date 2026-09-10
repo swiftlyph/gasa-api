@@ -3,6 +3,8 @@
 namespace App\Domains\Merchant\Policies;
 
 use App\Domains\Auth\Models\User;
+use App\Domains\Merchant\Enums\MerchantPermission;
+use App\Domains\Merchant\Exceptions\PermissionDenied;
 use App\Domains\Merchant\Models\Merchant;
 
 /**
@@ -27,12 +29,23 @@ use App\Domains\Merchant\Models\Merchant;
  * directly (`app(TeamMemberPolicy::class)->update(...)`) rather than
  * through $this->authorize(), to avoid silently hitting MerchantPolicy
  * instead.
+ *
+ * P8: ownership/active-merchant is checked first (bool), then the role
+ * question via MerchantPermission/RolePresets — viewAny needs team.view,
+ * create/update/delete all need team.manage (adding, changing a role,
+ * and removing are all "managing the roster," one permission) — throwing
+ * PermissionDenied on failure. See OrderPolicy's docblock for why the
+ * two failure modes differ.
  */
 class TeamMemberPolicy
 {
     public function viewAny(User $user): bool
     {
-        return $user->merchant() !== null;
+        if ($user->merchant() === null) {
+            return false;
+        }
+
+        return $this->requires($user, MerchantPermission::TeamView);
     }
 
     /**
@@ -43,17 +56,29 @@ class TeamMemberPolicy
      */
     public function create(User $user): bool
     {
-        return $user->merchant() !== null;
+        if ($user->merchant() === null) {
+            return false;
+        }
+
+        return $this->requires($user, MerchantPermission::TeamManage);
     }
 
     public function update(User $user, Merchant $merchant): bool
     {
-        return $this->ownsMerchant($user, $merchant);
+        if (! $this->ownsMerchant($user, $merchant)) {
+            return false;
+        }
+
+        return $this->requires($user, MerchantPermission::TeamManage);
     }
 
     public function delete(User $user, Merchant $merchant): bool
     {
-        return $this->ownsMerchant($user, $merchant);
+        if (! $this->ownsMerchant($user, $merchant)) {
+            return false;
+        }
+
+        return $this->requires($user, MerchantPermission::TeamManage);
     }
 
     private function ownsMerchant(User $user, Merchant $merchant): bool
@@ -61,5 +86,17 @@ class TeamMemberPolicy
         $ownMerchant = $user->merchant();
 
         return $ownMerchant !== null && $ownMerchant->getKey() === $merchant->getKey();
+    }
+
+    /**
+     * @throws PermissionDenied
+     */
+    private function requires(User $user, MerchantPermission $permission): bool
+    {
+        if (! $user->hasMerchantPermission($permission)) {
+            throw new PermissionDenied($permission);
+        }
+
+        return true;
     }
 }

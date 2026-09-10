@@ -24,10 +24,13 @@ use Illuminate\Http\JsonResponse;
  * this till shift."
  *
  * All three actions share ReportDateRangeRequest for `from`/`to` — see its
- * docblock for the range rules and cap. Authorization is the same question
- * OrderController already asks (does this user have an active merchant to
- * report on?), so it reuses OrderPolicy's viewAny rather than adding a
- * second policy that would only ever agree with the first.
+ * docblock for the range rules and cap. Authorization goes through
+ * OrderPolicy::viewReports (P8) rather than a second policy class of its
+ * own: tenant ownership is the same "active merchant" question
+ * OrderController already asks, gated additionally by its own
+ * reports.view permission rather than orders.view (see OrderPolicy's
+ * docblock — seeing sales totals is a distinct capability from seeing
+ * individual orders).
  */
 class ReportController extends Controller
 {
@@ -36,7 +39,7 @@ class ReportController extends Controller
      */
     public function salesSummary(ReportDateRangeRequest $request, SalesSummaryReport $report): JsonResponse
     {
-        $this->authorize('viewAny', Order::class);
+        $this->authorize('viewReports', Order::class);
 
         [$fromUtc, $toUtcExclusive] = $request->queryRange();
 
@@ -70,7 +73,7 @@ class ReportController extends Controller
      */
     public function salesByDay(ReportDateRangeRequest $request, SalesByDayReport $report): JsonResponse
     {
-        $this->authorize('viewAny', Order::class);
+        $this->authorize('viewReports', Order::class);
 
         [$fromUtc, $toUtcExclusive] = $request->queryRange();
 
@@ -91,7 +94,7 @@ class ReportController extends Controller
      */
     public function topItems(TopItemsReportRequest $request, TopItemsReport $report): JsonResponse
     {
-        $this->authorize('viewAny', Order::class);
+        $this->authorize('viewReports', Order::class);
 
         [$fromUtc, $toUtcExclusive] = $request->queryRange();
 

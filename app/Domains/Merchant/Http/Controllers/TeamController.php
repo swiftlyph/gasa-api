@@ -23,29 +23,19 @@ use Illuminate\Http\Request;
  *
  * AUTHORIZATION:
  *
- * viewAny/create have no natural per-instance model to authorize against
- * (a team member is a pivot row, not an id-addressed resource, until it
- * exists) — matching MenuController's and RegisterPolicy's reasoning
- * exactly: the only question either ability asks is "does this user have
- * an active merchant," which EnsureMerchantActive on the merchant.api
- * group has already guaranteed true before ANY method here runs. So,
- * like MenuController, this controller does not call
- * $this->authorize('viewAny'|'create', ...) at all for index()/store() —
- * TeamMemberPolicy still declares those methods for completeness and
- * consistency with CashSessionPolicy/RegisterPolicy's shape, and for any
- * future caller (a console command, a differently-guarded route) that
- * cannot rely on EnsureMerchantActive.
- *
- * update()/delete() DO call authorization, and deliberately NOT via
- * $this->authorize('update'|'delete', $merchant): Laravel resolves an
- * authorize() call by the argument's class, and MerchantPolicy is
- * already the auto-discovered policy for Merchant::class (see its
- * docblock) — passing a Merchant instance to $this->authorize() here
- * would silently invoke MerchantPolicy::update()/delete (which doesn't
- * even define delete()) instead of TeamMemberPolicy. Instead,
- * TeamMemberPolicy's methods are called directly via the container,
- * which is meaningful defence-in-depth (the acting user's own $merchant
- * is reconfirmed) without colliding with MerchantPolicy's registration.
+ * P8: every method here now calls TeamMemberPolicy explicitly —
+ * viewAny() for index(), create() for store(), update()/delete()
+ * unchanged — because role now matters (team.view / team.manage), not
+ * only "does this user have an active merchant." All four calls go
+ * through the container directly (`app(TeamMemberPolicy::class)->...`),
+ * deliberately NOT via $this->authorize(...): Laravel resolves an
+ * authorize() call for viewAny/create by the MODEL CLASS name
+ * (Merchant::class), and MerchantPolicy is already the auto-discovered
+ * policy for Merchant::class (see its docblock) — going through
+ * $this->authorize() here would silently invoke MerchantPolicy instead
+ * of TeamMemberPolicy for every one of these abilities, not just
+ * update/delete. Calling the container-resolved policy directly avoids
+ * that collision uniformly across all four methods.
  */
 class TeamController extends Controller
 {
@@ -53,6 +43,10 @@ class TeamController extends Controller
     {
         /** @var User $user */
         $user = $request->user();
+
+        if (! app(TeamMemberPolicy::class)->viewAny($user)) {
+            throw new AuthorizationException;
+        }
 
         /** @var Merchant $merchant */
         $merchant = $user->merchant();
@@ -77,6 +71,10 @@ class TeamController extends Controller
     {
         /** @var User $user */
         $user = $request->user();
+
+        if (! app(TeamMemberPolicy::class)->create($user)) {
+            throw new AuthorizationException;
+        }
 
         /** @var Merchant $merchant */
         $merchant = $user->merchant();
