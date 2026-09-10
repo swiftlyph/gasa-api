@@ -26,7 +26,16 @@ class RegisterFactory extends Factory
     {
         return [
             'merchant_id' => Merchant::factory(),
-            'name' => 'Front Counter',
+
+            // Unique per call, not the literal 'Front Counter': every
+            // merchant (including the one `Merchant::factory()` implicitly
+            // creates above) already gets a "Front Counter" register from
+            // P7's EnsureDefaultRegisterAction the moment it's created, so
+            // a second register defaulting to that same name would always
+            // collide with the table's unique (merchant_id, name) index.
+            // Tests that specifically want "the" default register fetch
+            // the auto-created one instead of making their own.
+            'name' => fake()->unique()->words(2, true).' Counter',
             'is_active' => true,
         ];
     }

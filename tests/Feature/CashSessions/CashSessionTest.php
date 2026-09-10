@@ -23,7 +23,12 @@ beforeEach(function () {
     $this->merchant = Merchant::factory()->ownedBy($this->user)->create(['name' => 'Merchant One']);
     $this->token = $this->user->createToken('merchant')->plainTextToken;
 
-    $this->register = Register::factory()->forMerchant($this->merchant)->create(['name' => 'Front Counter']);
+    // Merchant::factory()->create() already provisions a "Front Counter"
+    // default register (P7's EnsureDefaultRegisterAction, wired via
+    // Merchant::booted()) — fetch it rather than creating a second row
+    // with the same name, which the table's unique (merchant_id, name)
+    // index would reject.
+    $this->register = Register::withoutGlobalScope('merchant')->where('merchant_id', $this->merchant->id)->firstOrFail();
 
     $this->product = Product::factory()->create([
         'merchant_id' => $this->merchant->id,

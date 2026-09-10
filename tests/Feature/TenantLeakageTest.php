@@ -899,8 +899,12 @@ test('a platform admin token is rejected by the kitchen endpoints', function () 
 */
 
 test('a merchant only sees their own registers', function () {
-    $mine = Register::factory()->forMerchant($this->merchantOne)->create(['name' => 'Front Counter']);
-    Register::factory()->forMerchant($this->merchantTwo)->create(['name' => 'Front Counter']);
+    // Merchant::factory()->create() (in beforeEach) already provisions a
+    // "Front Counter" default register for both merchants (P7's
+    // EnsureDefaultRegisterAction) — fetch merchant one's rather than
+    // creating a second row with the same name, which the unique
+    // (merchant_id, name) index would reject.
+    $mine = Register::withoutGlobalScope('merchant')->where('merchant_id', $this->merchantOne->id)->firstOrFail();
 
     $token = $this->merchantOneUser->createToken('merchant')->plainTextToken;
 
@@ -961,9 +965,10 @@ test('GET current for merchant two never returns merchant one\'s open session', 
         ->open()
         ->create();
 
-    // Merchant Two has no register at all yet — current must answer
-    // "nothing open," never reach across and find Merchant One's session
-    // because it happens to be the only open one in the table.
+    // Merchant Two's (auto-provisioned) register has no OPEN session on
+    // it — current must answer "nothing open," never reach across and
+    // find Merchant One's session because it happens to be the only open
+    // one in the table.
     $registerTwo = Register::factory()->forMerchant($this->merchantTwo)->create();
 
     $tokenTwo = $this->merchantTwoUser->createToken('merchant')->plainTextToken;

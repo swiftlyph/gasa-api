@@ -3,6 +3,7 @@
 namespace App\Domains\Merchant\Models;
 
 use App\Domains\Auth\Models\User;
+use App\Domains\Merchant\Actions\EnsureDefaultRegisterAction;
 use App\Domains\Merchant\Enums\MerchantStatus;
 use Database\Factories\MerchantFactory;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
@@ -15,6 +16,17 @@ use Illuminate\Database\Eloquent\Relations\BelongsToMany;
  * @property string $name
  * @property MerchantStatus $status
  * @property int $owner_user_id
+ * @property string|null $legal_name
+ * @property string|null $address_line1
+ * @property string|null $address_line2
+ * @property string|null $city
+ * @property string|null $postal_code
+ * @property string|null $phone
+ * @property string|null $contact_email
+ * @property string|null $tax_identifier
+ * @property string|null $receipt_header
+ * @property string|null $receipt_footer
+ * @property string|null $timezone
  */
 class Merchant extends Model
 {
@@ -28,6 +40,17 @@ class Merchant extends Model
         'name',
         'status',
         'owner_user_id',
+        'legal_name',
+        'address_line1',
+        'address_line2',
+        'city',
+        'postal_code',
+        'phone',
+        'contact_email',
+        'tax_identifier',
+        'receipt_header',
+        'receipt_footer',
+        'timezone',
     ];
 
     /**
@@ -47,6 +70,21 @@ class Merchant extends Model
     protected static function newFactory(): MerchantFactory
     {
         return MerchantFactory::new();
+    }
+
+    /**
+     * Every merchant gets a default register the moment it exists — P4's
+     * DefaultRegister no longer has to tolerate a merchant with none as
+     * the common case, only as a defensive fallback (see
+     * NoRegisterConfigured's docblock). Runs on every `created` merchant
+     * regardless of how it was made (factory, seeder, future admin
+     * provisioning), so there is exactly one place this guarantee lives.
+     */
+    protected static function booted(): void
+    {
+        static::created(function (Merchant $merchant): void {
+            app(EnsureDefaultRegisterAction::class)->execute($merchant);
+        });
     }
 
     /**

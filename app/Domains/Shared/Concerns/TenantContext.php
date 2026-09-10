@@ -59,6 +59,20 @@ class TenantContext
      * - It grants a bypass, not an identity: callers still have to set
      *   merchant_id explicitly on every row they create.
      *
+     * ONE documented exception: App\Domains\Merchant\Actions\
+     * EnsureDefaultRegisterAction, wired to Merchant::booted()'s `created`
+     * event, so it runs whenever a merchant is created — including from
+     * request-path code (e.g. a future admin-provisioning endpoint). It
+     * needs the bypass for the same reason seeders do: provisioning a
+     * register for a brand-new merchant has no "acting merchant" of its
+     * own to inherit from, and the actor creating the merchant (a
+     * platform admin, a seeder, a factory) is never the merchant being
+     * provisioned for. It is safe specifically because it never reads
+     * request input for merchant_id — only ever the newly created
+     * Merchant's own primary key — so it cannot be steered to write into
+     * the wrong tenant. Any OTHER request-reachable use of this method
+     * remains forbidden.
+     *
      * Save-and-restore rather than enable-and-disable so nesting works
      * (a seeder wrapping factories that wrap themselves) and so a
      * genuinely-admin request never has its context switched off by an

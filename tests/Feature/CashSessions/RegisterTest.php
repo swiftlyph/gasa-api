@@ -17,7 +17,12 @@ beforeEach(function () {
 });
 
 test('the first register created is the default', function () {
-    $first = Register::factory()->forMerchant($this->merchant)->create(['name' => 'Front Counter']);
+    // Merchant::factory()->create() already provisions a "Front Counter"
+    // default register (P7's EnsureDefaultRegisterAction) — it's the
+    // first (oldest) one, so fetch it rather than creating a second row
+    // with the same name, which the unique (merchant_id, name) index
+    // would reject.
+    $first = Register::withoutGlobalScope('merchant')->where('merchant_id', $this->merchant->id)->firstOrFail();
     Register::factory()->forMerchant($this->merchant)->create(['name' => 'Drive-Thru']);
 
     $response = $this->withToken($this->token)

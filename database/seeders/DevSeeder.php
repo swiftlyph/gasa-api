@@ -93,12 +93,17 @@ class DevSeeder extends Seeder
             $this->seedCatalogAndOrders($merchantOne, $users['merchant@gasa.test']);
             $this->seedCatalogAndOrders($merchantTwo, $users['merchant2@gasa.test']);
 
-            // P4: a default register per merchant, plus cash-session
-            // history so the reconciliation screens have live and closed
-            // examples to demo against — after orders, since Merchant
-            // One's open session below attributes a fresh sale to itself.
-            $registerOne = $this->seedDefaultRegister($merchantOne);
-            $this->seedDefaultRegister($merchantTwo);
+            // P4: cash-session history so the reconciliation screens have
+            // live and closed examples to demo against — after orders,
+            // since Merchant One's open session below attributes a fresh
+            // sale to itself. The default register itself no longer needs
+            // seeding here: P7's Merchant::booted() guarantees every
+            // merchant gets one ("Front Counter") the moment it's
+            // created, above.
+            $registerOne = Register::query()
+                ->where('merchant_id', $merchantOne->getKey())
+                ->where('name', 'Front Counter')
+                ->firstOrFail();
 
             // Only Merchant One demos the closed/confirmed history: doing
             // it needs a SECOND user to confirm the remittance, and
@@ -165,19 +170,6 @@ class DevSeeder extends Seeder
         $factory()->completed()->split()->withItems(1, $products, 2)->create();
 
         $factory()->voided($cashier)->gcash()->withItems(2, $products)->create();
-    }
-
-    /**
-     * One default register per merchant. updateOrCreate on
-     * (merchant_id, name) — the pair the table's own unique index is
-     * built on — so re-seeding never duplicates.
-     */
-    private function seedDefaultRegister(Merchant $merchant): Register
-    {
-        return Register::query()->updateOrCreate(
-            ['merchant_id' => $merchant->getKey(), 'name' => 'Front Counter'],
-            ['is_active' => true],
-        );
     }
 
     /**
