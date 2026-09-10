@@ -30,9 +30,9 @@ class IndexOrdersRequest extends FormRequest
         return [
             'status' => ['sometimes', Rule::in(OrderStatus::values())],
 
-            // A single day, merchant-local — which is the app timezone for
-            // now (see OrderController). date_format rather than `date`:
-            // `date` would happily accept "next tuesday".
+            // A single day, merchant-local — see MerchantDay for what
+            // "merchant-local" resolves to today. date_format rather than
+            // `date`: `date` would happily accept "next tuesday".
             'date' => ['sometimes', 'date_format:Y-m-d'],
 
             'per_page' => ['sometimes', 'integer', 'min:1', 'max:100'],

@@ -6,6 +6,8 @@ use App\Domains\CashSessions\Models\Register;
 use App\Domains\Catalog\Models\Product;
 use App\Domains\Merchant\Models\Merchant;
 use App\Domains\Orders\Models\Order;
+use App\Domains\Orders\Support\MerchantDay;
+use Carbon\CarbonImmutable;
 use Database\Seeders\RoleSeeder;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
@@ -260,6 +262,63 @@ test('checkout with no open session still succeeds with a null cash_session_id',
     $order = Order::query()->findOrFail($orderId);
 
     expect($order->cash_session_id)->toBeNull();
+});
+
+/*
+|--------------------------------------------------------------------------
+| History: the ?from=/?to= date-range filter
+|--------------------------------------------------------------------------
+|
+| GET /merchant/cash-sessions filters opened_at by MerchantDay, the same
+| authority the orders list and kitchen queue use — see § Day boundaries.
+| It does NOT go through MerchantDay::constrain() (that helper is built
+| for created_at on Order specifically); it calls MerchantDay::startOf()
+| and forQuery() directly, so this is worth proving end to end rather than
+| trusting that the two call sites stayed in sync by inspection alone.
+*/
+
+test('the from/to filter selects sessions opened within the range', function () {
+    $inRange = CashSession::factory()
+        ->forMerchant($this->merchant, $this->register, $this->user)
+        ->create(['opened_at' => MerchantDay::forQuery(MerchantDay::startOfToday())]);
+
+    // Closed, and on the same register: the partial unique index only
+    // guards one OPEN session per register, and this fixture only cares
+    // about opened_at, not which register or status a row has.
+    CashSession::factory()->closed()
+        ->forMerchant($this->merchant, $this->register, $this->user)
+        ->create(['opened_at' => MerchantDay::forQuery(MerchantDay::startOfToday()->subDays(5))]);
+
+    $today = MerchantDay::startOfToday()->format('Y-m-d');
+
+    $response = $this->withToken($this->token)
+        ->getJson("/api/v1/merchant/cash-sessions?from={$today}&to={$today}")
+        ->assertOk();
+
+    expect(collect($response->json('data'))->pluck('id')->all())->toBe([$inRange->id]);
+});
+
+test('the day-boundary regression: a session opened at 00:30 local is in today\'s history', function () {
+    // Same production bug, same fix, same shape of regression as the
+    // orders list and kitchen queue: 00:30 merchant-local (Asia/Manila,
+    // UTC+8) is 16:30 the PREVIOUS day in UTC. If ?from=/?to= ever
+    // resolved its boundary in UTC instead of merchant-local time, a
+    // session opened right after local midnight would silently fall out
+    // of "today" here while agreeing with every other screen — exactly
+    // the two-disagreeing-notions-of-today bug Part A closed.
+    CarbonImmutable::setTestNow(CarbonImmutable::parse('2026-09-10 00:30:00', config('merchant.day_timezone')));
+
+    $session = CashSession::factory()
+        ->forMerchant($this->merchant, $this->register, $this->user)
+        ->create(['opened_at' => now()]);
+
+    $this->withToken($this->token)
+        ->getJson('/api/v1/merchant/cash-sessions?from=2026-09-10&to=2026-09-10')
+        ->assertOk()
+        ->assertJsonPath('meta.total', 1)
+        ->assertJsonPath('data.0.id', $session->id);
+
+    CarbonImmutable::setTestNow();
 });
 
 test('a suspended merchant gets 403 merchant_inactive on every cash-session endpoint', function () {

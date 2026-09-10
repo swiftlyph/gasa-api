@@ -8,6 +8,8 @@ use App\Domains\Catalog\Models\Product;
 use App\Domains\Merchant\Models\Merchant;
 use App\Domains\Orders\Models\CheckoutIdempotencyKey;
 use App\Domains\Orders\Models\Order;
+use App\Domains\Orders\Models\OrderItem;
+use App\Domains\Orders\Support\MerchantDay;
 use App\Domains\Shared\Support\MenuCache;
 use Database\Seeders\RoleSeeder;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
@@ -1031,5 +1033,119 @@ test('an unauthenticated cash-session request is 401 JSON, never a redirect', fu
             ->assertJson(['code' => 'unauthenticated']);
 
         expect($response->headers->get('Location'))->toBeNull();
+    }
+});
+
+/*
+|--------------------------------------------------------------------------
+| REPORTS (phase P6)
+|--------------------------------------------------------------------------
+|
+| Every report is an aggregate query over `orders` (and, for top-items,
+| `order_items` joined back to `orders`) — see ReportController's docblock
+| for why session-scoped reporting is out of scope here. An aggregate is
+| the easiest place to lose a tenant boundary, because the wrong answer is
+| still a plausible-looking number rather than an obvious error; TopItems
+| in particular starts its query from Order::query() rather than
+| OrderItem::query()->join(...) for exactly this reason (order_items has
+| no merchant_id of its own — see OrderItem's docblock), which is worth
+| proving here rather than trusting the docblock's claim on its own.
+*/
+
+test('sales-summary counts only the calling merchant\'s orders', function () {
+    Order::factory()->forMerchant($this->merchantOne)->completed()
+        ->create(['total_cents' => 10000, 'subtotal_cents' => 10000, 'discount_cents' => 0]);
+    Order::factory()->forMerchant($this->merchantTwo)->completed()
+        ->create(['total_cents' => 99999, 'subtotal_cents' => 99999, 'discount_cents' => 0]);
+
+    $tokenOne = $this->merchantOneUser->createToken('merchant')->plainTextToken;
+
+    $this->withToken($tokenOne)
+        ->getJson('/api/v1/merchant/reports/sales-summary')
+        ->assertOk()
+        ->assertJsonPath('orders_count', 1)
+        ->assertJsonPath('net_cents', 10000);
+});
+
+test('sales-by-day never folds another merchant\'s sales into the calling merchant\'s days', function () {
+    Order::factory()->forMerchant($this->merchantOne)->completed()
+        ->create(['created_at' => now(), 'total_cents' => 1000]);
+    Order::factory()->forMerchant($this->merchantTwo)->completed()
+        ->create(['created_at' => now(), 'total_cents' => 500000]);
+
+    $tokenOne = $this->merchantOneUser->createToken('merchant')->plainTextToken;
+
+    // Merchant-local "today", not a bare now()->format('Y-m-d') (UTC) —
+    // the two can disagree whenever the real clock sits between UTC and
+    // merchant-local midnight, which is exactly the bug Part A fixed.
+    $today = MerchantDay::startOfToday()->format('Y-m-d');
+
+    $this->withToken($tokenOne)
+        ->getJson("/api/v1/merchant/reports/sales-by-day?from={$today}&to={$today}")
+        ->assertOk()
+        ->assertJsonPath('data.0.net_cents', 1000);
+});
+
+test('top-items never surfaces another merchant\'s products or sales volume', function () {
+    $mine = Order::factory()->forMerchant($this->merchantOne)->completed()->create();
+    OrderItem::factory()->for($mine)->create(['product_name' => 'My Latte', 'quantity' => 1]);
+
+    $theirs = Order::factory()->forMerchant($this->merchantTwo)->completed()->create();
+    OrderItem::factory()->for($theirs)->create(['product_name' => 'Their Latte', 'quantity' => 999]);
+
+    $tokenOne = $this->merchantOneUser->createToken('merchant')->plainTextToken;
+
+    $response = $this->withToken($tokenOne)
+        ->getJson('/api/v1/merchant/reports/top-items')
+        ->assertOk();
+
+    expect(collect($response->json('data'))->pluck('product_name')->all())->toBe(['My Latte']);
+});
+
+test('a suspended merchant gets 403 merchant_inactive on every report endpoint', function () {
+    $user = User::factory()->withRole('merchant')->create();
+    $merchant = Merchant::factory()->suspended()->ownedBy($user)->create(['name' => 'Suspended Merchant']);
+
+    Order::factory()->forMerchant($merchant, $user)->completed()->create();
+
+    $token = $user->createToken('merchant')->plainTextToken;
+
+    foreach ([
+        '/api/v1/merchant/reports/sales-summary',
+        '/api/v1/merchant/reports/sales-by-day',
+        '/api/v1/merchant/reports/top-items',
+    ] as $uri) {
+        $this->withToken($token)->getJson($uri)
+            ->assertStatus(403)
+            ->assertJson(['code' => 'merchant_inactive']);
+    }
+});
+
+test('an unauthenticated report request is 401 JSON, never a redirect', function () {
+    foreach ([
+        '/api/v1/merchant/reports/sales-summary',
+        '/api/v1/merchant/reports/sales-by-day',
+        '/api/v1/merchant/reports/top-items',
+    ] as $uri) {
+        $response = $this->getJson($uri)
+            ->assertStatus(401)
+            ->assertJson(['code' => 'unauthenticated']);
+
+        expect($response->headers->get('Location'))->toBeNull();
+    }
+});
+
+test('a platform admin token is rejected by the report endpoints', function () {
+    $admin = User::factory()->withRole('platform_admin')->create();
+    $token = $admin->createToken('admin')->plainTextToken;
+
+    foreach ([
+        '/api/v1/merchant/reports/sales-summary',
+        '/api/v1/merchant/reports/sales-by-day',
+        '/api/v1/merchant/reports/top-items',
+    ] as $uri) {
+        $this->withToken($token)->getJson($uri)
+            ->assertStatus(403)
+            ->assertJson(['code' => 'forbidden']);
     }
 });

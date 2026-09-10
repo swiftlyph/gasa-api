@@ -9,6 +9,7 @@ use App\Domains\Orders\Http\Controllers\KitchenQueueController;
 use App\Domains\Orders\Http\Controllers\MenuController;
 use App\Domains\Orders\Http\Controllers\OrderController;
 use App\Domains\Orders\Http\Controllers\OrderTransitionController;
+use App\Domains\Orders\Http\Controllers\ReportController;
 use Illuminate\Support\Facades\Route;
 
 /*
@@ -110,3 +111,12 @@ Route::post('/remittances/{remittance}/confirm', [CashRemittanceController::clas
 // Note for later phases: there is no DELETE anywhere in this group either.
 // A cash session, a movement, and a remittance are all financial records —
 // the same "never deleted" rule that governs orders.
+
+// Date-range reporting over orders (P6). READ-ONLY — see README §
+// Reporting for the accounting rules and ReportController's docblock for
+// why session-scoped (Z-report) reporting is deliberately not here yet.
+Route::prefix('reports')->name('merchant.reports.')->group(function (): void {
+    Route::get('/sales-summary', [ReportController::class, 'salesSummary'])->name('sales-summary');
+    Route::get('/sales-by-day', [ReportController::class, 'salesByDay'])->name('sales-by-day');
+    Route::get('/top-items', [ReportController::class, 'topItems'])->name('top-items');
+});
