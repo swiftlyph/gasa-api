@@ -2,7 +2,9 @@
 
 namespace App\Domains\Merchant\Http\Resources;
 
+use App\Domains\Merchant\Enums\RoleInMerchant;
 use App\Domains\Merchant\Models\Merchant;
+use Illuminate\Database\Eloquent\Relations\Pivot;
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
 
@@ -24,6 +26,23 @@ class MerchantSummaryResource extends JsonResource
             'id' => $this->id,
             'name' => $this->name,
             'status' => $this->status->value,
+
+            // Loaded via $user->merchants->first() in UserResource, so
+            // the pivot (role_in_merchant) is attached the same way
+            // TeamMemberResource reads it — see that resource's docblock
+            // for why getAttribute() rather than magic property access.
+            // Guarded rather than assumed present: this resource is
+            // reachable from anywhere a Merchant is wrapped, not only
+            // through that relation.
+            'role_in_merchant' => $this->when($this->resource->relationLoaded('pivot'), function () {
+                /** @var Pivot $pivot */
+                $pivot = $this->resource->pivot;
+
+                /** @var string $role */
+                $role = $pivot->getAttribute('role_in_merchant');
+
+                return RoleInMerchant::from($role)->value;
+            }),
         ];
     }
 }
