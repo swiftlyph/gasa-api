@@ -131,8 +131,11 @@ test('removing a member detaches the pivot, leaves the user row intact, and revo
     $this->merchant->users()->attach($member->id, ['role_in_merchant' => 'staff']);
     $memberToken = $member->createToken('merchant')->plainTextToken;
 
+    // P8: staff's preset doesn't include profile.view (see RolePresets),
+    // so /merchant/menu proves merchant access here instead — it's in
+    // every preset.
     $this->withToken($memberToken)
-        ->getJson('/api/v1/merchant/profile')
+        ->getJson('/api/v1/merchant/menu')
         ->assertOk();
 
     $this->withToken($this->ownerToken)
@@ -144,7 +147,7 @@ test('removing a member detaches the pivot, leaves the user row intact, and revo
         ->and(User::find($member->id))->not->toBeNull();
 
     $this->withToken($memberToken)
-        ->getJson('/api/v1/merchant/profile')
+        ->getJson('/api/v1/merchant/menu')
         ->assertStatus(403)
         ->assertJsonPath('code', 'merchant_inactive');
 });
@@ -196,12 +199,16 @@ test('SEGREGATION OF DUTIES: a team member added this phase can confirm a remitt
         ->open()
         ->create(['opening_float_cents' => 100000]);
 
+    // P8: remittances.confirm is a manager/owner permission — staff
+    // never holds it (see RolePresets) — so the invited member here must
+    // be a manager for the SECOND-USER rule itself to be what blocks the
+    // owner, not a missing permission.
     app()->detectEnvironment(fn () => 'local');
     $inviteResponse = $this->withToken($this->ownerToken)
         ->postJson('/api/v1/merchant/team', [
-            'name' => 'Confirming Staff',
+            'name' => 'Confirming Manager',
             'email' => 'confirmer@merchantone.test',
-            'role_in_merchant' => 'staff',
+            'role_in_merchant' => 'manager',
         ])
         ->assertCreated();
     app()->detectEnvironment(fn () => 'testing');

@@ -42,10 +42,14 @@ test('a valid invite token sets the password and returns a merchant-portal token
 
     $accessToken = $response->json('token');
 
+    // P8: the invited member is `staff`, whose preset does not carry
+    // profile.view (see RolePresets) — /merchant/profile would now be a
+    // correct 403 permission_denied for this role, so this proves the
+    // token actually works against an endpoint staff legitimately has
+    // instead (menu.view is in every preset).
     $this->withToken($accessToken)
-        ->getJson('/api/v1/merchant/profile')
-        ->assertOk()
-        ->assertJsonPath('id', $this->merchant->id);
+        ->getJson('/api/v1/merchant/menu')
+        ->assertOk();
 
     expect(Hash::check('a-brand-new-password', $this->invitedUser->fresh()->password))->toBeTrue();
 });

@@ -18,8 +18,12 @@ beforeEach(function () {
     $this->merchant = Merchant::factory()->ownedBy($this->creator)->create(['name' => 'Merchant One']);
     $this->creatorToken = $this->creator->createToken('merchant')->plainTextToken;
 
+    // P8: remittances.confirm is a manager/owner permission — staff
+    // never holds it (see RolePresets) — so the confirmer here must be a
+    // manager for these tests to exercise the SECOND-USER rule itself
+    // rather than tripping over a missing permission first.
     $this->confirmer = User::factory()->withRole('merchant')->create();
-    $this->merchant->users()->attach($this->confirmer->id, ['role_in_merchant' => 'staff']);
+    $this->merchant->users()->attach($this->confirmer->id, ['role_in_merchant' => 'manager']);
     $this->confirmerToken = $this->confirmer->createToken('merchant')->plainTextToken;
 
     $this->register = Register::factory()->forMerchant($this->merchant)->create();

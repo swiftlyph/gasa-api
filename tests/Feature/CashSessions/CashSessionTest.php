@@ -171,8 +171,10 @@ test('reconciliation counts every term and excludes gcash and voided cash', func
             'reason' => 'Petty cash',
         ])->assertCreated();
 
+    // P8: remittances.confirm is a manager/owner permission (staff
+    // never holds it — see RolePresets).
     $confirmer = User::factory()->withRole('merchant')->create();
-    $this->merchant->users()->attach($confirmer->id, ['role_in_merchant' => 'staff']);
+    $this->merchant->users()->attach($confirmer->id, ['role_in_merchant' => 'manager']);
 
     $remittanceId = $this->withToken($this->token)
         ->postJson("/api/v1/merchant/cash-sessions/{$session['id']}/remittances", [
