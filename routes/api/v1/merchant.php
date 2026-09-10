@@ -117,6 +117,13 @@ Route::prefix('cash-sessions')->name('merchant.cash-sessions.')->group(function 
     Route::get('/{cashSession}', [CashSessionController::class, 'show'])->name('show');
     Route::post('/{cashSession}/close', [CashSessionController::class, 'close'])->name('close');
 
+    // P9: the printable shift summary — sales attributed to THIS session
+    // (cash_session_id, never a date range) plus the same reconciliation
+    // block GET /{cashSession} already reports, reused rather than
+    // re-derived. Works on an open session (live figures) exactly as it
+    // does on a closed one (final figures).
+    Route::get('/{cashSession}/z-report', [CashSessionController::class, 'zReport'])->name('z-report');
+
     Route::post('/{cashSession}/movements', [CashMovementController::class, 'store'])
         ->name('movements.store');
 

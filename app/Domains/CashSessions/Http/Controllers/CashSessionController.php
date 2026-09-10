@@ -9,11 +9,14 @@ use App\Domains\CashSessions\Http\Requests\CloseCashSessionRequest;
 use App\Domains\CashSessions\Http\Requests\IndexCashSessionsRequest;
 use App\Domains\CashSessions\Http\Requests\OpenCashSessionRequest;
 use App\Domains\CashSessions\Http\Requests\ShowCurrentCashSessionRequest;
+use App\Domains\CashSessions\Http\Requests\ZReportRequest;
 use App\Domains\CashSessions\Http\Resources\CashSessionResource;
+use App\Domains\CashSessions\Http\Resources\ZReportResource;
 use App\Domains\CashSessions\Models\CashSession;
 use App\Domains\CashSessions\Models\Register;
 use App\Domains\CashSessions\Support\DefaultRegister;
 use App\Domains\Merchant\Models\Merchant;
+use App\Domains\Orders\Reports\TopItemsReport;
 use App\Domains\Orders\Support\MerchantDay;
 use App\Http\Controllers\Controller;
 use Illuminate\Http\JsonResponse;
@@ -134,6 +137,23 @@ class CashSessionController extends Controller
         $this->authorize('view', $cashSession);
 
         return CashSessionResource::make($cashSession->load(['movements', 'remittances']));
+    }
+
+    /**
+     * GET /merchant/cash-sessions/{cashSession}/z-report — one printable
+     * shift summary. Gated by the SAME permission as `show` (drawer.view)
+     * — a Z-report is a read over this session, not a distinct capability
+     * — and works identically whether the session is still open (live
+     * figures) or already closed (final ones); see ZReportResource.
+     */
+    public function zReport(ZReportRequest $request, CashSession $cashSession): ZReportResource
+    {
+        $this->authorize('view', $cashSession);
+
+        return new ZReportResource(
+            $cashSession->load(['register', 'movements', 'remittances']),
+            (int) ($request->validated('limit') ?? TopItemsReport::DEFAULT_LIMIT),
+        );
     }
 
     public function close(
