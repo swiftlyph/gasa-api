@@ -50,7 +50,7 @@ class RolePresets
             // rule, which stays independent of this list entirely), NOT
             // reports.view (a staff member works the register, they
             // don't need the day's numbers), and NOT profile.*/team.*.
-            RoleInMerchant::Cashier => [
+            RoleInMerchant::Staff => [
                 MerchantPermission::OrdersView,
                 MerchantPermission::OrdersCreate,
                 MerchantPermission::OrdersComplete,

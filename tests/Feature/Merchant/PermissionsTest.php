@@ -102,8 +102,8 @@ test('manager holds every permission except profile.edit and team.manage', funct
     }
 });
 
-test('cashier (staff) holds exactly the till-facing subset', function () {
-    $staffValues = RolePresets::valuesFor(RoleInMerchant::Cashier);
+test('staff holds exactly the till-facing subset', function () {
+    $staffValues = RolePresets::valuesFor(RoleInMerchant::Staff);
 
     sort($staffValues);
 
@@ -148,7 +148,7 @@ test('cashier (staff) holds exactly the till-facing subset', function () {
  * test by construction rather than being silently skipped.
  */
 test('catalog coverage: every permission is enforced, directly or via the presets it is granted through', function () {
-    [$staffMember, $staffToken] = attachMember($this->merchant, RoleInMerchant::Cashier);
+    [$staffMember, $staffToken] = attachMember($this->merchant, RoleInMerchant::Staff);
     [$managerMember, $managerToken] = attachMember($this->merchant, RoleInMerchant::Manager);
 
     $session = CashSession::factory()
@@ -175,7 +175,7 @@ test('catalog coverage: every permission is enforced, directly or via the preset
         MerchantPermission::ProfileView->value => [$staffToken, fn ($t) => $this->withToken($t)->getJson('/api/v1/merchant/profile')],
         MerchantPermission::ProfileEdit->value => [$managerToken, fn ($t) => $this->withToken($t)->patchJson('/api/v1/merchant/profile', ['legal_name' => 'X'])],
         MerchantPermission::TeamView->value => [$staffToken, fn ($t) => $this->withToken($t)->getJson('/api/v1/merchant/team')],
-        MerchantPermission::TeamManage->value => [$managerToken, fn ($t) => $this->withToken($t)->postJson('/api/v1/merchant/team', ['name' => 'X', 'email' => 'covered@merchantone.test', 'role_in_merchant' => 'cashier'])],
+        MerchantPermission::TeamManage->value => [$managerToken, fn ($t) => $this->withToken($t)->postJson('/api/v1/merchant/team', ['name' => 'X', 'email' => 'covered@merchantone.test', 'role_in_merchant' => 'staff'])],
     ];
 
     foreach ($deniable as $permission => [$token, $call]) {
@@ -206,12 +206,12 @@ test('catalog coverage: every permission is enforced, directly or via the preset
 
 /*
 |--------------------------------------------------------------------------
-| Staff (role_in_merchant = cashier)
+| Staff (role_in_merchant = staff)
 |--------------------------------------------------------------------------
 */
 
 test('staff: can check out, complete, open the drawer, record a movement, and create a remittance', function () {
-    [, $token] = attachMember($this->merchant, RoleInMerchant::Cashier);
+    [, $token] = attachMember($this->merchant, RoleInMerchant::Staff);
 
     $orderId = $this->withToken($token)
         ->postJson('/api/v1/merchant/orders', [
@@ -250,7 +250,7 @@ test('staff: can check out, complete, open the drawer, record a movement, and cr
 });
 
 test('staff: cannot void an order — 403 permission_denied naming orders.void', function () {
-    [, $token] = attachMember($this->merchant, RoleInMerchant::Cashier);
+    [, $token] = attachMember($this->merchant, RoleInMerchant::Staff);
 
     $orderId = $this->withToken($token)
         ->postJson('/api/v1/merchant/orders', [
@@ -268,7 +268,7 @@ test('staff: cannot void an order — 403 permission_denied naming orders.void',
 });
 
 test('staff: cannot close the drawer — 403 permission_denied naming drawer.close', function () {
-    [, $token] = attachMember($this->merchant, RoleInMerchant::Cashier);
+    [, $token] = attachMember($this->merchant, RoleInMerchant::Staff);
 
     $sessionId = $this->withToken($token)
         ->postJson('/api/v1/merchant/cash-sessions', [
@@ -286,7 +286,7 @@ test('staff: cannot close the drawer — 403 permission_denied naming drawer.clo
 });
 
 test('staff: cannot confirm a remittance — 403 permission_denied naming remittances.confirm', function () {
-    [, $staffToken] = attachMember($this->merchant, RoleInMerchant::Cashier);
+    [, $staffToken] = attachMember($this->merchant, RoleInMerchant::Staff);
 
     $session = CashSession::factory()
         ->forMerchant($this->merchant, $this->register, $this->owner)
@@ -303,7 +303,7 @@ test('staff: cannot confirm a remittance — 403 permission_denied naming remitt
 });
 
 test('staff: cannot view reports — 403 permission_denied naming reports.view', function () {
-    [, $token] = attachMember($this->merchant, RoleInMerchant::Cashier);
+    [, $token] = attachMember($this->merchant, RoleInMerchant::Staff);
 
     $this->withToken($token)
         ->getJson('/api/v1/merchant/reports/sales-summary')
@@ -313,7 +313,7 @@ test('staff: cannot view reports — 403 permission_denied naming reports.view',
 });
 
 test('staff: cannot view or edit the merchant profile — 403 permission_denied naming profile.view/profile.edit', function () {
-    [, $token] = attachMember($this->merchant, RoleInMerchant::Cashier);
+    [, $token] = attachMember($this->merchant, RoleInMerchant::Staff);
 
     $this->withToken($token)
         ->getJson('/api/v1/merchant/profile')
@@ -329,7 +329,7 @@ test('staff: cannot view or edit the merchant profile — 403 permission_denied 
 });
 
 test('staff: cannot view or manage the team — 403 permission_denied naming team.view/team.manage', function () {
-    [, $token] = attachMember($this->merchant, RoleInMerchant::Cashier);
+    [, $token] = attachMember($this->merchant, RoleInMerchant::Staff);
 
     $this->withToken($token)
         ->getJson('/api/v1/merchant/team')
@@ -339,7 +339,7 @@ test('staff: cannot view or manage the team — 403 permission_denied naming tea
 
     $this->withToken($token)
         ->postJson('/api/v1/merchant/team', [
-            'name' => 'New Hire', 'email' => 'newhire@merchantone.test', 'role_in_merchant' => 'cashier',
+            'name' => 'New Hire', 'email' => 'newhire@merchantone.test', 'role_in_merchant' => 'staff',
         ])
         ->assertStatus(403)
         ->assertJsonPath('code', 'permission_denied')
@@ -415,7 +415,7 @@ test('manager: cannot edit the profile or manage the team — 403 permission_den
 
     $this->withToken($token)
         ->postJson('/api/v1/merchant/team', [
-            'name' => 'New Hire', 'email' => 'newhire2@merchantone.test', 'role_in_merchant' => 'cashier',
+            'name' => 'New Hire', 'email' => 'newhire2@merchantone.test', 'role_in_merchant' => 'staff',
         ])
         ->assertStatus(403)
         ->assertJsonPath('code', 'permission_denied')
@@ -512,7 +512,7 @@ test('owner: PATCH changing their own role is 422 cannot_demote_owner', function
 });
 
 test('owner: changing a non-owner\'s role still works', function () {
-    [$member] = attachMember($this->merchant, RoleInMerchant::Cashier);
+    [$member] = attachMember($this->merchant, RoleInMerchant::Staff);
     $ownerToken = $this->owner->createToken('merchant')->plainTextToken;
 
     $this->withToken($ownerToken)
@@ -543,18 +543,18 @@ test('/auth/me returns the correct permission list for each preset, and role_in_
         ->not->toContain('team.manage')
         ->and($managerResponse->json('merchant.role_in_merchant'))->toBe('manager');
 
-    [, $staffToken] = attachMember($this->merchant, RoleInMerchant::Cashier);
+    [, $staffToken] = attachMember($this->merchant, RoleInMerchant::Staff);
     $staffResponse = $this->withToken($staffToken)->getJson('/api/v1/auth/me')->assertOk();
     $staffPermissions = $staffResponse->json('permissions');
     sort($staffPermissions);
-    $expectedStaff = RolePresets::valuesFor(RoleInMerchant::Cashier);
+    $expectedStaff = RolePresets::valuesFor(RoleInMerchant::Staff);
     sort($expectedStaff);
     expect($staffPermissions)->toBe($expectedStaff)
-        ->and($staffResponse->json('merchant.role_in_merchant'))->toBe('cashier');
+        ->and($staffResponse->json('merchant.role_in_merchant'))->toBe('staff');
 });
 
 test('/auth/me: a removed member gets an empty permission list and merchant: null', function () {
-    [$member, $memberToken] = attachMember($this->merchant, RoleInMerchant::Cashier);
+    [$member, $memberToken] = attachMember($this->merchant, RoleInMerchant::Staff);
 
     $this->withToken($this->owner->createToken('merchant')->plainTextToken)
         ->deleteJson("/api/v1/merchant/team/{$member->id}")
@@ -568,7 +568,7 @@ test('/auth/me: a removed member gets an empty permission list and merchant: nul
 });
 
 test('/auth/me: a suspended merchant\'s member also gets an empty permission list, even though merchant is still shown', function () {
-    [$member, $memberToken] = attachMember($this->merchant, RoleInMerchant::Cashier);
+    [$member, $memberToken] = attachMember($this->merchant, RoleInMerchant::Staff);
 
     $this->merchant->update(['status' => 'suspended']);
 
@@ -586,7 +586,7 @@ test('/auth/me: a suspended merchant\'s member also gets an empty permission lis
 
 test('permission_denied is distinguishable from merchant_inactive and the portal-role forbidden', function () {
     // permission_denied: right merchant, right role... wrong permission.
-    [, $staffToken] = attachMember($this->merchant, RoleInMerchant::Cashier);
+    [, $staffToken] = attachMember($this->merchant, RoleInMerchant::Staff);
     $this->withToken($staffToken)
         ->getJson('/api/v1/merchant/reports/sales-summary')
         ->assertStatus(403)
