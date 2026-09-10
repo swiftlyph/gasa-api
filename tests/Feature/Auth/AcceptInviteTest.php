@@ -22,7 +22,7 @@ beforeEach(function () {
         ->postJson('/api/v1/merchant/team', [
             'name' => 'Invited Member',
             'email' => 'invited@merchantone.test',
-            'role_in_merchant' => 'cashier',
+            'role_in_merchant' => 'staff',
         ])
         ->assertCreated();
     app()->detectEnvironment(fn () => 'testing');

@@ -67,7 +67,7 @@ class TeamMemberResource extends JsonResource
             'email' => (string) $this->email,
             // The pivot column has no cast declared on Merchant::users()/
             // User::merchants(), so it already arrives as the plain string
-            // value ("owner", "manager", "cashier") — RoleInMerchant::from()
+            // value ("owner", "manager", "staff") — RoleInMerchant::from()
             // is not needed to "unwrap" anything, but round-tripping
             // through it here still guards against a stored value ever
             // drifting from the enum's cases.

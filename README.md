@@ -1270,12 +1270,18 @@ existing merchants first, never gradually.
 
 `merchant_user`'s `role_in_merchant` is now a backed enum
 (`App\Domains\Merchant\Enums\RoleInMerchant`: `owner` | `manager` |
-`cashier`), mirrored by a Postgres CHECK constraint the same way
-`MerchantStatus` mirrors `merchants.status`.
+`staff`), mirrored by a Postgres CHECK constraint the same way
+`MerchantStatus` mirrors `merchants.status`. The third value was renamed
+from `cashier` to `staff` in P7.1: GASA serves any food business — coffee
+shops, stalls, bakeries, canteens — and "cashier" is till-specific
+vocabulary that has no business being a platform-level role name.
+`cashier` is rejected by both the CHECK constraint and `POST`/`PATCH
+/merchant/team`'s validation (a normal `422 validation_failed`, no
+special-casing) — it is not a valid `role_in_merchant` value anymore.
 
 **`role_in_merchant` is recorded and returned, but is NOT yet an
 authorization boundary.** Every merchant-portal user can call every
-`merchant.api` route regardless of their role — a `cashier` and an
+`merchant.api` route regardless of their role — a `staff` member and an
 `owner` have identical access this phase. Per-role permission gating is
 a later phase; don't assume otherwise from the field's presence.
 

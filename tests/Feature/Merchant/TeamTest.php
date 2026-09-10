@@ -6,6 +6,8 @@ use App\Domains\CashSessions\Models\Register;
 use App\Domains\Merchant\Models\Merchant;
 use App\Domains\Merchant\Models\TeamInvitation;
 use Database\Seeders\RoleSeeder;
+use Illuminate\Database\QueryException;
+use Illuminate\Support\Facades\DB;
 
 /**
  * Team members (merchant_user pivot) and the invite/accept flow.
@@ -31,17 +33,17 @@ test('GET team lists the owner, marking them as such', function () {
 test('adding a member creates a user with the merchant role, attaches the pivot, and returns an invite link locally', function () {
     $response = $this->withToken($this->ownerToken)
         ->postJson('/api/v1/merchant/team', [
-            'name' => 'New Cashier',
-            'email' => 'cashier@merchantone.test',
-            'role_in_merchant' => 'cashier',
+            'name' => 'New Staff',
+            'email' => 'newstaff@merchantone.test',
+            'role_in_merchant' => 'staff',
         ])
         ->assertCreated()
-        ->assertJsonPath('name', 'New Cashier')
-        ->assertJsonPath('email', 'cashier@merchantone.test')
-        ->assertJsonPath('role_in_merchant', 'cashier')
+        ->assertJsonPath('name', 'New Staff')
+        ->assertJsonPath('email', 'newstaff@merchantone.test')
+        ->assertJsonPath('role_in_merchant', 'staff')
         ->assertJsonPath('is_owner', false);
 
-    $newUser = User::where('email', 'cashier@merchantone.test')->firstOrFail();
+    $newUser = User::where('email', 'newstaff@merchantone.test')->firstOrFail();
 
     expect($newUser->hasRole('merchant'))->toBeTrue()
         ->and($this->merchant->users()->where('users.id', $newUser->id)->exists())->toBeTrue()
@@ -59,9 +61,9 @@ test('the invite link is included in local/development environments only', funct
 
     $this->withToken($this->ownerToken)
         ->postJson('/api/v1/merchant/team', [
-            'name' => 'Dev Cashier',
-            'email' => 'devcashier@merchantone.test',
-            'role_in_merchant' => 'cashier',
+            'name' => 'Dev Staff',
+            'email' => 'devstaff@merchantone.test',
+            'role_in_merchant' => 'staff',
         ])
         ->assertCreated()
         ->assertJsonPath('invite.token', fn ($token) => is_string($token) && strlen($token) > 0)
@@ -72,7 +74,7 @@ test('the invite link is included in local/development environments only', funct
 
 test('adding an email already on this merchant is 422 member_already_exists', function () {
     $existing = User::factory()->withRole('merchant')->create(['email' => 'dup@merchantone.test']);
-    $this->merchant->users()->attach($existing->id, ['role_in_merchant' => 'cashier']);
+    $this->merchant->users()->attach($existing->id, ['role_in_merchant' => 'staff']);
 
     $this->withToken($this->ownerToken)
         ->postJson('/api/v1/merchant/team', [
@@ -103,7 +105,7 @@ test('adding an email belonging to another merchant\'s user is 422 email_unavail
 
 test('PATCH team member changes role_in_merchant only', function () {
     $member = User::factory()->withRole('merchant')->create();
-    $this->merchant->users()->attach($member->id, ['role_in_merchant' => 'cashier']);
+    $this->merchant->users()->attach($member->id, ['role_in_merchant' => 'staff']);
 
     $this->withToken($this->ownerToken)
         ->patchJson("/api/v1/merchant/team/{$member->id}", ['role_in_merchant' => 'manager'])
@@ -126,7 +128,7 @@ test('removing the owner is 422 cannot_remove_owner', function () {
 
 test('removing a member detaches the pivot, leaves the user row intact, and revokes their merchant access', function () {
     $member = User::factory()->withRole('merchant')->create();
-    $this->merchant->users()->attach($member->id, ['role_in_merchant' => 'cashier']);
+    $this->merchant->users()->attach($member->id, ['role_in_merchant' => 'staff']);
     $memberToken = $member->createToken('merchant')->plainTextToken;
 
     $this->withToken($memberToken)
@@ -171,7 +173,7 @@ test('a suspended merchant gets 403 merchant_inactive on every team endpoint', f
         ->assertStatus(403)->assertJsonPath('code', 'merchant_inactive');
 
     $this->withToken($token)->postJson('/api/v1/merchant/team', [
-        'name' => 'X', 'email' => 'x@x.test', 'role_in_merchant' => 'cashier',
+        'name' => 'X', 'email' => 'x@x.test', 'role_in_merchant' => 'staff',
     ])->assertStatus(403)->assertJsonPath('code', 'merchant_inactive');
 });
 
@@ -197,9 +199,9 @@ test('SEGREGATION OF DUTIES: a team member added this phase can confirm a remitt
     app()->detectEnvironment(fn () => 'local');
     $inviteResponse = $this->withToken($this->ownerToken)
         ->postJson('/api/v1/merchant/team', [
-            'name' => 'Confirming Cashier',
+            'name' => 'Confirming Staff',
             'email' => 'confirmer@merchantone.test',
-            'role_in_merchant' => 'cashier',
+            'role_in_merchant' => 'staff',
         ])
         ->assertCreated();
     app()->detectEnvironment(fn () => 'testing');
@@ -239,4 +241,88 @@ test('SEGREGATION OF DUTIES: a team member added this phase can confirm a remitt
         ->assertOk()
         ->assertJsonPath('status', 'confirmed')
         ->assertJsonPath('confirmed_by_user_id', $newUser->id);
+});
+
+test('POST/PATCH team reject the retired "cashier" role value with a normal validation error', function () {
+    $this->withToken($this->ownerToken)
+        ->postJson('/api/v1/merchant/team', [
+            'name' => 'X',
+            'email' => 'x@merchantone.test',
+            'role_in_merchant' => 'cashier',
+        ])
+        ->assertStatus(422)
+        ->assertJsonPath('code', 'validation_failed')
+        ->assertJsonValidationErrors('role_in_merchant');
+
+    $member = User::factory()->withRole('merchant')->create();
+    $this->merchant->users()->attach($member->id, ['role_in_merchant' => 'staff']);
+
+    $this->withToken($this->ownerToken)
+        ->patchJson("/api/v1/merchant/team/{$member->id}", ['role_in_merchant' => 'cashier'])
+        ->assertStatus(422)
+        ->assertJsonPath('code', 'validation_failed')
+        ->assertJsonValidationErrors('role_in_merchant');
+});
+
+test('P7.1: the database itself rejects "cashier" and accepts "staff" on merchant_user.role_in_merchant', function () {
+    $member = User::factory()->withRole('merchant')->create();
+
+    // Postgres aborts the whole surrounding transaction on a constraint
+    // violation — including the outer RefreshDatabase transaction Pest
+    // wraps every test in — so the rejected insert has to run inside its
+    // own SAVEPOINT (a nested DB::transaction()) that rolls back on
+    // failure, leaving the outer transaction usable for the assertions
+    // that follow.
+    expect(fn () => DB::transaction(fn () => DB::table('merchant_user')->insert([
+        'user_id' => $member->id,
+        'merchant_id' => $this->merchant->id,
+        'role_in_merchant' => 'cashier',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ])))->toThrow(QueryException::class);
+
+    DB::table('merchant_user')->insert([
+        'user_id' => $member->id,
+        'merchant_id' => $this->merchant->id,
+        'role_in_merchant' => 'staff',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    expect(DB::table('merchant_user')->where('user_id', $member->id)->value('role_in_merchant'))
+        ->toBe('staff');
+});
+
+test('P7.1: an existing "cashier" pivot row reads as "staff" after the rename migration runs', function () {
+    $member = User::factory()->withRole('merchant')->create();
+
+    // Insert directly, bypassing the current (already-renamed) CHECK
+    // constraint: this reproduces the state a real pre-P7.1 database was
+    // in — a live 'cashier' row — by disabling the constraint just long
+    // enough to seed that state, then re-enabling it before running the
+    // rename migration under test, exactly as it would run against a
+    // real deployed database that still had the old constraint in place.
+    DB::statement('ALTER TABLE merchant_user DROP CONSTRAINT merchant_user_role_in_merchant_check');
+    DB::statement("ALTER TABLE merchant_user ADD CONSTRAINT merchant_user_role_in_merchant_check CHECK (role_in_merchant IN ('owner', 'manager', 'cashier'))");
+
+    DB::table('merchant_user')->insert([
+        'user_id' => $member->id,
+        'merchant_id' => $this->merchant->id,
+        'role_in_merchant' => 'cashier',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    (new (require database_path('migrations/2026_09_10_050000_rename_merchant_user_role_cashier_to_staff.php')))->up();
+
+    expect(DB::table('merchant_user')->where('user_id', $member->id)->value('role_in_merchant'))
+        ->toBe('staff');
+
+    expect(fn () => DB::table('merchant_user')->insert([
+        'user_id' => User::factory()->create()->id,
+        'merchant_id' => $this->merchant->id,
+        'role_in_merchant' => 'cashier',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]))->toThrow(QueryException::class);
 });

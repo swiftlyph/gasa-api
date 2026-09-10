@@ -13,8 +13,10 @@ use Illuminate\Support\Facades\Schema;
  * Postgres, no enum at all on sqlite), so a CHECK constraint is the real
  * enforcement and the PHP enum is its typed mirror.
  *
- * Existing seeded rows use 'owner'/'cashier', both valid RoleInMerchant
- * values, so this never needs a data backfill.
+ * Existing seeded rows use 'owner'/'cashier' (the latter renamed to
+ * 'staff' in P7.1 — see that migration), both valid RoleInMerchant
+ * values at the time this migration ran, so it never needed a data
+ * backfill of its own.
  */
 return new class extends Migration
 {

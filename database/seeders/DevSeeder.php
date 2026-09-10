@@ -48,7 +48,7 @@ class DevSeeder extends Seeder
             // confirmation (which REQUIRES a different user than the
             // creator) has someone real to demo against rather than only
             // being exercisable in tests.
-            ['email' => 'cashier@gasa.test', 'name' => 'Merchant One Cashier', 'role' => 'merchant'],
+            ['email' => 'staff@gasa.test', 'name' => 'Merchant One Staff', 'role' => 'merchant'],
         ];
 
         $users = [];
@@ -72,7 +72,7 @@ class DevSeeder extends Seeder
         // owner — syncWithoutDetaching keeps this idempotent alongside the
         // owner pivot seedMerchant() already wrote.
         $merchantOne->users()->syncWithoutDetaching([
-            $users['cashier@gasa.test']->id => ['role_in_merchant' => 'cashier'],
+            $users['staff@gasa.test']->id => ['role_in_merchant' => 'staff'],
         ]);
 
         // Both active merchants get a catalog and order history. BOTH, not
@@ -108,7 +108,7 @@ class DevSeeder extends Seeder
             // Only Merchant One demos the closed/confirmed history: doing
             // it needs a SECOND user to confirm the remittance, and
             // Merchant Two has only its single owner seeded above.
-            $this->seedClosedCashSession($registerOne, $users['merchant@gasa.test'], $users['cashier@gasa.test']);
+            $this->seedClosedCashSession($registerOne, $users['merchant@gasa.test'], $users['staff@gasa.test']);
 
             $this->seedOpenCashSession($registerOne, $users['merchant@gasa.test']);
         });
@@ -218,7 +218,7 @@ class DevSeeder extends Seeder
         ]);
 
         // Through the real Action, not a direct assignment: $confirmer is
-        // a genuine second user here (the seeded cashier), so this
+        // a genuine second user here (the seeded staff member), so this
         // exercises the same segregation-of-duties path production does,
         // matching how OrderFactory issues numbers through
         // GenerateOrderNumberAction rather than inventing its own.

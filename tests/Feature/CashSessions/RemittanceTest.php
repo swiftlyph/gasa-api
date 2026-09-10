@@ -19,7 +19,7 @@ beforeEach(function () {
     $this->creatorToken = $this->creator->createToken('merchant')->plainTextToken;
 
     $this->confirmer = User::factory()->withRole('merchant')->create();
-    $this->merchant->users()->attach($this->confirmer->id, ['role_in_merchant' => 'cashier']);
+    $this->merchant->users()->attach($this->confirmer->id, ['role_in_merchant' => 'staff']);
     $this->confirmerToken = $this->confirmer->createToken('merchant')->plainTextToken;
 
     $this->register = Register::factory()->forMerchant($this->merchant)->create();

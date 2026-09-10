@@ -172,7 +172,7 @@ test('reconciliation counts every term and excludes gcash and voided cash', func
         ])->assertCreated();
 
     $confirmer = User::factory()->withRole('merchant')->create();
-    $this->merchant->users()->attach($confirmer->id, ['role_in_merchant' => 'cashier']);
+    $this->merchant->users()->attach($confirmer->id, ['role_in_merchant' => 'staff']);
 
     $remittanceId = $this->withToken($this->token)
         ->postJson("/api/v1/merchant/cash-sessions/{$session['id']}/remittances", [
