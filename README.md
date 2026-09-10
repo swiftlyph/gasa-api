@@ -150,7 +150,7 @@ header — never a redirect.
 | 403    | `merchant_inactive`    | Merchant portal, but the user has no merchant or theirs isn't `active` |
 | 404    | `not_found`            | Route or model not found                                        |
 | 422    | `validation_failed`    | FormRequest validation failure                                  |
-| 422    | `invalid_transition`   | Order status change the transition map forbids (e.g. completing a voided order) |
+| 422    | `invalid_transition`   | Order status change the transition map forbids (e.g. completing a voided order), OR a merchant status change `PATCH /admin/merchants/{merchant}/status` forbids (e.g. `pending` → `pending`) — one shared code across both, see § Platform admin |
 | 422    | `product_unavailable`  | Checkout referenced a product that is missing, not the caller's, or flagged unavailable — `errors.product_ids` lists them |
 | 422    | `discount_exceeds_subtotal` | Checkout discount is larger than the server-computed subtotal   |
 | 422    | `split_mismatch`       | Split payment whose `cash_cents` + `gcash_cents` don't equal the server-computed total |
@@ -162,7 +162,7 @@ header — never a redirect.
 | 403    | `confirmation_requires_second_user` | Confirming a remittance you created yourself                |
 | 422    | `range_too_large`      | A report's `?from=`/`?to=` spans more than 366 days (see § Reporting) |
 | 422    | `member_already_exists` | `POST /merchant/team` — the email is already attached to this merchant |
-| 422    | `email_unavailable`    | `POST /merchant/team` — the email belongs to a user not already on this merchant (never reveals which merchant) |
+| 422    | `email_unavailable`    | `POST /merchant/team` — the email belongs to a user not already on this merchant (never reveals which merchant); also `POST /admin/merchants` — the owner email already belongs to any user |
 | 422    | `cannot_remove_owner`  | `DELETE /merchant/team/{user}` — the target is the merchant's owner |
 | 422    | `invalid_invite`       | `/auth/accept-invite` — token missing, already used, or expired (never distinguished) |
 | 429    | `too_many_attempts`    | `/auth/login` — 6th+ attempt from the same email+IP within a minute |
@@ -1335,16 +1335,161 @@ environments only, `POST /merchant/team`'s response includes an
 that block is omitted entirely. Real delivery (email, SMS) is a later
 phase.
 
+There is still no way for a merchant to invalidate and reissue their own
+team member's invite from inside the merchant portal — only a platform
+admin can, and only for a merchant's owner specifically, via
+`POST /admin/merchants/{merchant}/resend-invite` (see § Platform admin →
+Resending an invite).
+
 ### Default register on merchant creation
 
 Every merchant now gets a default (`"Front Counter"`) register the
 moment it's created — `App\Domains\Merchant\Actions\
 EnsureDefaultRegisterAction`, invoked from `Merchant::booted()`'s
 `created` event, so this holds regardless of how the merchant was made
-(factory, seeder, a future admin-provisioning endpoint). This **narrows**
-when `DefaultRegister`'s `NoRegisterConfigured` fallback (see §
-Registers) can be hit — it does not replace it; a merchant created before
-this phase shipped still falls through to that graceful behavior.
+(factory, seeder, `POST /admin/merchants` — see § Platform admin). This
+**narrows** when `DefaultRegister`'s `NoRegisterConfigured` fallback (see
+§ Registers) can be hit — it does not replace it; a merchant created
+before this phase shipped still falls through to that graceful behavior.
+
+## Platform admin
+
+Before this phase, a merchant existed only because a seeder made one —
+there was no way to onboard a real second merchant without `tinker`.
+Every route below sits behind the `admin.api` middleware group
+(`auth:sanctum` + `role:platform_admin` + `AllowsAdminContext`, see
+bootstrap/app.php) — that group's `AllowsAdminContext` flag is what lifts
+`BelongsToMerchant`'s tenant scope for the whole request; nothing here
+calls `TenantContext::runInAdminContext()` itself.
+
+| Method  | Route                                          | Notes |
+| ------- | ----------------------------------------------- | ----- |
+| `GET`   | `/api/v1/admin/merchants`                       | Paginated, filterable by `status` and `search` (matches merchant name or owner name/email) |
+| `GET`   | `/api/v1/admin/merchants/{merchant}`             | Full profile, owner, team, registers, and status history |
+| `POST`  | `/api/v1/admin/merchants`                        | Provision a merchant: `{ name, owner: { name, email }, profile? }` |
+| `PATCH` | `/api/v1/admin/merchants/{merchant}/status`      | `{ status, reason? }` — legal transitions only |
+| `POST`  | `/api/v1/admin/merchants/{merchant}/resend-invite` | Reissues the owner's invite, invalidating the prior one |
+| `GET`   | `/api/v1/admin/audit-logs`                       | Paginated, filterable by actor, action, subject, and date range |
+
+### Provisioning
+
+`POST /admin/merchants` does five things in **one transaction**
+(`App\Domains\Merchant\Actions\ProvisionMerchantAction`): creates the
+owner `User` (a random password, exactly like `AddTeamMemberAction`
+does for a regular team member — the invite flow is what sets a real
+one), creates the `Merchant` in status `pending`, attaches the
+`merchant_user` pivot with `role_in_merchant` `owner`, assigns the
+`merchant` spatie role, and issues an invite via P7's
+`CreateTeamInvitationAction` — the exact same mechanism
+`POST /merchant/team` uses. The default register is **not** provisioned
+explicitly here; `Merchant::booted()`'s `created` hook already guarantees
+one the moment the row exists (see § Default register on merchant
+creation below), so it happens automatically as a side effect of step
+two. A failure at any point rolls back everything — no orphaned user,
+pivot, or invite.
+
+The owner `User` is created **before** the `Merchant`, not after:
+`merchants.owner_user_id` is `NOT NULL`, and creating the `Merchant`
+first would leave no owner to point it at.
+
+An owner email that already belongs to any user (on this merchant, a
+different one, or none at all) → `422 email_unavailable`, mirroring
+`POST /merchant/team`'s exact reasoning — never revealing that the email
+is registered.
+
+A newly-provisioned merchant is **`pending`**, so its owner's invite
+leads to a working login but a `403 merchant_inactive` on every merchant
+route until an admin approves it (see § Status transitions below).
+
+Like `POST /merchant/team`, the response includes the plaintext invite
+`{ token, expires_at, url }` **only** in `local`/`development`
+environments — never sent by real email this phase, never surfaced in
+production by this endpoint either.
+
+### Status transitions
+
+`App\Domains\Merchant\Enums\MerchantStatus::allowedTransitions()` is the
+single authority on which status changes are legal — mirroring
+`App\Domains\Orders\Enums\OrderStatus`'s shape exactly:
+
+- `pending` → `active` (approve) or `suspended` (block before ever going live)
+- `active` → `suspended`
+- `suspended` → `active` (reinstate)
+
+Every other pair — including `active`/`suspended` → `pending`, and a
+status "changed" to itself — is `422 invalid_transition`, the same code
+`OrderStatus` already uses (the error contract has no per-domain field,
+so the code is deliberately shared).
+
+Every **legal** change writes one `audit_logs` entry
+(`merchant.status_changed`) with the actor, old status, new status, and
+the optional `reason` in `context`. An **illegal** transition writes none
+— `MerchantStatus::assertCanTransitionTo()` throws before
+`ChangeMerchantStatusAction` does any write.
+
+Suspension bites immediately: `EnsureMerchantActive` (P7) already 403s
+every merchant-portal request from a non-`active` merchant, checked on
+every request, not cached — this phase is what makes that reachable in
+practice, since before it there was no way to suspend a merchant at all
+outside a factory state.
+
+### Resending an invite
+
+P7 shipped `CreateTeamInvitationAction` (issuing) and `AcceptInviteAction`
+(redeeming), but no way to invalidate a still-live invitation.
+`POST /admin/merchants/{merchant}/resend-invite`
+(`App\Domains\Merchant\Actions\ResendMerchantInviteAction`) closes that
+gap: it marks every unused `team_invitations` row for the merchant's
+owner as `used_at = now()` — the same "used" mechanism
+`AcceptInviteAction` already sets on redemption, not a new column or
+state — before issuing a fresh token via `CreateTeamInvitationAction`.
+The old token then collapses into the ordinary `422 invalid_invite` any
+other already-used token gets; no new error case was needed on the
+accept-invite side. Writes an `audit_logs` entry
+(`merchant.invite_resent`).
+
+### The audit log
+
+`audit_logs` (`App\Domains\Platform\Models\AuditLog`) is a general-purpose,
+append-only record of platform-admin actions: `actor_user_id`, `action`
+(e.g. `merchant.created`, `merchant.status_changed`,
+`merchant.invite_resent`), a polymorphic `subject`, `old_values`/
+`new_values`/`context` (all nullable JSON), `ip_address`, and
+`created_at` only — an entry is never updated once written.
+`App\Domains\Platform\Actions\RecordAuditLogAction` is the only place
+`AuditLog::create()` is ever called; no controller or Action writes one
+inline.
+
+**Deliberately NOT tenant-scoped** (no `merchant_id` column, no
+`BelongsToMerchant`) — it spans every merchant by design, e.g. a
+merchant's own status history draws from it directly. Because it carries
+no tenant scope of its own, `GET /admin/audit-logs` (behind `admin.api`)
+is its **only** access path; there is no merchant-portal or public route
+that can reach it, by construction rather than by an extra check (see
+`TenantLeakageTest`'s admin-boundary cases).
+
+`GET /admin/audit-logs` filters by `actor_user_id`, `action`,
+`subject_type` + `subject_id`, and an optional `from`/`to` date range
+converted through `MerchantDay::forQuery()` — the same UTC-conversion
+rule `ReportDateRangeRequest` already follows (see § Day boundaries),
+just with no range cap: this is a plain indexed paginated read, not a
+report's whole-range aggregate.
+
+### Admin scoping discipline
+
+Only `AllowsAdminContext`, registered on the `admin.api` group, may lift
+`BelongsToMerchant`'s scope for a request. No admin controller or Action
+in this phase calls `TenantContext::runInAdminContext()` directly — the
+one documented exception to that rule remains `EnsureDefaultRegisterAction`
+(see § Default register on merchant creation), which already ran before
+this phase and needed it for a different reason (no acting merchant to
+inherit from at all, admin request or not).
+
+A `platform_admin` token gets a plain `403 forbidden` from
+`role:merchant` on every `merchant.api` route (being an admin is not by
+itself a bypass — see § Tenancy), and a `merchant` token gets the same
+`403 forbidden` from `role:platform_admin` on every route in this
+section, including `/admin/audit-logs`.
 
 ## Local setup
 
