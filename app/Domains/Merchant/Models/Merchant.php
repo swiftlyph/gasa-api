@@ -3,6 +3,7 @@
 namespace App\Domains\Merchant\Models;
 
 use App\Domains\Auth\Models\User;
+use App\Domains\CashSessions\Models\Register;
 use App\Domains\Merchant\Actions\EnsureDefaultRegisterAction;
 use App\Domains\Merchant\Enums\MerchantStatus;
 use Database\Factories\MerchantFactory;
@@ -10,6 +11,7 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 
 /**
  * @property int $id
@@ -108,5 +110,24 @@ class Merchant extends Model
     public function isActive(): bool
     {
         return $this->status === MerchantStatus::Active;
+    }
+
+    /**
+     * Register has no reverse-declared "belongs to a specific merchant
+     * from the merchant side" relation before this phase — every other
+     * caller reaches registers through BelongsToMerchant's own scoped
+     * queries (RegisterController, DefaultRegister), never through
+     * Merchant itself. Added here for GET /admin/merchants/{merchant},
+     * the first place that needs to load a NAMED merchant's registers
+     * rather than "the current tenant's" — an admin request, which is why
+     * this must only ever be queried from admin.api context (see
+     * BelongsToMerchant's docblock: the scope bypass is a request-context
+     * flag, not something this relation grants on its own).
+     *
+     * @return HasMany<Register, $this>
+     */
+    public function registers(): HasMany
+    {
+        return $this->hasMany(Register::class);
     }
 }
