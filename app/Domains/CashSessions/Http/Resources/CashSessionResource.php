@@ -62,6 +62,18 @@ class CashSessionResource extends JsonResource
     }
 
     /**
+     * `cash_sales_cents` and `voided_cash_cents` are the GROSS shape —
+     * "taken in" and "given back" as two independent figures, never one
+     * netted against the other — so read them together, not in
+     * isolation: `cash_sales_cents` is EVERY cash order in the session,
+     * voided ones included (money hit the drawer the moment it was rung
+     * up), and `voided_cash_cents` is the cash portion of voided orders
+     * ALONE, subtracted back out by `expected_cash_cents` as its own
+     * term. A session with only a voided cash sale reports a non-zero
+     * `cash_sales_cents` alongside an equal `voided_cash_cents` — that
+     * pair nets to zero in `expected_cash_cents`, exactly matching the
+     * physical drawer, and is not a bug.
+     *
      * @return array{
      *     opening_float_cents: int,
      *     cash_sales_cents: int,

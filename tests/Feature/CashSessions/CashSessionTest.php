@@ -183,22 +183,105 @@ test('reconciliation counts every term and excludes gcash and voided cash', func
         ->postJson("/api/v1/merchant/remittances/{$remittanceId}/confirm")
         ->assertOk();
 
-    // opening_float   100000
-    // + cash_sales     14000 (cash) + 6000 (split cash half) = 20000
-    // - voided_cash    14000 (the voided cash order)
-    // + cash_in         20000
-    // - cash_out         5000
-    // - remittance      30000
-    // = 100000 + 20000 - 14000 + 20000 - 5000 - 30000 = 91000
+    // Reasoning from the PHYSICAL DRAWER, not the formula: a cashier
+    // opens with 100000, rings up 14000 cash (kept) and the 6000 cash
+    // half of the split (kept) — both stay in the drawer. The voided
+    // cash order put 14000 IN at checkout and took it back OUT at void:
+    // net zero, it never should have moved the drawer at all. The voided
+    // gcash order never touched the drawer either way. Then 20000 cash
+    // in, 5000 cash out, 30000 confirmed remittance out:
+    //   100000 + 14000 + 6000 + 0 + 20000 - 5000 - 30000 = 105000
+    //
+    // The GROSS reconciliation fields get there as two independent
+    // terms rather than one pre-netted figure:
+    //   cash_sales  = 14000 (cash) + 6000 (split cash) + 14000 (the
+    //                 voided cash order, counted because it WAS rung
+    //                 up) = 34000
+    //   voided_cash = 14000 (that same order, given back at void)
+    //   100000 + 34000 - 14000 + 20000 - 5000 - 30000 = 105000
     $this->withToken($this->token)
         ->getJson("/api/v1/merchant/cash-sessions/{$session['id']}")
         ->assertOk()
-        ->assertJsonPath('reconciliation.cash_sales_cents', 20000)
+        ->assertJsonPath('reconciliation.cash_sales_cents', 34000)
         ->assertJsonPath('reconciliation.voided_cash_cents', 14000)
         ->assertJsonPath('reconciliation.cash_in_cents', 20000)
         ->assertJsonPath('reconciliation.cash_out_cents', 5000)
         ->assertJsonPath('reconciliation.confirmed_remittances_cents', 30000)
-        ->assertJsonPath('reconciliation.expected_cash_cents', 91000);
+        ->assertJsonPath('reconciliation.expected_cash_cents', 105000);
+});
+
+/*
+|--------------------------------------------------------------------------
+| P4.1 regression: double-subtraction of voided cash
+|--------------------------------------------------------------------------
+|
+| Found live: ReconcileCashSessionAction computed cash_sales NET of voided
+| orders, then ALSO subtracted voided_cash — double-subtracting the void.
+| Reproduction: float 5,000, cash 250 (voided), gcash 665, split 445 (200
+| cash / 245 gcash). Physically the drawer holds float + the split's cash
+| portion = 5,200 (the voided cash order paid in and was fully refunded —
+| net zero — and neither gcash leg ever touched the till). The buggy
+| formula answered 4,950, a phantom 250 shortfall.
+*/
+test('P4.1 regression: a voided cash order nets to zero, not a phantom shortfall', function () {
+    $cashProduct = Product::factory()->create([
+        'merchant_id' => $this->merchant->id,
+        'name' => 'Voided Item',
+        'price_cents' => 250,
+    ]);
+    $gcashProduct = Product::factory()->create([
+        'merchant_id' => $this->merchant->id,
+        'name' => 'Gcash Item',
+        'price_cents' => 665,
+    ]);
+    $splitProduct = Product::factory()->create([
+        'merchant_id' => $this->merchant->id,
+        'name' => 'Split Item',
+        'price_cents' => 445,
+    ]);
+
+    $session = ($this->open)(['opening_float_cents' => 5000])->assertCreated()->json();
+
+    // cash 250, voided below.
+    $voidedOrderId = ($this->checkout)([
+        'payment_method' => 'cash',
+        'items' => [['product_id' => $cashProduct->id, 'quantity' => 1]],
+    ])->assertCreated()->json('id');
+
+    // gcash 665: never touches the drawer, void or not.
+    ($this->checkout)([
+        'payment_method' => 'gcash',
+        'items' => [['product_id' => $gcashProduct->id, 'quantity' => 1]],
+    ])->assertCreated();
+
+    // split 445: 200 cash / 245 gcash.
+    ($this->checkout)([
+        'payment_method' => 'split',
+        'cash_cents' => 200,
+        'gcash_cents' => 245,
+        'items' => [['product_id' => $splitProduct->id, 'quantity' => 1]],
+    ])->assertCreated();
+
+    $this->withToken($this->token)
+        ->postJson("/api/v1/merchant/orders/{$voidedOrderId}/void")
+        ->assertOk();
+
+    // Physical drawer: float 5,000 + split's 200 cash portion = 5,200.
+    // The voided 250 cash order went in at checkout and back out at
+    // void — net zero — and the gcash legs (665 pure, 245 of the split)
+    // never touched the till either way.
+    //
+    // Gross reconciliation fields get there as two independent terms:
+    //   cash_sales  = 250 (the voided order, counted because it WAS rung
+    //                 up) + 200 (split's cash half) = 450
+    //   voided_cash = 250 (that same order, given back at void)
+    //   5000 + 450 - 250 = 5200
+    $this->withToken($this->token)
+        ->getJson("/api/v1/merchant/cash-sessions/{$session['id']}")
+        ->assertOk()
+        ->assertJsonPath('reconciliation.cash_sales_cents', 450)
+        ->assertJsonPath('reconciliation.voided_cash_cents', 250)
+        ->assertJsonPath('reconciliation.expected_cash_cents', 5200);
 });
 
 test('closing snapshots expected, stores counted, and computes variance', function (int $countedDelta, int $expectedVariance) {

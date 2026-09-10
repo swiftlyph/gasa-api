@@ -1013,25 +1013,37 @@ session with `422 session_closed`.
 `App\Domains\CashSessions\Actions\ReconcileCashSessionAction` is **the
 single authority** on expected cash, and the figure is **derived, every
 time it's asked for** — never a running total that could drift from its
-own inputs. The formula, in the order its terms are summed:
+own inputs. The formula uses the **gross** shape — "taken in" and "given
+back" as two separate terms, never one that has already netted the other
+out — summed in this order:
 
 ```
 expected_cash =
     opening_float
-  + cash sales attributed to the session
-  − voided orders' cash contribution
+  + cash_sales    (GROSS: every cash order in the session, voided ones
+                    included — a sale is money in the drawer the moment
+                    it's rung up, and voiding it later doesn't erase that
+                    it once happened)
+  − voided_cash   (the cash portion of VOIDED orders alone, given back)
   + cash_in movements − cash_out movements
   − confirmed remittances
 ```
+
+This shop is paid at creation and a void is a refund, so physically a
+voided cash order's cents go into the drawer at checkout and back out at
+void — net zero. Computing `cash_sales` **net of** voided orders and then
+*also* subtracting `voided_cash` double-subtracts the void and understates
+expected cash by twice the voided amount; keeping the two as independent
+gross terms is what makes them match the physical drawer.
 
 "Cash sales" means the **cash portion only**: a pure-cash order's full
 `total_cents`, plus a split order's `cash_cents` half. **GCash never
 counts**, in either direction — gcash settles electronically and never
 touches the physical till, so a voided gcash order changes nothing here,
-while a voided cash order subtracts back out exactly the cash portion it
-had contributed. Only **confirmed** remittances subtract; a pending one is
-a claim, not proof, and counting it early would make the drawer look short
-of cash it still physically holds.
+while a voided cash order nets to zero (counted once in `cash_sales`,
+subtracted once in `voided_cash`). Only **confirmed** remittances subtract;
+a pending one is a claim, not proof, and counting it early would make the
+drawer look short of cash it still physically holds.
 
 On an **open** session this figure is computed live on every read (`GET
 .../current`, `GET .../{cashSession}`). On a **closed** session,
