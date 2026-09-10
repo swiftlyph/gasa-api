@@ -4,6 +4,7 @@ use App\Domains\Auth\Models\User;
 use App\Domains\Catalog\Models\Product;
 use App\Domains\Merchant\Models\Merchant;
 use App\Domains\Orders\Models\Order;
+use App\Domains\Orders\Support\MerchantDay;
 use Carbon\CarbonImmutable;
 use Database\Seeders\RoleSeeder;
 
@@ -87,21 +88,30 @@ test('an unknown status is a 422 rather than a silently unfiltered list', functi
 });
 
 test('the date filter selects a single merchant-local day', function () {
-    $today = now();
+    // Built from MerchantDay, not bare now(): a plain now()->format('Y-m-d')
+    // is the UTC calendar date, which disagrees with the merchant-local
+    // date exactly when the real clock sits between UTC and merchant-local
+    // midnight — the same confusion Part A's day-boundary fix closed, and
+    // this test would otherwise silently reopen it depending on wall-clock
+    // time when the suite happens to run.
+    $todayStart = MerchantDay::forQuery(MerchantDay::startOfToday());
+    $today = $todayStart->addHours(10); // safely inside today, merchant-local
 
     Order::factory()->forMerchant($this->merchant)->count(2)->create(['created_at' => $today]);
-    Order::factory()->forMerchant($this->merchant)->create(['created_at' => $today->copy()->subDay()]);
+    Order::factory()->forMerchant($this->merchant)->create(['created_at' => $today->subDay()]);
 
     // Boundaries: the last instant of the previous day and the first of
     // the next must both fall outside. A BETWEEN with an inclusive end
-    // would have caught the midnight order twice.
+    // would have caught the midnight order twice. CarbonImmutable, so
+    // each call below returns a fresh instance — $todayStart itself is
+    // never mutated.
     Order::factory()->forMerchant($this->merchant)
-        ->create(['created_at' => $today->copy()->startOfDay()->subSecond()]);
+        ->create(['created_at' => $todayStart->subSecond()]);
     Order::factory()->forMerchant($this->merchant)
-        ->create(['created_at' => $today->copy()->startOfDay()->addDay()]);
+        ->create(['created_at' => $todayStart->addDay()]);
 
     $this->withToken($this->token)
-        ->getJson('/api/v1/merchant/orders?date='.$today->format('Y-m-d'))
+        ->getJson('/api/v1/merchant/orders?date='.MerchantDay::startOfToday()->format('Y-m-d'))
         ->assertOk()
         ->assertJsonPath('meta.total', 2);
 });
@@ -133,15 +143,20 @@ test('a malformed date is a 422', function () {
 });
 
 test('filters combine', function () {
-    $today = now();
+    // Merchant-local "today", not bare now(): see the day-boundary test
+    // above for why a plain now()->format('Y-m-d') is the wrong "today" to
+    // build a ?date= fixture from — it's the UTC calendar date, which
+    // disagrees with the merchant-local one whenever the real clock sits
+    // between the two midnights.
+    $today = MerchantDay::forQuery(MerchantDay::startOfToday())->addHours(10);
 
     Order::factory()->forMerchant($this->merchant)->completed()->create(['created_at' => $today]);
     Order::factory()->forMerchant($this->merchant)->pending()->create(['created_at' => $today]);
     Order::factory()->forMerchant($this->merchant)->completed()
-        ->create(['created_at' => $today->copy()->subDay()]);
+        ->create(['created_at' => $today->subDay()]);
 
     $this->withToken($this->token)
-        ->getJson('/api/v1/merchant/orders?status=completed&date='.$today->format('Y-m-d'))
+        ->getJson('/api/v1/merchant/orders?status=completed&date='.MerchantDay::startOfToday()->format('Y-m-d'))
         ->assertOk()
         ->assertJsonPath('meta.total', 1);
 });
