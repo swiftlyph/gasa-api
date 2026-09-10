@@ -4,6 +4,7 @@ namespace App\Domains\Orders\Http\Controllers;
 
 use App\Domains\Orders\Http\Requests\IndexOrdersRequest;
 use App\Domains\Orders\Http\Resources\OrderResource;
+use App\Domains\Orders\Http\Resources\ReceiptResource;
 use App\Domains\Orders\Models\Order;
 use App\Domains\Orders\Support\MerchantDay;
 use App\Http\Controllers\Controller;
@@ -64,5 +65,20 @@ class OrderController extends Controller
         $this->authorize('view', $order);
 
         return new OrderResource($order->load(['items.addOns']));
+    }
+
+    /**
+     * GET /merchant/orders/{order}/receipt — printable receipt data (P9).
+     * Gated by the SAME permission as `show` (orders.view): a receipt is a
+     * read over this order, not a distinct capability. Always 200, even
+     * for a VOIDED order — never a 404 — see ReceiptResource's docblock
+     * for why a reprint of a voided slip must still say so rather than the
+     * endpoint refusing to answer.
+     */
+    public function receipt(Order $order): ReceiptResource
+    {
+        $this->authorize('view', $order);
+
+        return new ReceiptResource($order->load(['items.addOns', 'createdBy', 'merchant']));
     }
 }

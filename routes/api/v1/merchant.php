@@ -81,6 +81,10 @@ Route::prefix('orders')->name('merchant.orders.')->group(function (): void {
 
     Route::get('/{order}', [OrderController::class, 'show'])->name('show');
 
+    // P9: printable receipt data — no PDF, no printer driver. Always 200,
+    // even for a voided order (see OrderController::receipt's docblock).
+    Route::get('/{order}/receipt', [OrderController::class, 'receipt'])->name('receipt');
+
     // POST, not PATCH: these are named operations on an order, not
     // arbitrary edits to its status field. There is deliberately no route
     // that sets `status` directly — every status change goes through the
@@ -116,6 +120,13 @@ Route::prefix('cash-sessions')->name('merchant.cash-sessions.')->group(function 
 
     Route::get('/{cashSession}', [CashSessionController::class, 'show'])->name('show');
     Route::post('/{cashSession}/close', [CashSessionController::class, 'close'])->name('close');
+
+    // P9: the printable shift summary — sales attributed to THIS session
+    // (cash_session_id, never a date range) plus the same reconciliation
+    // block GET /{cashSession} already reports, reused rather than
+    // re-derived. Works on an open session (live figures) exactly as it
+    // does on a closed one (final figures).
+    Route::get('/{cashSession}/z-report', [CashSessionController::class, 'zReport'])->name('z-report');
 
     Route::post('/{cashSession}/movements', [CashMovementController::class, 'store'])
         ->name('movements.store');
