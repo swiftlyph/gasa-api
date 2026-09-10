@@ -4,6 +4,8 @@ use App\Domains\CashSessions\Http\Controllers\CashMovementController;
 use App\Domains\CashSessions\Http\Controllers\CashRemittanceController;
 use App\Domains\CashSessions\Http\Controllers\CashSessionController;
 use App\Domains\CashSessions\Http\Controllers\RegisterController;
+use App\Domains\Merchant\Http\Controllers\MerchantProfileController;
+use App\Domains\Merchant\Http\Controllers\TeamController;
 use App\Domains\Orders\Http\Controllers\CheckoutController;
 use App\Domains\Orders\Http\Controllers\KitchenQueueController;
 use App\Domains\Orders\Http\Controllers\MenuController;
@@ -29,6 +31,27 @@ use Illuminate\Support\Facades\Route;
 // Replaced by real merchant endpoints in a later phase.
 Route::get('/whoami', fn () => response()->json(['portal' => 'merchant']))
     ->name('merchant.whoami');
+
+// P7: the merchant's own profile — name, status, and every profile field
+// (address, contact, tax id, receipt copy). No {merchant} parameter:
+// "which merchant" always comes from the caller's own $user->merchant(),
+// never from the URL.
+Route::prefix('profile')->name('merchant.profile.')->group(function (): void {
+    Route::get('/', [MerchantProfileController::class, 'show'])->name('show');
+    Route::patch('/', [MerchantProfileController::class, 'update'])->name('update');
+});
+
+// P7: team members. {user} binds directly to the Auth\Models\User model
+// (not tenant-scoped via BelongsToMerchant — User has no merchant_id
+// column of its own), so TeamController verifies membership in the
+// caller's own merchant explicitly and 404s a foreign id, matching every
+// other tenant-owned resource in this file.
+Route::prefix('team')->name('merchant.team.')->group(function (): void {
+    Route::get('/', [TeamController::class, 'index'])->name('index');
+    Route::post('/', [TeamController::class, 'store'])->name('store');
+    Route::patch('/{user}', [TeamController::class, 'update'])->name('update');
+    Route::delete('/{user}', [TeamController::class, 'destroy'])->name('destroy');
+});
 
 // The POS product list. A read-only projection of the shared `products`
 // table for the till — product management belongs to the catalog module,

@@ -1154,3 +1154,114 @@ test('a platform admin token is rejected by the report endpoints', function () {
             ->assertJson(['code' => 'forbidden']);
     }
 });
+
+/*
+|--------------------------------------------------------------------------
+| MERCHANT PROFILE & TEAM MEMBERS (P7)
+|--------------------------------------------------------------------------
+|
+| Profile has no {merchant} route parameter to spoof at all — "which
+| merchant" always comes from the caller's own token, so there is no id
+| to guess. Team members ARE addressed by {user}, a route-model-bound
+| Auth\Models\User rather than a BelongsToMerchant-scoped model, so
+| TeamController checks membership explicitly — proven here the same way
+| every other tenant-owned resource is: a foreign id is a 404, never a
+| 403, and no cross-tenant write ever lands.
+*/
+
+test('merchant two\'s token never sees or changes merchant one\'s profile', function () {
+    $this->merchantOne->update(['legal_name' => 'Merchant One Legal Name']);
+
+    $tokenTwo = $this->merchantTwoUser->createToken('merchant')->plainTextToken;
+
+    $this->withToken($tokenTwo)
+        ->getJson('/api/v1/merchant/profile')
+        ->assertOk()
+        ->assertJsonPath('id', $this->merchantTwo->id)
+        ->assertJsonMissingPath('legal_name.Merchant One Legal Name');
+
+    $this->withToken($tokenTwo)
+        ->patchJson('/api/v1/merchant/profile', ['legal_name' => 'Hijacked'])
+        ->assertOk();
+
+    expect($this->merchantOne->fresh()->legal_name)->toBe('Merchant One Legal Name');
+});
+
+test('a merchant only sees their own team, never another merchant\'s members', function () {
+    $tokenOne = $this->merchantOneUser->createToken('merchant')->plainTextToken;
+
+    $response = $this->withToken($tokenOne)->getJson('/api/v1/merchant/team')->assertOk();
+
+    expect(collect($response->json('data'))->pluck('email')->all())
+        ->toBe([(string) $this->merchantOneUser->email]);
+});
+
+test('a merchant cannot change or remove another merchant\'s team member by id — 404, never 403', function () {
+    $tokenOne = $this->merchantOneUser->createToken('merchant')->plainTextToken;
+
+    $this->withToken($tokenOne)
+        ->patchJson("/api/v1/merchant/team/{$this->merchantTwoUser->id}", ['role_in_merchant' => 'manager'])
+        ->assertStatus(404)
+        ->assertJson(['code' => 'not_found']);
+
+    $this->withToken($tokenOne)
+        ->deleteJson("/api/v1/merchant/team/{$this->merchantTwoUser->id}")
+        ->assertStatus(404)
+        ->assertJson(['code' => 'not_found']);
+
+    expect($this->merchantTwo->users()->where('users.id', $this->merchantTwoUser->id)->exists())->toBeTrue();
+});
+
+test('adding a team member with an email from another merchant never attaches them, and reveals nothing', function () {
+    $tokenOne = $this->merchantOneUser->createToken('merchant')->plainTextToken;
+
+    $this->withToken($tokenOne)
+        ->postJson('/api/v1/merchant/team', [
+            'name' => 'Poacher',
+            'email' => (string) $this->merchantTwoUser->email,
+            'role_in_merchant' => 'manager',
+        ])
+        ->assertStatus(422)
+        ->assertJson(['code' => 'email_unavailable']);
+
+    expect($this->merchantOne->users()->where('users.id', $this->merchantTwoUser->id)->exists())->toBeFalse();
+});
+
+test('a suspended merchant gets 403 merchant_inactive on profile and team endpoints', function () {
+    $user = User::factory()->withRole('merchant')->create();
+    Merchant::factory()->suspended()->ownedBy($user)->create(['name' => 'Suspended Merchant']);
+    $token = $user->createToken('merchant')->plainTextToken;
+
+    foreach ([
+        ['GET', '/api/v1/merchant/profile'],
+        ['GET', '/api/v1/merchant/team'],
+    ] as [$method, $uri]) {
+        $this->withToken($token)->json($method, $uri)
+            ->assertStatus(403)
+            ->assertJson(['code' => 'merchant_inactive']);
+    }
+});
+
+test('an unauthenticated request to profile or team is 401 JSON, never a redirect', function () {
+    foreach (['/api/v1/merchant/profile', '/api/v1/merchant/team'] as $uri) {
+        $response = $this->getJson($uri)
+            ->assertStatus(401)
+            ->assertJson(['code' => 'unauthenticated']);
+
+        expect($response->headers->get('Location'))->toBeNull();
+    }
+});
+
+test('a newly created merchant always has a default register', function () {
+    $owner = User::factory()->withRole('merchant')->create();
+
+    $merchant = Merchant::factory()->ownedBy($owner)->create(['name' => 'Brand New Merchant']);
+
+    $register = Register::withoutGlobalScope('merchant')
+        ->where('merchant_id', $merchant->getKey())
+        ->first();
+
+    expect($register)->not->toBeNull()
+        ->and($register->name)->toBe('Front Counter')
+        ->and($register->is_active)->toBeTrue();
+});

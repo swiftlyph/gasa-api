@@ -161,6 +161,10 @@ header — never a redirect.
 | 422    | `remittance_already_confirmed` | Confirming a remittance that is already confirmed                |
 | 403    | `confirmation_requires_second_user` | Confirming a remittance you created yourself                |
 | 422    | `range_too_large`      | A report's `?from=`/`?to=` spans more than 366 days (see § Reporting) |
+| 422    | `member_already_exists` | `POST /merchant/team` — the email is already attached to this merchant |
+| 422    | `email_unavailable`    | `POST /merchant/team` — the email belongs to a user not already on this merchant (never reveals which merchant) |
+| 422    | `cannot_remove_owner`  | `DELETE /merchant/team/{user}` — the target is the merchant's owner |
+| 422    | `invalid_invite`       | `/auth/accept-invite` — token missing, already used, or expired (never distinguished) |
 | 429    | `too_many_attempts`    | `/auth/login` — 6th+ attempt from the same email+IP within a minute |
 | 500    | `server_error`         | Unhandled exception (message hidden unless `APP_DEBUG=true`)    |
 
@@ -973,9 +977,10 @@ governs orders.
 
 ### Registers
 
-A `registers` table exists from day one, with **one default register
-seeded per merchant** — a single-till shop never notices it exists. "The
-default" is the merchant's oldest active register
+A `registers` table exists from day one, with **every merchant
+guaranteed a default register the moment it's created** (see § Merchant
+profile & team members) — a single-till shop never notices it exists.
+"The default" is the merchant's oldest active register
 (`App\Domains\CashSessions\Support\DefaultRegister`), not a stored flag:
 that needs no uniqueness rule and no transfer-of-default logic when a
 register is retired. There is no register CRUD beyond listing this phase —
@@ -1214,6 +1219,132 @@ product still reports under the name it sold as at the time; a deleted
 product (`product_id` set `NULL`) still reports in full, because this
 report never joins back to `products` for anything. Voided orders'
 lines are excluded entirely — a canceled sale sold nothing.
+
+## Merchant profile & team members
+
+Two things a shop needs before it can operate: an identity to print on a
+receipt, and more than one person who can work it. Before this phase,
+nothing carried a merchant's own details, and a merchant had exactly one
+user — which made P4's "a remittance must be confirmed by someone other
+than its creator" rule impossible to satisfy in practice.
+
+| Method   | Route                              | Notes |
+| -------- | ------------------------------------ | ----- |
+| `GET`    | `/api/v1/merchant/profile`           | The caller's own merchant, flat, every profile field |
+| `PATCH`  | `/api/v1/merchant/profile`           | Update profile fields only — see below |
+| `GET`    | `/api/v1/merchant/team`               | List members: id, name, email, `role_in_merchant`, `is_owner`, `created_at` |
+| `POST`   | `/api/v1/merchant/team`               | Add a member: `{ name, email, role_in_merchant }` |
+| `PATCH`  | `/api/v1/merchant/team/{user}`        | Change `role_in_merchant` only |
+| `DELETE` | `/api/v1/merchant/team/{user}`        | Detach from the merchant (never deletes the user row) |
+| `POST`   | `/api/v1/auth/accept-invite`          | Public. `{ token, password }` → sets the password, returns a token like login |
+
+### Profile
+
+`merchants` gained nullable profile columns: `legal_name`,
+`address_line1`, `address_line2`, `city`, `postal_code`, `phone`,
+`contact_email`, `tax_identifier`, `receipt_header` (short text printed
+above a receipt), `receipt_footer` (e.g. "Thank you!"), and `timezone`
+(see the rule below). The existing `name` stays the display name. There
+is no `{merchant}` route parameter anywhere in this vertical — "which
+merchant" always comes from the caller's own `$user->merchant()`, so a
+request can never even name another merchant's profile.
+
+**`status`, `owner_user_id`, `id`, `name`, and `timezone` are not
+editable through `PATCH /merchant/profile`.** The FormRequest defines
+validation rules for none of them, so they never reach `validated()`,
+and the Action only ever writes what `validated()` contains — sending
+them in the request body is silently ignored, never applied, even though
+all five are `$fillable` on `Merchant` for other write paths.
+
+**TIMEZONE COLUMN RULE:** `timezone` is a column only. It is **not**
+wired into `App\Domains\Orders\Support\MerchantDay` this phase —
+`MerchantDay` still resolves the single `day_timezone` from
+`config/merchant.php` for every merchant, unconditionally. Reading this
+column at some call sites and not others would silently split day
+boundaries between endpoints depending on rollout order — exactly the
+UTC-vs-local bug class a previous phase fixed. A dedicated later phase
+migrates `MerchantDay` to read this column in one atomic change, backfilling
+existing merchants first, never gradually.
+
+### Team members
+
+`merchant_user`'s `role_in_merchant` is now a backed enum
+(`App\Domains\Merchant\Enums\RoleInMerchant`: `owner` | `manager` |
+`cashier`), mirrored by a Postgres CHECK constraint the same way
+`MerchantStatus` mirrors `merchants.status`.
+
+**`role_in_merchant` is recorded and returned, but is NOT yet an
+authorization boundary.** Every merchant-portal user can call every
+`merchant.api` route regardless of their role — a `cashier` and an
+`owner` have identical access this phase. Per-role permission gating is
+a later phase; don't assume otherwise from the field's presence.
+
+`POST /merchant/team` creates a `User` (with the `merchant` spatie role)
+if none exists for that email, attaches the `merchant_user` pivot, and
+always issues an invite (see below) so the new member sets their own
+password:
+
+- An email already attached to **this** merchant → `422
+  member_already_exists`.
+- An email belonging to a user **not already on this merchant** —
+  whether they belong to no merchant yet or to a different one — → `422
+  email_unavailable`. Deliberately generic and deliberately identical in
+  shape to `member_already_exists`: it never reveals that the email is
+  registered at all, let alone to which merchant, which would otherwise
+  let a caller enumerate registered emails by probing this endpoint. No
+  pivot is ever created on this path.
+
+`{user}` on `PATCH`/`DELETE /merchant/team/{user}` route-model-binds
+directly to `App\Domains\Auth\Models\User` — unlike every other
+merchant-owned resource in this file, `User` has no `merchant_id` column
+of its own to scope through `BelongsToMerchant`, so `TeamController`
+checks membership in the caller's own merchant explicitly. A foreign
+user id is a `404 not_found` on both routes, **never** a 403 — a 403
+would confirm the row exists for some other merchant, the same leak
+every other tenant-owned resource in this API is built to avoid.
+
+**The owner can never be removed** — `DELETE` on the owner's own id is
+`422 cannot_remove_owner`. Their `role_in_merchant` can still be changed
+freely; only detachment is blocked. `DELETE` otherwise only detaches the
+`merchant_user` pivot row — the `User` account itself is never deleted,
+and immediately loses merchant-portal access the moment the pivot is
+gone (`User::merchant()` no longer resolves it).
+
+### Invitations
+
+An invite is a random 40-character token, hashed with SHA-256 before
+storage (`team_invitations.token_hash`) — the plaintext is never
+persisted anywhere, only returned once at creation and (local/development
+only) logged. It expires after **72 hours** and is single-use
+(`used_at`).
+
+`POST /auth/accept-invite` is public and unauthenticated, rate-limited
+the same as login (`throttle:login` — note the shared limiter keys on
+`email+IP`; an accept-invite request has no `email` field, so it degrades
+to keying on IP alone, which still rate-limits effectively per IP). A
+missing, already-used, or expired token are **all** reported identically
+as `422 invalid_invite` — distinguishing them would let a caller probe
+which tokens exist and whether they've been redeemed. On success it sets
+the real password, marks the token used, and returns `{ token, user }`
+exactly like `POST /auth/login` does.
+
+**No real email is sent this phase.** In `local`/`development`
+environments only, `POST /merchant/team`'s response includes an
+`invite: { token, expires_at, url }` block and the invite is logged
+(`Log::info('Team invite created', ...)`); in every other environment
+that block is omitted entirely. Real delivery (email, SMS) is a later
+phase.
+
+### Default register on merchant creation
+
+Every merchant now gets a default (`"Front Counter"`) register the
+moment it's created — `App\Domains\Merchant\Actions\
+EnsureDefaultRegisterAction`, invoked from `Merchant::booted()`'s
+`created` event, so this holds regardless of how the merchant was made
+(factory, seeder, a future admin-provisioning endpoint). This **narrows**
+when `DefaultRegister`'s `NoRegisterConfigured` fallback (see §
+Registers) can be hit — it does not replace it; a merchant created before
+this phase shipped still falls through to that graceful behavior.
 
 ## Local setup
 
