@@ -11,10 +11,10 @@ namespace App\Domains\Merchant\Enums;
  * shops, stalls, bakeries, canteens — and "cashier" is coffee-shop-till
  * vocabulary that has no business being a platform-level role name.
  *
- * This is recorded and returned by the team endpoints, NOT enforced as an
- * authorization boundary — every merchant-portal user can call every
- * merchant.api route regardless of their role_in_merchant. Per-role
- * permission gating is a later phase; see README § Team members.
+ * THIS IS an authorization boundary (P8) — each case maps, via
+ * RolePresets, to a fixed set of App\Domains\Merchant\Enums\
+ * MerchantPermission cases, enforced in every merchant Policy (see
+ * README § Permissions for the full catalog/preset tables).
  */
 enum RoleInMerchant: string
 {
