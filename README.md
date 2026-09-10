@@ -164,6 +164,8 @@ header — never a redirect.
 | 422    | `member_already_exists` | `POST /merchant/team` — the email is already attached to this merchant |
 | 422    | `email_unavailable`    | `POST /merchant/team` — the email belongs to a user not already on this merchant (never reveals which merchant) |
 | 422    | `cannot_remove_owner`  | `DELETE /merchant/team/{user}` — the target is the merchant's owner |
+| 422    | `cannot_demote_owner`  | `PATCH /merchant/team/{user}` — the target is the merchant's owner, and the new `role_in_merchant` isn't `owner` |
+| 403    | `permission_denied`    | The caller's `role_in_merchant` preset doesn't carry the permission a merchant Policy requires — `errors.permission` names it (see § Permissions) |
 | 422    | `invalid_invite`       | `/auth/accept-invite` — token missing, already used, or expired (never distinguished) |
 | 429    | `too_many_attempts`    | `/auth/login` — 6th+ attempt from the same email+IP within a minute |
 | 500    | `server_error`         | Unhandled exception (message hidden unless `APP_DEBUG=true`)    |
@@ -218,7 +220,8 @@ regression from the `withoutWrapping()` call above.
   "name": "Merchant",
   "email": "merchant@gasa.test",
   "roles": ["merchant"],
-  "merchant": { "id": 1, "name": "Merchant One", "status": "active" }
+  "merchant": { "id": 1, "name": "Merchant One", "status": "active", "role_in_merchant": "owner" },
+  "permissions": ["orders.view", "orders.create", "..."]
 }
 ```
 
@@ -229,6 +232,14 @@ that applies. That's deliberate: a suspended merchant is blocked from every
 merchant route with 403 `merchant_inactive`, but `/auth/me` keeps working so
 the frontend can read `merchant.status` and render a suspended screen rather
 than bouncing the user back to login.
+
+`permissions` (P8) is **empty, not merely absent, for any account with no
+ACTIVE merchant** — a `pending`/`suspended` merchant's `permissions` is
+`[]` even though `merchant` itself is still shown, matching
+`User::merchant()`'s own active-only rule (see § Permissions). It is
+**additive**: new values may appear here in a later phase (custom roles)
+without warning, and the frontend should never treat an unrecognised
+value as an error.
 
 #### The order payload
 
@@ -1279,11 +1290,10 @@ vocabulary that has no business being a platform-level role name.
 /merchant/team`'s validation (a normal `422 validation_failed`, no
 special-casing) — it is not a valid `role_in_merchant` value anymore.
 
-**`role_in_merchant` is recorded and returned, but is NOT yet an
-authorization boundary.** Every merchant-portal user can call every
-`merchant.api` route regardless of their role — a `staff` member and an
-`owner` have identical access this phase. Per-role permission gating is
-a later phase; don't assume otherwise from the field's presence.
+**`role_in_merchant` IS an authorization boundary as of P8** — see
+§ Permissions below for the full permission catalog, the preset each
+role maps to, and how it's enforced. (Earlier phases shipped this field
+recorded-but-unenforced; that is no longer true.)
 
 `POST /merchant/team` creates a `User` (with the `merchant` spatie role)
 if none exists for that email, attaches the `merchant_user` pivot, and
@@ -1310,11 +1320,116 @@ would confirm the row exists for some other merchant, the same leak
 every other tenant-owned resource in this API is built to avoid.
 
 **The owner can never be removed** — `DELETE` on the owner's own id is
-`422 cannot_remove_owner`. Their `role_in_merchant` can still be changed
-freely; only detachment is blocked. `DELETE` otherwise only detaches the
+`422 cannot_remove_owner`. `DELETE` otherwise only detaches the
 `merchant_user` pivot row — the `User` account itself is never deleted,
 and immediately loses merchant-portal access the moment the pivot is
 gone (`User::merchant()` no longer resolves it).
+
+**The owner can never be changed to a different role, either (P8)** —
+`PATCH /merchant/team/{owner}` with any `role_in_merchant` other than
+`owner` is `422 cannot_demote_owner`. There is exactly one owner per
+merchant this phase (`Merchant::owner_user_id`), and the owner's preset
+is the only one that carries the full permission catalog — silently
+allowing this would leave the merchant's actual owner unable to do owner
+things while `owner_user_id` still pointed at them. Changing anyone
+else's role is unaffected.
+
+### Permissions
+
+A FIXED, code-defined permission catalog
+(`App\Domains\Merchant\Enums\MerchantPermission`, a backed enum) —
+nothing here is stored in the database. Three PRESETS
+(`App\Domains\Merchant\Support\RolePresets`) map each `role_in_merchant`
+to a set of catalog permissions; presets are the only source of
+permissions this phase. Enforcement lives in Policies (`Gate`/
+`->authorize()`), never inline in controllers or middleware — the
+tenant-ownership checks every Policy already had stay exactly as they
+were, with the permission check added alongside, checked SECOND (tenant
+ownership always wins first, so a cross-tenant request is still a 404
+regardless of the caller's role — see § Error shape's cross-tenant note
+and `TenantLeakageTest.php`).
+
+**The catalog:**
+
+| Permission | Label |
+| --- | --- |
+| `orders.view` | View orders |
+| `orders.create` | Check out (create orders) |
+| `orders.complete` | Complete orders |
+| `orders.void` | Void orders |
+| `queue.view` | View the kitchen queue |
+| `menu.view` | View the menu |
+| `drawer.view` | View cash sessions |
+| `drawer.open` | Open the drawer |
+| `drawer.close` | Close the drawer |
+| `drawer.movements` | Record cash movements |
+| `remittances.create` | Create remittances |
+| `remittances.confirm` | Confirm remittances |
+| `reports.view` | View reports |
+| `profile.view` | View the merchant profile |
+| `profile.edit` | Edit the merchant profile |
+| `team.view` | View team members |
+| `team.manage` | Manage team members (add, change role, remove) |
+
+**The presets** (`role_in_merchant` → permissions):
+
+| Preset | Permissions |
+| --- | --- |
+| `owner` | **All** 17 catalog permissions. |
+| `manager` | Every permission **except** `profile.edit` and `team.manage`. |
+| `staff` | `orders.view`, `orders.create`, `orders.complete`, `queue.view`, `menu.view`, `drawer.view`, `drawer.open`, `drawer.movements`, `remittances.create`. **Not** `orders.void`, `drawer.close`, `remittances.confirm` (all three are "someone signs off" actions), **not** `reports.view`, and **not** `profile.*`/`team.*`. |
+
+**Enforcement, endpoint by endpoint:**
+
+| Policy | Method | Permission |
+| --- | --- | --- |
+| `OrderPolicy` | `viewAny`, `view` | `orders.view` |
+| `OrderPolicy` | `create` | `orders.create` |
+| `OrderPolicy` | `complete` | `orders.complete` |
+| `OrderPolicy` | `void` | `orders.void` |
+| `OrderPolicy` | `viewKitchenQueue` | `queue.view` |
+| `OrderPolicy` | `viewReports` | `reports.view` |
+| — (`MenuController`, no Policy class) | `hasMerchantPermission()` directly | `menu.view` |
+| `CashSessionPolicy` | `viewAny`, `view` | `drawer.view` |
+| `CashSessionPolicy` | `create` | `drawer.open` |
+| `CashSessionPolicy` | `close` | `drawer.close` |
+| `CashMovementPolicy` | `create` | `drawer.movements` |
+| `CashRemittancePolicy` | `create` | `remittances.create` |
+| `CashRemittancePolicy` | `confirm` | `remittances.confirm` |
+| `MerchantPolicy` | `view` | `profile.view` |
+| `MerchantPolicy` | `update` | `profile.edit` |
+| `TeamMemberPolicy` | `viewAny` | `team.view` |
+| `TeamMemberPolicy` | `create`, `update`, `delete` | `team.manage` |
+
+`queue.view` and `reports.view` are their own permissions rather than
+reusing `orders.view`, even though every preset in this phase happens to
+pair them — a role that can see orders and a role that can see the
+kitchen screen or the day's numbers are independently assignable
+questions, and treating them as one would make a later custom-role phase
+unable to tell them apart.
+
+**Denial**: `403 permission_denied`, with the specific permission named
+in `errors.permission` (e.g. `{ "permission": ["orders.void"] }`) so the
+frontend can explain rather than guess. This is a DIFFERENT code from
+the generic `403 forbidden` a tenant-ownership failure still renders as,
+and different again from `403 merchant_inactive` (no active merchant at
+all) and the portal role middleware's `403 forbidden` (wrong PORTAL
+entirely, before any merchant-specific check runs) — all four are
+distinguishable by `code`.
+
+`GET /auth/me` additionally returns `permissions: string[]`, resolved
+from the caller's `role_in_merchant` the same way (see § The user
+payload below) — empty, never missing, when there is no active merchant.
+**Additive**: the frontend should tolerate new keys appearing in this
+list later without treating them as invalid — a later custom-role phase
+adds values here, it does not restructure the field.
+
+**Future**: custom per-merchant roles (a name + an arbitrary chosen
+subset of `MerchantPermission` cases, configurable per merchant instead
+of only the three fixed presets) are a LATER phase, layered on top of
+this catalog without changing it — see `MerchantPermission`'s and
+`RolePresets`' docblocks. Nothing in P8 adds an endpoint to edit
+permissions or define custom roles.
 
 ### Invitations
 
