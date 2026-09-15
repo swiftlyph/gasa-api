@@ -10,6 +10,10 @@ use App\Domains\CashSessions\Enums\CashMovementType;
 use App\Domains\CashSessions\Models\CashSession;
 use App\Domains\CashSessions\Models\Register;
 use App\Domains\Catalog\Models\Product;
+use App\Domains\Company\Enums\CompanyStatus;
+use App\Domains\Company\Enums\EmployeeStatus;
+use App\Domains\Company\Models\Company;
+use App\Domains\Company\Models\Employee;
 use App\Domains\Merchant\Enums\MerchantStatus;
 use App\Domains\Merchant\Models\Merchant;
 use App\Domains\Orders\Models\Order;
@@ -32,6 +36,11 @@ class DevSeeder extends Seeder
         $accounts = [
             ['email' => 'admin@gasa.test', 'name' => 'Platform Admin', 'role' => 'platform_admin'],
             ['email' => 'company@gasa.test', 'name' => 'Company Admin', 'role' => 'company_admin'],
+
+            // Second company: the company-portal twin of merchant2 below.
+            // With a single company seeded, a correctly scoped employee
+            // list and an unscoped one look identical.
+            ['email' => 'company2@gasa.test', 'name' => 'Company Two Admin', 'role' => 'company_admin'],
             ['email' => 'employee@gasa.test', 'name' => 'Employee', 'role' => 'employee'],
             ['email' => 'merchant@gasa.test', 'name' => 'Merchant', 'role' => 'merchant'],
 
@@ -75,6 +84,9 @@ class DevSeeder extends Seeder
             $users['staff@gasa.test']->id => ['role_in_merchant' => 'staff'],
         ]);
 
+        $companyOne = $this->seedCompany('Company One', $users['company@gasa.test']);
+        $companyTwo = $this->seedCompany('Company Two', $users['company2@gasa.test']);
+
         // Both active merchants get a catalog and order history. BOTH, not
         // just one: the kitchen and POS frontends demo against this data,
         // and with a single merchant seeded, "correctly scoped" and "not
@@ -85,7 +97,7 @@ class DevSeeder extends Seeder
         // nothing and every write would fail the merchant_id NOT NULL
         // constraint. This is the sanctioned non-request use of the
         // bypass — see TenantContext::runInAdminContext().
-        app(TenantContext::class)->runInAdminContext(function () use ($merchantOne, $merchantTwo, $users): void {
+        app(TenantContext::class)->runInAdminContext(function () use ($merchantOne, $merchantTwo, $companyOne, $companyTwo, $users): void {
             // Catalogs first: the demo orders below snapshot their lines
             // from real products, so the menu has to exist before them.
             $this->call(ProductSeeder::class);
@@ -111,6 +123,32 @@ class DevSeeder extends Seeder
             $this->seedClosedCashSession($registerOne, $users['merchant@gasa.test'], $users['staff@gasa.test']);
 
             $this->seedOpenCashSession($registerOne, $users['merchant@gasa.test']);
+
+            // Company rosters. Employees are BelongsToCompany, so they need
+            // the same admin context the merchant rows above do. Both
+            // companies get one, for the same two-tenants reason as the
+            // merchants: scoping is only visible with something to hide.
+            $this->seedEmployees($companyOne, [
+                ['employee_no' => 'EMP-0001', 'first_name' => 'Maria', 'last_name' => 'Santos', 'email' => 'maria.santos@companyone.test',
+                    'department' => 'Finance', 'job_title' => 'Accountant', 'hired_at' => '2024-03-01', 'user' => $users['employee@gasa.test']],
+                ['employee_no' => 'EMP-0002', 'first_name' => 'Jose', 'last_name' => 'Reyes', 'email' => 'jose.reyes@companyone.test',
+                    'department' => 'Operations', 'job_title' => 'Supervisor', 'hired_at' => '2023-07-15'],
+                ['employee_no' => 'EMP-0003', 'first_name' => 'Ana', 'last_name' => 'Cruz', 'email' => 'ana.cruz@companyone.test',
+                    'department' => 'Engineering', 'job_title' => 'Software Engineer', 'hired_at' => '2025-01-06'],
+                ['employee_no' => 'EMP-0004', 'first_name' => 'Paolo', 'last_name' => 'Garcia', 'email' => 'paolo.garcia@companyone.test',
+                    'department' => 'Sales', 'job_title' => 'Account Executive', 'hired_at' => '2022-11-02'],
+                ['employee_no' => 'EMP-0005', 'first_name' => 'Liza', 'last_name' => 'Mendoza', 'email' => 'liza.mendoza@companyone.test',
+                    'department' => 'Human Resources', 'job_title' => 'HR Specialist', 'hired_at' => '2024-09-09'],
+            ]);
+
+            $this->seedEmployees($companyTwo, [
+                ['employee_no' => 'C2-001', 'first_name' => 'Ramon', 'last_name' => 'Villanueva', 'email' => 'ramon.villanueva@companytwo.test',
+                    'department' => 'Operations', 'job_title' => 'Plant Manager', 'hired_at' => '2021-04-19'],
+                ['employee_no' => 'C2-002', 'first_name' => 'Carla', 'last_name' => 'Bautista', 'email' => 'carla.bautista@companytwo.test',
+                    'department' => 'Finance', 'job_title' => 'Payroll Officer', 'hired_at' => '2023-02-01'],
+                ['employee_no' => 'C2-003', 'first_name' => 'Noel', 'last_name' => 'Aquino', 'email' => 'noel.aquino@companytwo.test',
+                    'department' => 'Logistics', 'job_title' => 'Dispatcher', 'hired_at' => '2025-05-12'],
+            ]);
         });
     }
 
@@ -131,6 +169,59 @@ class DevSeeder extends Seeder
         ]);
 
         return $merchant;
+    }
+
+    /**
+     * Idempotent: keyed on owner_user_id like seedMerchant(). The owner
+     * also carries the company_id, since membership is that column
+     * rather than a pivot.
+     */
+    private function seedCompany(string $name, User $owner): Company
+    {
+        $company = Company::updateOrCreate(
+            ['owner_user_id' => $owner->id],
+            ['name' => $name, 'status' => CompanyStatus::Active],
+        );
+
+        if ($owner->company_id !== $company->getKey()) {
+            $owner->company_id = $company->getKey();
+            $owner->save();
+        }
+
+        return $company;
+    }
+
+    /**
+     * Idempotent: keyed on company + email, the same pair the partial
+     * unique index enforces, so re-seeding updates rather than
+     * duplicates. Runs inside run()'s admin context because
+     * BelongsToCompany would otherwise stamp a null tenant.
+     *
+     * @param  list<array<string, mixed>>  $rows
+     */
+    private function seedEmployees(Company $company, array $rows): void
+    {
+        foreach ($rows as $row) {
+            $user = $row['user'] ?? null;
+            unset($row['user']);
+
+            $employee = Employee::updateOrCreate(
+                ['company_id' => $company->getKey(), 'email' => $row['email']],
+                [...$row, 'status' => EmployeeStatus::Active],
+            );
+
+            // The one seeded employee WITH a portal account: links the
+            // `employee` dev user to Company One so has_account has a
+            // true example. user_id is never mass-assigned (not
+            // $fillable), hence the explicit assignment.
+            if ($user instanceof User && $employee->user_id !== $user->getKey()) {
+                $employee->user_id = $user->getKey();
+                $employee->save();
+
+                $user->company_id = $company->getKey();
+                $user->save();
+            }
+        }
     }
 
     /**
