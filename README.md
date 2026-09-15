@@ -36,7 +36,7 @@ The per-audience middleware groups are filled:
 | Group          | Middleware                          |
 | -------------- | ------------------------------------ |
 | `admin.api`    | `auth:sanctum`, `role:platform_admin`, `AllowsAdminContext` |
-| `company.api`  | `auth:sanctum`, `role:company_admin`  |
+| `company.api`  | `auth:sanctum`, `role:company_admin`, `EnsureCompanyActive` |
 | `employee.api` | `auth:sanctum`, `role:employee`       |
 | `merchant.api` | `auth:sanctum`, `role:merchant`, `EnsureMerchantActive` |
 | `public.api`   | *(none)*                              |
@@ -46,9 +46,10 @@ Order matters in the two tenant-aware groups. `AllowsAdminContext` runs
 request that already proved it's an admin. `EnsureMerchantActive` runs
 **after** `role:merchant`, so a non-merchant gets a plain `forbidden`
 rather than `merchant_inactive` — the latter would confirm the route exists
-for merchants and invite probing.
+for merchants and invite probing. `EnsureCompanyActive` sits after
+`role:company_admin` in `company.api` for the same reason.
 
-Both `role:` and `EnsureMerchantActive` are also registered in the
+`role:`, `EnsureMerchantActive` and `EnsureCompanyActive` are all registered in the
 **middleware priority list** (`bootstrap/app.php`) ahead of
 `SubstituteBindings`, so they run before route-model binding. Without that,
 Laravel resolves `{order}` first, and a suspended merchant hitting
@@ -64,8 +65,9 @@ registered once under `auth:sanctum` — never duplicated per audience file.
 
 Each portal file also currently has a `GET /whoami` route returning
 `{ "portal": "<name>" }` — a temporary placeholder proving its middleware
-stack actually enforces the right role. It gets replaced by real endpoints
-later; until then it's harmless and safe to leave in place.
+stack actually enforces the right role. Real endpoints land alongside it
+phase by phase (the merchant and company files already have them); it is
+harmless and stays in place.
 
 ### Domains folder rules
 
@@ -148,6 +150,7 @@ header — never a redirect.
 | 403    | `portal_forbidden`     | `/auth/login` — valid credentials, but wrong `portal` for role  |
 | 403    | `forbidden`            | Authenticated, but role/policy check failed (e.g. wrong portal's `/whoami`) |
 | 403    | `merchant_inactive`    | Merchant portal, but the user has no merchant or theirs isn't `active` |
+| 403    | `company_inactive`     | Company portal, but the user has no company or theirs isn't `active` (see § Company & employees) |
 | 404    | `not_found`            | Route or model not found                                        |
 | 422    | `validation_failed`    | FormRequest validation failure                                  |
 | 422    | `invalid_transition`   | Order status change the transition map forbids (e.g. completing a voided order), OR a merchant status change `PATCH /admin/merchants/{merchant}/status` forbids (e.g. `pending` → `pending`) — one shared code across both, see § Platform admin |
@@ -166,6 +169,8 @@ header — never a redirect.
 | 422    | `email_unavailable`    | `POST /merchant/team` — the email belongs to a user not already on this merchant (never reveals which merchant); also `POST /admin/merchants` — the owner email already belongs to any user |
 | 422    | `cannot_remove_owner`  | `DELETE /merchant/team/{user}` — the target is the merchant's owner |
 | 422    | `cannot_demote_owner`  | `PATCH /merchant/team/{user}` — the target is the merchant's owner, and the new `role_in_merchant` isn't `owner` |
+| 422    | `employee_email_taken` | `POST`/`PATCH /company/employees`: the email is already on another employee of this company; `errors.email` names it (see § Company & employees) |
+| 422    | `employee_number_taken` | Same, for `employee_no`; `errors.employee_no` names it |
 | 403    | `permission_denied`    | The caller's `role_in_merchant` preset doesn't carry the permission a merchant Policy requires — `errors.permission` names it (see § Permissions) |
 | 422    | `invalid_invite`       | `/auth/accept-invite` — token missing, already used, or expired (never distinguished) |
 | 429    | `too_many_attempts`    | `/auth/login` — 6th+ attempt from the same email+IP within a minute |
@@ -222,6 +227,7 @@ regression from the `withoutWrapping()` call above.
   "email": "merchant@gasa.test",
   "roles": ["merchant"],
   "merchant": { "id": 1, "name": "Merchant One", "status": "active", "role_in_merchant": "owner" },
+  "company": null,
   "permissions": ["orders.view", "orders.create", "..."]
 }
 ```
@@ -233,6 +239,10 @@ that applies. That's deliberate: a suspended merchant is blocked from every
 merchant route with 403 `merchant_inactive`, but `/auth/me` keeps working so
 the frontend can read `merchant.status` and render a suspended screen rather
 than bouncing the user back to login.
+
+`company` is the same idea for the other tenant type: `{ id, name, status }`,
+present regardless of status, `null` for any user with no company (platform
+admins, merchants). A user has one or the other. See § Company & employees.
 
 `permissions` (P8) is **empty, not merely absent, for any account with no
 ACTIVE merchant** — a `pending`/`suspended` merchant's `permissions` is
@@ -443,6 +453,7 @@ per role, idempotent (`updateOrCreate` by email, safe to re-run):
 | ----------------------- | ---------- | ---------------- |
 | `admin@gasa.test`       | `password` | `platform_admin` |
 | `company@gasa.test`     | `password` | `company_admin`  |
+| `company2@gasa.test`    | `password` | `company_admin`  |
 | `employee@gasa.test`    | `password` | `employee`       |
 | `merchant@gasa.test`    | `password` | `merchant`       |
 | `merchant2@gasa.test`   | `password` | `merchant`       |
@@ -474,7 +485,10 @@ draws a fresh number from the merchant's counter.
 
 ## Tenancy
 
-Merchant is the first tenant type. Tenant identity **always** derives from
+Merchant was the first tenant type and Company is the second (see § Company &
+employees). `BelongsToCompany` mirrors `BelongsToMerchant` exactly, with
+`company_id` and `User::activeCompany()` in place of `merchant_id` and
+`User::merchant()`; everything below applies to both. Tenant identity **always** derives from
 the authenticated user — nothing in the tenancy path reads request input,
 so a `merchant_id` in a payload is never authoritative.
 
@@ -515,7 +529,8 @@ asserts isolation through the actual HTTP endpoints, which is the surface
 an attacker really has.
 
 Tenant-owned tables so far: `merchants` (the tenant itself), `products`,
-`orders`. `order_items` and `order_item_add_ons` deliberately have **no**
+`orders`; and on the company side `companies` (the tenant itself) and
+`employees`. `order_items` and `order_item_add_ons` deliberately have **no**
 `merchant_id` — they inherit tenancy structurally, since they are only ever
 reachable through a scoped order. A second owner column on those tables
 would be a second source of truth that could disagree with the first.
@@ -2035,6 +2050,130 @@ A `platform_admin` token gets a plain `403 forbidden` from
 itself a bypass — see § Tenancy), and a `merchant` token gets the same
 `403 forbidden` from `role:platform_admin` on every route in this
 section, including `/admin/audit-logs`.
+
+## Company & employees
+
+The company portal's first vertical, and the second tenant type. Built as
+the Merchant domain's twin so the two read alike: `BelongsToCompany`
+mirrors `BelongsToMerchant`, `EnsureCompanyActive` mirrors
+`EnsureMerchantActive`, and the employee endpoints follow the team
+endpoints' shape. Every route below sits behind the `company.api` group
+(`auth:sanctum` + `role:company_admin` + `EnsureCompanyActive`).
+
+| Method   | Route                                  | Notes |
+| -------- | -------------------------------------- | ----- |
+| `GET`    | `/api/v1/company/profile`              | The caller's own company, flat, every profile field |
+| `GET`    | `/api/v1/company/employees`            | Paginated; filterable by `status` and `search`; `per_page` capped at 100 |
+| `POST`   | `/api/v1/company/employees`            | Add an employee: `{ first_name, last_name, email, employee_no?, mobile?, department?, job_title?, hired_at? }` |
+| `GET`    | `/api/v1/company/employees/{employee}` | One employee, flat |
+| `PATCH`  | `/api/v1/company/employees/{employee}` | Partial update: the same fields plus `status` (`active` \| `inactive`) |
+| `DELETE` | `/api/v1/company/employees/{employee}` | Soft-deletes the record; `200 { message, code: "employee_removed" }` |
+
+### Companies
+
+`companies` is shaped like `merchants`: `name`, `status` (`pending` |
+`active` | `suspended`, CHECK-constrained, typed by
+`App\Domains\Company\Enums\CompanyStatus`), `owner_user_id` (the first
+company admin), and nullable profile columns (`legal_name`, address,
+`phone`, `contact_email`, `tax_identifier`).
+
+Membership is **`users.company_id`**, not a pivot. The column has been on
+`users` since the first migration waiting for this phase, and a company
+admin or an employee belongs to exactly one company. `User::company()` is
+the plain relation (any status, for `/auth/me`); `User::activeCompany()`
+is the tenancy resolver (active only, memoized), the twin of
+`User::merchant()`.
+
+There is no company provisioning endpoint yet: companies come from the
+seeders (`DevSeeder`, `StagingCompanySeeder`). The platform-admin
+provisioning phase adds `POST /admin/companies` and the status transition
+map, mirroring § Platform admin.
+
+Only an `active` company may use the portal. A pending or suspended
+company's admin gets `403 company_inactive` on every `/company/*` route,
+while `/auth/me` keeps working and carries the status:
+
+```json
+{ "company": { "id": 1, "name": "Company One", "status": "active" } }
+```
+
+`company` is `null` for any user with no company (platform admins,
+merchants). It sits alongside `merchant`; a user has one or the other.
+
+### Employees
+
+An employee is an **HR record, not a login.** `employees` carries
+`employee_no`, `first_name`, `last_name`, `email`, `mobile`,
+`department`, `job_title`, `hired_at`, `status` (`active` | `inactive`,
+`App\Domains\Company\Enums\EmployeeStatus`) and a nullable `user_id`
+that stays null until a later phase invites the employee into the
+employee portal, the same order the merchant vertical shipped in
+(profile first, team after). `has_account` in the payload is that
+`user_id`, surfaced early so the frontend can branch on it before the
+invite phase lands.
+
+`employees` is tenant-owned (`BelongsToCompany`, non-nullable
+`company_id`): `{employee}` resolves through the global scope, so
+another company's id is a `404`, never a `403`.
+
+`email` and `employee_no` are unique **per company** and only among
+non-deleted rows (partial unique indexes on Postgres), so the same
+person can be on two rosters and a rehire can reuse both values. A
+collision inside the caller's own company is `422 employee_email_taken`
+or `422 employee_number_taken`, with the field named in `errors`. Unlike
+`email_unavailable` there is nothing to hide here: the roster is the
+caller's own. Email is lowercased on write. Both checks live in the
+Actions, not the FormRequests (see `AddTeamMemberRequest` for the rule).
+
+Employees are **soft-deleted**, never hard-deleted: a future wallet
+ledger references them. `DELETE` returns `200 { message, code }` like
+every other confirmation in this API, never a bare 204.
+
+The list is ordered by `last_name`, `first_name`, `id` and paginated
+(`{ data, links, meta }`, default 25 per page). `search` matches first
+name, last name, email or employee number, case-insensitively.
+
+#### The employee payload
+
+```json
+{
+  "id": 1,
+  "employee_no": "EMP-0001",
+  "first_name": "Maria",
+  "last_name": "Santos",
+  "full_name": "Maria Santos",
+  "email": "maria.santos@companyone.test",
+  "mobile": "+63 917 000 0001",
+  "department": "Finance",
+  "job_title": "Accountant",
+  "hired_at": "2024-03-01",
+  "status": "active",
+  "has_account": false,
+  "created_at": "2026-09-16T00:00:00.000000Z",
+  "updated_at": "2026-09-16T00:00:00.000000Z"
+}
+```
+
+### Seeding
+
+`DevSeeder` gives `company@gasa.test` **Company One** and the new
+`company2@gasa.test` **Company Two**, both `active`, each with a small
+roster. Two companies for the same reason there are two merchants: with
+one, correct scoping and no scoping look identical. `employee@gasa.test`
+is linked to Company One as an employee row with `user_id` set, so
+`has_account: true` has one real example.
+
+`StagingCompanySeeder` is the manual staging fixture (never wired into
+`DatabaseSeeder`): idempotent, keyed on email, safe to re-run. The admin
+password is read from a real process environment variable, so it works
+with a cached config:
+
+```bash
+STAGING_SEED_PASSWORD='<choose one>' php artisan db:seed --class=StagingCompanySeeder --force
+```
+
+Account: `company.staging@gasa.test`, role `company_admin`, company
+"Staging Company" (`active`), five employees.
 
 ## Local setup
 

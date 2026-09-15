@@ -2,6 +2,7 @@
 
 namespace App\Domains\Auth\Models;
 
+use App\Domains\Company\Models\Company;
 use App\Domains\Merchant\Enums\MerchantPermission;
 use App\Domains\Merchant\Enums\MerchantStatus;
 use App\Domains\Merchant\Enums\RoleInMerchant;
@@ -9,6 +10,7 @@ use App\Domains\Merchant\Models\Merchant;
 use App\Domains\Merchant\Support\RolePresets;
 use Database\Factories\UserFactory;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\Pivot;
 use Illuminate\Database\Eloquent\SoftDeletes;
@@ -17,6 +19,9 @@ use Illuminate\Notifications\Notifiable;
 use Laravel\Sanctum\HasApiTokens;
 use Spatie\Permission\Traits\HasRoles;
 
+/**
+ * @property int|null $company_id
+ */
 class User extends Authenticatable
 {
     /** @use HasFactory<UserFactory> */
@@ -173,9 +178,49 @@ class User extends Authenticatable
         return in_array($permission->value, $this->merchantPermissions(), true);
     }
 
+    /**
+     * Company membership is the users.company_id column, not a pivot
+     * (see the add_company_foreign_key_to_users_table migration). This
+     * is the plain relation: it resolves the company REGARDLESS of
+     * status, which is what UserResource needs so a suspended company's
+     * admin can still read the status from /auth/me. Tenancy and access
+     * checks never use it; they use activeCompany().
+     *
+     * @return BelongsTo<Company, $this>
+     */
+    public function company(): BelongsTo
+    {
+        return $this->belongsTo(Company::class);
+    }
+
+    /**
+     * The user's company if, and only if, it is ACTIVE: the company twin
+     * of merchant(). Null for pending/suspended companies and for users
+     * with no company at all, which is what makes BelongsToCompany match
+     * nothing and EnsureCompanyActive return 403 for those accounts.
+     *
+     * Memoized for the same reason merchant() is: BelongsToCompany calls
+     * this on every scoped query. Null is cached too, via the flag.
+     */
+    public function activeCompany(): ?Company
+    {
+        if (! $this->companyResolved) {
+            $company = $this->company;
+
+            $this->resolvedCompany = $company !== null && $company->isActive() ? $company : null;
+            $this->companyResolved = true;
+        }
+
+        return $this->resolvedCompany;
+    }
+
     private ?Merchant $resolvedMerchant = null;
 
     private bool $merchantResolved = false;
+
+    private ?Company $resolvedCompany = null;
+
+    private bool $companyResolved = false;
 
     /**
      * @var array<int, string>|null
