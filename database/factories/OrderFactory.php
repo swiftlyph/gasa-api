@@ -29,7 +29,11 @@ use Illuminate\Support\Facades\DB;
  *
  * Every money field it produces is internally consistent: total equals
  * subtotal minus discount, a split's cash and gcash sum to the total, and
- * withItems() recomputes all of them from the lines it created.
+ * withItems() recomputes all of them from the lines it created. P10 adds
+ * the tax columns to that guarantee — discount_cents always equals
+ * statutory + promo (a CHECK constraint, not a convention), and a
+ * default fixture is a non-VAT sale whose nonvat_sales_cents tracks its
+ * subtotal.
  *
  * @extends Factory<Order>
  */
@@ -61,6 +65,31 @@ class OrderFactory extends Factory
 
             'subtotal_cents' => fake()->numberBetween(85, 1500) * 100,
             'discount_cents' => 0,
+
+            // P10: `discount_cents` is constrained to equal statutory +
+            // promo (orders_discount_split_check), so a factory that set
+            // only the former would write a row the database rejects.
+            // Any discount a test asks for with ['discount_cents' => n]
+            // is a MANUAL one — that is what the field meant before P10
+            // and what every existing caller means by it — so it mirrors
+            // into promo, exactly as the migration backfills pre-P10
+            // rows. A test that wants a statutory discount says so
+            // explicitly (or, better, goes through the real checkout).
+            'promo_discount_cents' => fn (array $attributes) => $attributes['discount_cents'],
+            'statutory_discount_cents' => 0,
+
+            // Non-VAT by default, matching merchants.vat_registered's own
+            // default: the whole subtotal is non-VAT sales, no VAT was
+            // ever extracted. Mirrors what CheckoutAction snapshots for a
+            // non-VAT merchant, so factory-built and checkout-built
+            // orders agree.
+            'vat_registered_snapshot' => false,
+            'vat_rate_bps_snapshot' => 0,
+            'vatable_sales_cents' => 0,
+            'vat_cents' => 0,
+            'vat_exempt_sales_cents' => 0,
+            'nonvat_sales_cents' => fn (array $attributes) => $attributes['subtotal_cents'],
+
             'total_cents' => fn (array $attributes) => $attributes['subtotal_cents'] - $attributes['discount_cents'],
             'currency' => 'PHP',
 
@@ -200,6 +229,15 @@ class OrderFactory extends Factory
 
             $order->subtotal_cents = $subtotal;
             $order->total_cents = $subtotal - $order->discount_cents;
+
+            // Kept in step with the recomputed subtotal for a non-VAT
+            // fixture, where the two are the same figure by definition. A
+            // VAT-registered fixture is not built this way (its buckets
+            // depend on which lines belong to a beneficiary), so this
+            // deliberately only touches the non-VAT case.
+            if (! $order->vat_registered_snapshot) {
+                $order->nonvat_sales_cents = $subtotal;
+            }
 
             if ($order->payment_method->isSplit()) {
                 $order->cash_cents = intdiv($order->total_cents, 2);

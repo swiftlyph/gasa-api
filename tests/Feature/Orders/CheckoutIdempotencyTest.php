@@ -353,6 +353,129 @@ test('the split amounts are part of the fingerprint', function () {
 
 /*
 |--------------------------------------------------------------------------
+| Beneficiaries are part of the request (P10)
+|--------------------------------------------------------------------------
+|
+| "Same basket" has to include WHO is being charged what: adding a senior
+| changes the total, so it must change the fingerprint. But the people
+| themselves are hashed BY VALUE, not by their position in the list — a
+| tablet that rebuilds its JSON may legitimately list the same two
+| beneficiaries in the other order, and that retry must still replay.
+*/
+
+test('the same basket with the same beneficiaries replays', function () {
+    $key = 'f1a4d7b0-2c58-4e93-8f1a-4d7b0c2e5f91';
+
+    $payload = [
+        'payment_method' => 'cash',
+        'beneficiaries' => [['type' => 'senior', 'name' => 'Lola Remedios', 'id_number' => 'SC-2020-0001']],
+        'items' => [['product_id' => $this->latte->id, 'quantity' => 1, 'beneficiary' => 0]],
+    ];
+
+    $first = ($this->checkout)($payload, $key)->assertCreated();
+    $second = ($this->checkout)($payload, $key)->assertOk();
+
+    expect($second->json('id'))->toBe($first->json('id'))
+        ->and(Order::query()->count())->toBe(1)
+        ->and(DB::table('order_beneficiaries')->count())->toBe(1);
+});
+
+test('adding a beneficiary to the same key is a 409 idempotency_key_reuse', function () {
+    $key = 'a2b5e8c1-3d69-4f04-9a2b-5e8c1d3f7a60';
+
+    // The same drink, now claimed by a senior — a different amount of
+    // money, so a different request.
+    ($this->checkout)(($this->basket)(), $key)->assertCreated();
+
+    ($this->checkout)([
+        'payment_method' => 'cash',
+        'beneficiaries' => [['type' => 'senior', 'name' => 'Lola Remedios', 'id_number' => 'SC-2020-0001']],
+        'items' => [['product_id' => $this->latte->id, 'quantity' => 1, 'beneficiary' => 0]],
+    ], $key)->assertStatus(409)
+        ->assertJsonPath('code', 'idempotency_key_reuse');
+
+    expect(Order::query()->count())->toBe(1)
+        // The rejected attempt wrote nothing.
+        ->and(DB::table('order_beneficiaries')->count())->toBe(0);
+});
+
+test('a different beneficiary with the same basket is a 409', function () {
+    $key = 'b3c6f9d2-4e70-4a15-8b3c-6f9d2e4a8b71';
+
+    $payload = fn (string $name, string $id) => [
+        'payment_method' => 'cash',
+        'beneficiaries' => [['type' => 'senior', 'name' => $name, 'id_number' => $id]],
+        'items' => [['product_id' => $this->latte->id, 'quantity' => 1, 'beneficiary' => 0]],
+    ];
+
+    ($this->checkout)($payload('Lola Remedios', 'SC-2020-0001'), $key)->assertCreated();
+
+    // Same money, different person — and the person is the record.
+    ($this->checkout)($payload('Lolo Ernesto', 'SC-2020-0002'), $key)
+        ->assertStatus(409)
+        ->assertJsonPath('code', 'idempotency_key_reuse');
+});
+
+test('reordering two beneficiaries is still the same request', function () {
+    $key = 'c4d7a0e3-5f81-4b26-9c4d-7a0e3f5b9c82';
+
+    $senior = ['type' => 'senior', 'name' => 'Lola Remedios', 'id_number' => 'SC-2020-0001'];
+    $pwd = ['type' => 'pwd', 'name' => 'Juan Cruz', 'id_number' => 'PWD-1234-5678'];
+
+    $orderId = ($this->checkout)([
+        'payment_method' => 'cash',
+        'beneficiaries' => [$senior, $pwd],
+        'items' => [
+            ['product_id' => $this->latte->id, 'quantity' => 1, 'beneficiary' => 0],
+            ['product_id' => $this->brew->id, 'quantity' => 1, 'beneficiary' => 1],
+        ],
+    ], $key)->assertCreated()->json('id');
+
+    // The same two people and the same two drinks, declared the other way
+    // round — every index renumbered, nothing about the sale changed.
+    ($this->checkout)([
+        'payment_method' => 'cash',
+        'beneficiaries' => [$pwd, $senior],
+        'items' => [
+            ['product_id' => $this->latte->id, 'quantity' => 1, 'beneficiary' => 1],
+            ['product_id' => $this->brew->id, 'quantity' => 1, 'beneficiary' => 0],
+        ],
+    ], $key)->assertOk()
+        ->assertJsonPath('id', $orderId);
+
+    expect(Order::query()->count())->toBe(1);
+});
+
+test('moving a line to the other beneficiary is a different request', function () {
+    $key = 'd5e8b1f4-6a92-4c37-8d5e-8b1f4a6c9d93';
+
+    $senior = ['type' => 'senior', 'name' => 'Lola Remedios', 'id_number' => 'SC-2020-0001'];
+    $pwd = ['type' => 'pwd', 'name' => 'Juan Cruz', 'id_number' => 'PWD-1234-5678'];
+
+    ($this->checkout)([
+        'payment_method' => 'cash',
+        'beneficiaries' => [$senior, $pwd],
+        'items' => [
+            ['product_id' => $this->latte->id, 'quantity' => 1, 'beneficiary' => 0],
+            ['product_id' => $this->brew->id, 'quantity' => 1, 'beneficiary' => 1],
+        ],
+    ], $key)->assertCreated();
+
+    // Same people, same drinks, but the expensive one is now the
+    // senior's: the discounts land differently, so this is not a replay.
+    ($this->checkout)([
+        'payment_method' => 'cash',
+        'beneficiaries' => [$senior, $pwd],
+        'items' => [
+            ['product_id' => $this->latte->id, 'quantity' => 1, 'beneficiary' => 1],
+            ['product_id' => $this->brew->id, 'quantity' => 1, 'beneficiary' => 0],
+        ],
+    ], $key)->assertStatus(409)
+        ->assertJsonPath('code', 'idempotency_key_reuse');
+});
+
+/*
+|--------------------------------------------------------------------------
 | Losing the race
 |--------------------------------------------------------------------------
 |

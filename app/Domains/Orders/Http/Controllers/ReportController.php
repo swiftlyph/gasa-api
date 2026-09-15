@@ -58,6 +58,21 @@ class ReportController extends Controller
             'net_cents' => $summary['net_cents'],
             'net_formatted' => Money::format($summary['net_cents'], 'PHP'),
 
+            // P10. `discount_cents` above still reports every peso off;
+            // these say why, and decompose the range's sales for tax.
+            'statutory_discount_cents' => $summary['statutory_discount_cents'],
+            'statutory_discount_formatted' => Money::format($summary['statutory_discount_cents'], 'PHP'),
+            'promo_discount_cents' => $summary['promo_discount_cents'],
+            'promo_discount_formatted' => Money::format($summary['promo_discount_cents'], 'PHP'),
+            'vatable_sales_cents' => $summary['vatable_sales_cents'],
+            'vatable_sales_formatted' => Money::format($summary['vatable_sales_cents'], 'PHP'),
+            'vat_cents' => $summary['vat_cents'],
+            'vat_formatted' => Money::format($summary['vat_cents'], 'PHP'),
+            'vat_exempt_sales_cents' => $summary['vat_exempt_sales_cents'],
+            'vat_exempt_sales_formatted' => Money::format($summary['vat_exempt_sales_cents'], 'PHP'),
+            'nonvat_sales_cents' => $summary['nonvat_sales_cents'],
+            'nonvat_sales_formatted' => Money::format($summary['nonvat_sales_cents'], 'PHP'),
+
             'by_payment_method' => collect($summary['by_payment_method'])->map(fn (array $bucket): array => [
                 'count' => $bucket['count'],
                 'amount_cents' => $bucket['amount_cents'],

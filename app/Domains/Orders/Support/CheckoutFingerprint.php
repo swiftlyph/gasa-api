@@ -17,6 +17,9 @@ namespace App\Domains\Orders\Support;
  * So the payload is normalised to a canonical form first:
  *
  *  - only the fields that change what is sold or charged are included;
+ *    P10's beneficiaries and line->beneficiary assignments ARE such
+ *    fields — adding a senior to an otherwise identical basket changes
+ *    what is charged, so it must change the hash (see below);
  *  - optional fields are defaulted, so absent and explicit-null and 0
  *    agree;
  *  - add-ons within a line are sorted, and lines within the basket are
@@ -41,9 +44,11 @@ class CheckoutFingerprint
      *     cash_cents?: int|null,
      *     gcash_cents?: int|null,
      *     discount_cents?: int|null,
+     *     beneficiaries?: list<array{type: string, name: string, id_number: string}>,
      *     items: list<array{
      *         product_id: int,
      *         quantity: int,
+     *         beneficiary?: int|null,
      *         add_ons?: list<array{name: string, price_cents: int}>
      *     }>
      * }  $payload  The validated checkout payload, WITHOUT the idempotency
@@ -66,9 +71,33 @@ class CheckoutFingerprint
      */
     private static function normalise(array $payload): array
     {
-        $lines = array_map(self::normaliseLine(...), array_values($payload['items']));
+        /** @var list<array<string, mixed>> $beneficiaries */
+        $beneficiaries = array_values($payload['beneficiaries'] ?? []);
+
+        $normalisedBeneficiaries = array_map(self::normaliseBeneficiary(...), $beneficiaries);
+
+        // Each line carries its beneficiary BY VALUE (the normalised
+        // person) rather than by index. This is what keeps "the same
+        // basket is the same request" true through a retry: a tablet that
+        // rebuilds its JSON may legitimately list the same two
+        // beneficiaries in the other order, which renumbers every index
+        // while changing nothing about who is being charged what.
+        // Hashing the index would turn that retry into a 409 — the exact
+        // false rejection this whole class exists to avoid (see the
+        // line-ordering note above).
+        $lines = array_map(
+            fn (array $line): array => self::normaliseLine($line, $normalisedBeneficiaries),
+            array_values($payload['items']),
+        );
 
         usort($lines, self::compareCanonically(...));
+
+        // Sorted for the same reason the lines are: the declaration order
+        // of two beneficiaries is a display detail, not part of what is
+        // sold. A genuine difference (a different person, a different ID)
+        // still changes the hash, because sorting is a bijection on the
+        // multiset.
+        usort($normalisedBeneficiaries, self::compareCanonically(...));
 
         // Keys are written in a fixed order, so json_encode's output is
         // deterministic without relying on the caller's array ordering.
@@ -77,15 +106,32 @@ class CheckoutFingerprint
             'discount_cents' => (int) ($payload['discount_cents'] ?? 0),
             'cash_cents' => isset($payload['cash_cents']) ? (int) $payload['cash_cents'] : null,
             'gcash_cents' => isset($payload['gcash_cents']) ? (int) $payload['gcash_cents'] : null,
+            'beneficiaries' => $normalisedBeneficiaries,
             'items' => $lines,
         ];
     }
 
     /**
-     * @param  array<string, mixed>  $line
+     * @param  array<string, mixed>  $beneficiary
      * @return array<string, mixed>
      */
-    private static function normaliseLine(array $line): array
+    private static function normaliseBeneficiary(array $beneficiary): array
+    {
+        return [
+            'type' => (string) $beneficiary['type'],
+            'name' => (string) $beneficiary['name'],
+            'id_number' => (string) $beneficiary['id_number'],
+        ];
+    }
+
+    /**
+     * @param  array<string, mixed>  $line
+     * @param  list<array<string, mixed>>  $beneficiaries  normalised, still in
+     *                                                     the payload's own order
+     *                                                     so indexes resolve
+     * @return array<string, mixed>
+     */
+    private static function normaliseLine(array $line, array $beneficiaries = []): array
     {
         /** @var list<array<string, mixed>> $addOns */
         $addOns = array_values($line['add_ons'] ?? []);
@@ -97,9 +143,18 @@ class CheckoutFingerprint
 
         usort($addOns, self::compareCanonically(...));
 
+        $beneficiaryIndex = $line['beneficiary'] ?? null;
+
         return [
             'product_id' => (int) $line['product_id'],
             'quantity' => (int) $line['quantity'],
+
+            // Null for an ordinary line, so an absent key and an explicit
+            // null agree — exactly like discount_cents above.
+            'beneficiary' => $beneficiaryIndex === null
+                ? null
+                : ($beneficiaries[(int) $beneficiaryIndex] ?? null),
+
             'add_ons' => $addOns,
         ];
     }

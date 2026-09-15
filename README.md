@@ -152,7 +152,8 @@ header — never a redirect.
 | 422    | `validation_failed`    | FormRequest validation failure                                  |
 | 422    | `invalid_transition`   | Order status change the transition map forbids (e.g. completing a voided order), OR a merchant status change `PATCH /admin/merchants/{merchant}/status` forbids (e.g. `pending` → `pending`) — one shared code across both, see § Platform admin |
 | 422    | `product_unavailable`  | Checkout referenced a product that is missing, not the caller's, or flagged unavailable — `errors.product_ids` lists them |
-| 422    | `discount_exceeds_subtotal` | Checkout discount is larger than the server-computed subtotal   |
+| 422    | `discount_exceeds_subtotal` | Checkout promo discount is larger than the server-computed post-statutory subtotal (see § Tax & statutory discounts) |
+| 422    | `beneficiary_unused`   | Checkout declared a senior/PWD beneficiary that no line was assigned to — `errors.beneficiaries` names the indexes |
 | 422    | `split_mismatch`       | Split payment whose `cash_cents` + `gcash_cents` don't equal the server-computed total |
 | 409    | `idempotency_key_reuse` | Checkout reused an `Idempotency-Key` with a different request body |
 | 409    | `session_already_open` | Opening a cash session on a register that already has one open        |
@@ -293,6 +294,34 @@ never needs a follow-up `GET`.
 "split"`, where they sum exactly to `total_cents`. `product_id` is `null`
 once the catalog entry is deleted — the line still renders in full, which
 is the whole point (see § Orders).
+
+P10 adds two **additive** blocks to this same payload — a `tax` object and
+a `beneficiaries` list — plus `discount_cents`/`payable_cents` on each
+line. `discount_cents` at the top level is **unchanged**: it still means
+every peso off the order. See § Tax & statutory discounts.
+
+```json
+{
+  "tax": {
+    "vat_registered": true,
+    "vat_rate_bps": 1200,
+    "vatable_sales_cents": 12500, "vatable_sales_formatted": "₱125.00",
+    "vat_cents": 1500, "vat_formatted": "₱15.00",
+    "vat_exempt_sales_cents": 29018, "vat_exempt_sales_formatted": "₱290.18",
+    "nonvat_sales_cents": 0, "nonvat_sales_formatted": "₱0.00",
+    "statutory_discount_cents": 9286, "statutory_discount_formatted": "₱92.86",
+    "promo_discount_cents": 1000, "promo_discount_formatted": "₱10.00"
+  },
+  "beneficiaries": [
+    {
+      "id": 1, "type": "senior", "type_label": "Senior Citizen",
+      "name": "Lola Remedios", "id_number": "SC-2020-0001",
+      "discount_cents": 5804, "discount_formatted": "₱58.04",
+      "vat_exempt_sales_cents": 29018, "vat_exempt_sales_formatted": "₱290.18"
+    }
+  ]
+}
+```
 
 #### The cash session payload
 
@@ -1384,6 +1413,247 @@ follow OPPOSITE rules on purpose:**
   phase. A shop that changes its printed letterhead mid-shift will see
   old and new receipts differ if reprinted side by side; there is no
   endpoint that freezes the profile at sale time.
+
+## Tax & statutory discounts
+
+Philippine senior-citizen and PWD discounts, and the VAT decomposition
+they interact with (P10). Everything in this section is **additive**: a
+checkout that sends no `beneficiaries` produces byte-for-byte the same
+totals it did before this phase, and `orders.discount_cents` still means
+what it always meant.
+
+**Out of scope, explicitly.** BIR receipt accreditation (CAS/POS permit,
+serial-number accreditation, the printed permit line) and **signature
+capture** are NOT implemented and are not attempted. The printed document
+stays labelled an **"Order slip"**, never an Official Receipt. ID-number
+*formats* are not validated either — the field is recorded as presented
+(see § The beneficiary record). This phase implements the ARITHMETIC and
+the RECORD, not the legal accreditation around them.
+
+### The rules
+
+Senior citizens (RA 9994) and PWDs (RA 10754) get **20% off their own
+consumption**, and those sales are **VAT-exempt**. In a group order only
+the lines assigned to the beneficiary are discounted — which is why a
+beneficiary is a row that lines point at, never a flag on the order.
+
+Whether a merchant is VAT-registered is a **per-merchant toggle**
+(`merchants.vat_registered`, default `false`). The rates are national law
+and live in `config/merchant.php`:
+
+| Constant | Default | Meaning |
+| -------- | ------- | ------- |
+| `merchant.vat_rate_bps` | `1200` | VAT rate in basis points (12%) |
+| `merchant.statutory_discount_bps` | `2000` | Senior/PWD discount (20%) |
+
+Basis points, not floats — the arithmetic stays integer end to end, like
+every other money value here. **No `1.12` or `0.20` literal appears in any
+Action**; the formulas live in exactly one class,
+`App\Domains\Orders\Support\StatutoryTax`.
+
+### The formulas
+
+Per line, where `line_total` is the existing pre-discount, VAT-inclusive
+line amount (`(unit_price + Σ add_ons) × quantity` — unchanged by this
+phase):
+
+**VAT-registered merchant** (shelf prices are VAT-inclusive):
+
+```
+beneficiary line:      net      = round(line_total / 1.12)
+                       discount = round(net × 20%)
+                       payable  = net − discount          → net is VAT-EXEMPT SALES
+non-beneficiary line:  vatable  = round(line_total / 1.12)
+                       vat      = line_total − vatable
+                       payable  = line_total              → VAT stays in the price
+```
+
+A beneficiary is relieved of **both** the VAT and a further 20%, which is
+why the 20% comes off the **net** and not off the shelf price.
+
+**Non-VAT merchant** (no VAT was ever in the price):
+
+```
+beneficiary line:      discount = round(line_total × 20%)
+                       payable  = line_total − discount
+non-beneficiary line:  payable  = line_total
+```
+
+Every VAT field is `0`, and the whole subtotal is recorded as
+`nonvat_sales_cents`.
+
+**Rounding is HALF-UP to the cent, at each step named above and nowhere
+else** (₱0.005 → ₱0.01). Implemented as integer arithmetic, never
+`round($n / $d)`: `1.12` is not representable in binary, so the float form
+is already wrong at the half-cent boundary before any rounding rule
+applies. VAT is always derived **by subtraction** (`vat = gross − net`)
+rather than rounded independently, so a line's parts always add back up to
+what the customer paid.
+
+### The promo discount
+
+`discount_cents` in the checkout request is the **promo (manual)
+discount**. The field **keeps its name** so every POS already in the field
+keeps working — renaming it would break clients to say something they
+already meant.
+
+It is applied **after** the statutory discounts and **may not exceed the
+post-statutory subtotal**; exceeding it is the existing `422
+discount_exceeds_subtotal`, which from a client's point of view is the
+same condition it always was ("your discount is bigger than what's left to
+pay") — only "what's left" is now net of the statutory discount.
+
+### The two invariants
+
+Both of these hold on **every** order, and they are the reason
+`statutory_discount_cents` is defined the way it is:
+
+```
+total_cents = subtotal_cents − discount_cents            (unchanged since P2)
+total_cents = Σ payable(lines) − promo_discount_cents    (P10)
+discount_cents = statutory_discount_cents + promo_discount_cents
+```
+
+The third is enforced by a **CHECK constraint**
+(`orders_discount_split_check`), not by convention: every existing report
+reads `discount_cents` as "total discounts", and a row that broke the
+identity would make a day's figures silently disagree with themselves.
+
+**`statutory_discount_cents` on the ORDER is the total relief given** —
+every peso between what the beneficiary's lines would have cost at shelf
+price and what they actually pay. On a VAT-registered order that includes
+the VAT the beneficiary is relieved of, because an exempt line's payable
+is computed from the VAT-*exclusive* net while `subtotal_cents` is
+VAT-*inclusive*. Using only the 20% here would leave that VAT
+unaccounted for and the first two invariants would disagree by exactly
+that amount.
+
+The **20%-only** figure — what the customer's ID actually saved them, and
+what prints on the slip — is recorded on each line
+(`order_items.discount_cents`) and on each beneficiary
+(`order_beneficiaries.discount_cents`).
+
+### Worked example
+
+A VAT-registered shop. Latte ₱140.00, Cold Brew ₱185.00. A senior takes
+one of each; a third line (another latte) belongs to nobody. ₱10.00 promo.
+
+| | line_total | net | statutory 20% | payable |
+| --- | --- | --- | --- | --- |
+| Latte (senior) | 14000 | 12500 | 2500 | 10000 |
+| Brew (senior)  | 18500 | 16518 | 3304 | 13214 |
+| Latte (nobody) | 14000 | 12500 | — | 14000 |
+
+```
+subtotal_cents           = 46500
+vat_exempt_sales_cents   = 12500 + 16518 = 29018     (the senior's nets)
+vatable_sales_cents      = 12500
+vat_cents                = 14000 − 12500 = 1500
+statutory_discount_cents = (14000−10000) + (18500−13214) = 9286   ← total relief
+promo_discount_cents     = 1000
+discount_cents           = 9286 + 1000 = 10286
+total_cents              = 46500 − 10286 = 36214
+                         = Σpayable (37214) − promo (1000)        ✓ both agree
+```
+
+The beneficiary row records `discount_cents = 2500 + 3304 = 5804` (the
+20% they saved) and `vat_exempt_sales_cents = 29018`.
+
+The same basket on a **non-VAT** shop: statutory = 2800 + 3700 = 6500,
+`nonvat_sales_cents` = 46500, every VAT field 0, total = 46500 − 7500 =
+39000.
+
+### The request
+
+```json
+{
+  "payment_method": "cash",
+  "discount_cents": 1000,
+  "beneficiaries": [
+    { "type": "senior", "name": "Lola Remedios", "id_number": "SC-2020-0001" }
+  ],
+  "items": [
+    { "product_id": 3, "quantity": 1, "beneficiary": 0 },
+    { "product_id": 7, "quantity": 1 }
+  ]
+}
+```
+
+`items[*].beneficiary` is an **index into `beneficiaries`** — which is why
+that list must be a JSON array, never an object. Rules:
+
+| Cause | Code |
+| ----- | ---- |
+| A beneficiary with no line assigned to them | `422 beneficiary_unused` (`errors.beneficiaries` names the indexes) |
+| Missing/blank `name` or `id_number`, index out of range, unknown `type` | `422 validation_failed` |
+| Promo discount > post-statutory subtotal | `422 discount_exceeds_subtotal` |
+
+A beneficiary with no lines is **rejected, not ignored**: dropping it
+silently would record no discount for a customer who presented an ID at
+the counter and is owed 20% by law; discounting the whole order instead
+would hand a group's worth of statutory discount to one person.
+
+`name` and `id_number` are **required** — the discount is only lawful
+against a presented ID, and both print on the slip. A nullable column
+would make "the cashier didn't bother" indistinguishable from "there was
+no ID", and the first is the case that matters.
+
+**Idempotency.** Beneficiaries and line→beneficiary assignments are part
+of the request fingerprint, so adding a senior to an otherwise identical
+basket with the same `Idempotency-Key` is a `409 idempotency_key_reuse`.
+A beneficiary is hashed **by value, not by index**: a tablet that rebuilds
+its JSON may list the same two people in the other order, which renumbers
+every index while changing nothing about who is charged what — that retry
+must still replay, not 409.
+
+### The snapshot rule
+
+`orders.vat_registered_snapshot` and `vat_rate_bps_snapshot` freeze the
+merchant's toggle and the national rate **as they were at sale time**,
+exactly like `order_items.unit_price_cents` freezes a price. A shop that
+registers for VAT in March does not retroactively turn January's sales
+into VAT sales, and toggling `vat_registered` never changes a stored
+order or its reprinted slip.
+
+This is the **opposite** of the receipt's `merchant` block, which is read
+live (see § The receipt) — deliberately, and the two rules sit side by
+side in `ReceiptResource`.
+
+### Columns
+
+`merchants`: `vat_registered` (bool, default `false`, editable via
+`PATCH /merchant/profile` with `profile.edit`, returned by `GET
+/merchant/profile` and in `/auth/me`'s merchant summary).
+
+`order_beneficiaries` (new): `order_id` (cascade), `type`
+(`senior`|`pwd`, CHECK-constrained, mirrored by
+`App\Domains\Orders\Enums\BeneficiaryType`), `name`, `id_number`,
+`discount_cents`, `vat_exempt_sales_cents`. **No `merchant_id`** —
+tenancy is inherited structurally through the order, exactly as for
+`order_items` (a second source of truth for who owns the row could
+disagree with the first).
+
+`order_items`: `beneficiary_id` (nullable FK, `nullOnDelete`),
+`net_of_vat_cents`, `discount_cents` (statutory only, default 0),
+`payable_cents`. **`line_total_cents` is unchanged** — still the
+pre-discount, VAT-inclusive line amount.
+
+`orders`: `vat_registered_snapshot`, `vat_rate_bps_snapshot`,
+`vatable_sales_cents`, `vat_cents`, `vat_exempt_sales_cents`,
+`nonvat_sales_cents`, `statutory_discount_cents`, `promo_discount_cents`.
+
+### Reporting and reconciliation
+
+`sales-summary` and the Z-report gain `statutory_discount`,
+`promo_discount`, `vatable_sales`, `vat`, `vat_exempt_sales` and
+`nonvat_sales` totals — additive fields on the **existing** report
+classes, under the same accounting rules as every figure beside them
+(voided orders excluded, pending included).
+
+**Reconciliation is unchanged.** `ReconcileCashSessionAction` derives
+expected cash from what was **PAID** — `total_cents` and `cash_cents`,
+totals only — so a discounted sale contributes exactly its total, and
+nothing in this phase touches that formula.
 
 ## Merchant profile & team members
 

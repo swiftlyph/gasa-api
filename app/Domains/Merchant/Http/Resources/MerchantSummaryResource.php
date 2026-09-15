@@ -27,6 +27,10 @@ class MerchantSummaryResource extends JsonResource
             'name' => $this->name,
             'status' => $this->status->value,
 
+            // P10: additive, so the POS can render the right tax lines on
+            // a slip without a second request for the full profile.
+            'vat_registered' => $this->vat_registered,
+
             // Loaded via $user->merchants->first() in UserResource, so
             // the pivot (role_in_merchant) is attached the same way
             // TeamMemberResource reads it — see that resource's docblock

@@ -46,6 +46,12 @@ class SalesSummaryReport
      *     gross_cents: int,
      *     discount_cents: int,
      *     net_cents: int,
+     *     statutory_discount_cents: int,
+     *     promo_discount_cents: int,
+     *     vatable_sales_cents: int,
+     *     vat_cents: int,
+     *     vat_exempt_sales_cents: int,
+     *     nonvat_sales_cents: int,
      *     by_payment_method: array<string, array{count: int, amount_cents: int}>,
      *     average_order_cents: int,
      * }
@@ -68,6 +74,19 @@ class SalesSummaryReport
                     coalesce(sum(discount_cents) filter (where status != ?), 0) as discount_cents,
                     coalesce(sum(total_cents) filter (where status != ?), 0) as net_cents,
 
+                    -- P10. discount_cents above stays "every peso off";
+                    -- these two say why, and always sum back to it. The
+                    -- four buckets partition the subtotal by tax
+                    -- treatment. Same voided-exclusion rule as every
+                    -- figure above — a voided discounted order must not
+                    -- contribute its discount either.
+                    coalesce(sum(statutory_discount_cents) filter (where status != ?), 0) as statutory_discount_cents,
+                    coalesce(sum(promo_discount_cents) filter (where status != ?), 0) as promo_discount_cents,
+                    coalesce(sum(vatable_sales_cents) filter (where status != ?), 0) as vatable_sales_cents,
+                    coalesce(sum(vat_cents) filter (where status != ?), 0) as vat_cents,
+                    coalesce(sum(vat_exempt_sales_cents) filter (where status != ?), 0) as vat_exempt_sales_cents,
+                    coalesce(sum(nonvat_sales_cents) filter (where status != ?), 0) as nonvat_sales_cents,
+
                     count(*) filter (where status != ? and payment_method = ?) as cash_count,
                     coalesce(sum(total_cents) filter (where status != ? and payment_method = ?), 0) as cash_amount_cents,
 
@@ -82,6 +101,14 @@ class SalesSummaryReport
                     OrderStatus::Completed->value,
                     OrderStatus::Voided->value,
 
+                    OrderStatus::Voided->value,
+                    OrderStatus::Voided->value,
+                    OrderStatus::Voided->value,
+
+                    // P10's six additive figures, same voided exclusion.
+                    OrderStatus::Voided->value,
+                    OrderStatus::Voided->value,
+                    OrderStatus::Voided->value,
                     OrderStatus::Voided->value,
                     OrderStatus::Voided->value,
                     OrderStatus::Voided->value,
@@ -125,6 +152,14 @@ class SalesSummaryReport
             'gross_cents' => (int) $row->gross_cents,
             'discount_cents' => (int) $row->discount_cents,
             'net_cents' => $netCents,
+
+            'statutory_discount_cents' => (int) $row->statutory_discount_cents,
+            'promo_discount_cents' => (int) $row->promo_discount_cents,
+            'vatable_sales_cents' => (int) $row->vatable_sales_cents,
+            'vat_cents' => (int) $row->vat_cents,
+            'vat_exempt_sales_cents' => (int) $row->vat_exempt_sales_cents,
+            'nonvat_sales_cents' => (int) $row->nonvat_sales_cents,
+
             'by_payment_method' => [
                 'cash' => [
                     'count' => (int) $row->cash_count,

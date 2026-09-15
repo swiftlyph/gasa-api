@@ -79,6 +79,22 @@ class ZReportResource extends JsonResource
                 'net_cents' => $sales['net_cents'],
                 'net_formatted' => Money::format($sales['net_cents'], 'PHP'),
 
+                // P10. `discounts_cents` above still reports every peso
+                // off; these break it down and decompose the shift's
+                // sales for tax. Additive — nothing above changed.
+                'statutory_discount_cents' => $sales['statutory_discount_cents'],
+                'statutory_discount_formatted' => Money::format($sales['statutory_discount_cents'], 'PHP'),
+                'promo_discount_cents' => $sales['promo_discount_cents'],
+                'promo_discount_formatted' => Money::format($sales['promo_discount_cents'], 'PHP'),
+                'vatable_sales_cents' => $sales['vatable_sales_cents'],
+                'vatable_sales_formatted' => Money::format($sales['vatable_sales_cents'], 'PHP'),
+                'vat_cents' => $sales['vat_cents'],
+                'vat_formatted' => Money::format($sales['vat_cents'], 'PHP'),
+                'vat_exempt_sales_cents' => $sales['vat_exempt_sales_cents'],
+                'vat_exempt_sales_formatted' => Money::format($sales['vat_exempt_sales_cents'], 'PHP'),
+                'nonvat_sales_cents' => $sales['nonvat_sales_cents'],
+                'nonvat_sales_formatted' => Money::format($sales['nonvat_sales_cents'], 'PHP'),
+
                 'by_payment_method' => collect($sales['by_payment_method'])->map(fn (array $bucket): array => [
                     'count' => $bucket['count'],
                     'amount_cents' => $bucket['amount_cents'],

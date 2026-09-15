@@ -1418,3 +1418,145 @@ test('audit logs are unreachable outside admin.api', function () {
         ->assertStatus(403)
         ->assertJson(['code' => 'forbidden']);
 });
+
+/*
+|--------------------------------------------------------------------------
+| P10 — STATUTORY DISCOUNTS / BENEFICIARIES
+|--------------------------------------------------------------------------
+|
+| order_beneficiaries has NO merchant_id column: tenancy is inherited
+| structurally through the order, exactly as for order_items. These cases
+| prove that inheritance actually holds through the real endpoints, which
+| is where a leak would happen.
+*/
+
+test('merchant two cannot see merchant one\'s beneficiaries through any order endpoint', function () {
+    $latte = Product::factory()->create([
+        'merchant_id' => $this->merchantOne->id,
+        'name' => 'Cafe Latte (16oz)',
+        'price_cents' => 14000,
+    ]);
+
+    $oneToken = $this->merchantOneUser->createToken('merchant')->plainTextToken;
+
+    $orderId = $this->withToken($oneToken)
+        ->postJson('/api/v1/merchant/orders', [
+            'payment_method' => 'cash',
+            'beneficiaries' => [['type' => 'senior', 'name' => 'Lola Remedios', 'id_number' => 'SC-2020-0001']],
+            'items' => [['product_id' => $latte->id, 'quantity' => 1, 'beneficiary' => 0]],
+        ])->assertCreated()
+        ->assertJsonPath('beneficiaries.0.name', 'Lola Remedios')
+        ->json('id');
+
+    $twoToken = $this->merchantTwoUser->createToken('merchant')->plainTextToken;
+
+    // The order itself is a 404 for merchant two — so the beneficiary,
+    // reachable only through it, is unreachable by construction.
+    foreach ([
+        "/api/v1/merchant/orders/{$orderId}",
+        "/api/v1/merchant/orders/{$orderId}/receipt",
+    ] as $uri) {
+        $this->withToken($twoToken)->getJson($uri)
+            ->assertStatus(404)
+            ->assertJson(['code' => 'not_found']);
+    }
+
+    // And merchant two's own order list never surfaces the row.
+    $list = $this->withToken($twoToken)->getJson('/api/v1/merchant/orders')->assertOk();
+
+    expect($list->json('data'))->toBe([]);
+
+    // The beneficiary really does exist — this test would pass vacuously
+    // if the checkout above had quietly written nothing.
+    expect(DB::table('order_beneficiaries')->count())->toBe(1)
+        ->and(DB::table('order_beneficiaries')->value('name'))->toBe('Lola Remedios');
+});
+
+test('a beneficiary is only ever reachable through its own merchant\'s order', function () {
+    // The structural guarantee stated directly: every beneficiary row's
+    // order belongs to the merchant whose token created it, so there is
+    // no query path from one tenant to another's row.
+    $latteOne = Product::factory()->create(['merchant_id' => $this->merchantOne->id, 'price_cents' => 10000]);
+    $latteTwo = Product::factory()->create(['merchant_id' => $this->merchantTwo->id, 'price_cents' => 10000]);
+
+    $this->withToken($this->merchantOneUser->createToken('m')->plainTextToken)
+        ->postJson('/api/v1/merchant/orders', [
+            'payment_method' => 'cash',
+            'beneficiaries' => [['type' => 'senior', 'name' => 'One\'s Senior', 'id_number' => 'SC-ONE']],
+            'items' => [['product_id' => $latteOne->id, 'quantity' => 1, 'beneficiary' => 0]],
+        ])->assertCreated();
+
+    $this->withToken($this->merchantTwoUser->createToken('m')->plainTextToken)
+        ->postJson('/api/v1/merchant/orders', [
+            'payment_method' => 'cash',
+            'beneficiaries' => [['type' => 'pwd', 'name' => 'Two\'s PWD', 'id_number' => 'PWD-TWO']],
+            'items' => [['product_id' => $latteTwo->id, 'quantity' => 1, 'beneficiary' => 0]],
+        ])->assertCreated();
+
+    $ownerOf = fn (string $idNumber) => Order::withoutGlobalScope('merchant')
+        ->whereIn('id', DB::table('order_beneficiaries')->where('id_number', $idNumber)->pluck('order_id'))
+        ->value('merchant_id');
+
+    expect($ownerOf('SC-ONE'))->toBe($this->merchantOne->id)
+        ->and($ownerOf('PWD-TWO'))->toBe($this->merchantTwo->id);
+
+    // Merchant two's order list shows exactly one order — their own.
+    $list = $this->withToken($this->merchantTwoUser->createToken('m')->plainTextToken)
+        ->getJson('/api/v1/merchant/orders')->assertOk();
+
+    expect($list->json('data'))->toHaveCount(1)
+        ->and($list->json('data.0.beneficiaries.0.id_number'))->toBe('PWD-TWO');
+});
+
+test('a suspended merchant cannot check out a statutory discount — 403', function () {
+    $user = User::factory()->withRole('merchant')->create();
+    $merchant = Merchant::factory()->suspended()->ownedBy($user)->create(['name' => 'Suspended Shop']);
+
+    // Through the factory, not Product::create(): BelongsToMerchant's
+    // `creating` hook overwrites merchant_id with the CURRENT tenant
+    // (nobody, here), so a direct create would insert a null. The factory
+    // uses CreatesAcrossTenants, which is the supported way to seed a row
+    // for an explicit merchant with no authenticated user.
+    $product = Product::factory()->create([
+        'merchant_id' => $merchant->id,
+        'name' => 'Latte',
+        'price_cents' => 14000,
+    ]);
+
+    $this->withToken($user->createToken('merchant')->plainTextToken)
+        ->postJson('/api/v1/merchant/orders', [
+            'payment_method' => 'cash',
+            'beneficiaries' => [['type' => 'senior', 'name' => 'Lola', 'id_number' => 'SC-1']],
+            'items' => [['product_id' => $product->id, 'quantity' => 1, 'beneficiary' => 0]],
+        ])
+        ->assertStatus(403)
+        ->assertJson(['code' => 'merchant_inactive']);
+
+    expect(DB::table('order_beneficiaries')->count())->toBe(0);
+});
+
+test('merchant two\'s vat_registered toggle never affects merchant one\'s orders', function () {
+    // The snapshot is per-order, and the toggle is per-merchant: one
+    // shop's tax status must be invisible to another's sales.
+    $this->merchantOne->update(['vat_registered' => true]);
+    $this->merchantTwo->update(['vat_registered' => false]);
+
+    $latte = Product::factory()->create(['merchant_id' => $this->merchantOne->id, 'price_cents' => 14000]);
+
+    $orderId = $this->withToken($this->merchantOneUser->createToken('m')->plainTextToken)
+        ->postJson('/api/v1/merchant/orders', [
+            'payment_method' => 'cash',
+            'items' => [['product_id' => $latte->id, 'quantity' => 1]],
+        ])->assertCreated()
+        ->assertJsonPath('tax.vat_registered', true)
+        ->json('id');
+
+    // Merchant two deregisters, registers, whatever — irrelevant.
+    $this->merchantTwo->update(['vat_registered' => true]);
+
+    $this->withToken($this->merchantOneUser->createToken('m')->plainTextToken)
+        ->getJson("/api/v1/merchant/orders/{$orderId}")
+        ->assertOk()
+        ->assertJsonPath('tax.vat_registered', true)
+        ->assertJsonPath('tax.vat_cents', 1500);
+});

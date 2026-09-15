@@ -29,6 +29,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
  * @property string|null $receipt_header
  * @property string|null $receipt_footer
  * @property string|null $timezone
+ * @property bool $vat_registered
  */
 class Merchant extends Model
 {
@@ -53,6 +54,12 @@ class Merchant extends Model
         'receipt_header',
         'receipt_footer',
         'timezone',
+
+        // P10: whether this shop is VAT-registered, which decides how
+        // every one of its sales is decomposed for tax. Per-merchant
+        // DATA; the VAT rate itself is national law and lives in
+        // config/merchant.php. Editable through PATCH /merchant/profile.
+        'vat_registered',
     ];
 
     /**
@@ -62,6 +69,7 @@ class Merchant extends Model
     {
         return [
             'status' => MerchantStatus::class,
+            'vat_registered' => 'boolean',
         ];
     }
 

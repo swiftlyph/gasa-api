@@ -1,0 +1,33 @@
+name: Deploy
+
+# Fires only after CI finishes on main, and only if it succeeded — never
+# deploys code that hasn't passed lint/analyse/test.
+on:
+  workflow_run:
+    workflows: [CI]
+    branches: [main]
+    types: [completed]
+
+jobs:
+  deploy:
+    name: Deploy to staging
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            set -euo pipefail
+            cd /var/www/gasa-api
+            sudo git pull origin main
+            sudo composer install --no-dev --optimize-autoloader --no-interaction
+            sudo php artisan migrate --force
+            sudo php artisan config:cache
+            sudo php artisan route:cache
+            sudo php artisan view:cache
+            sudo php artisan queue:restart
+            sudo chown -R www-data:www-data storage bootstrap/cache

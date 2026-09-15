@@ -8,13 +8,16 @@ use App\Domains\CashSessions\Models\CashSession;
 use App\Domains\CashSessions\Models\Register;
 use App\Domains\CashSessions\Support\DefaultRegister;
 use App\Domains\Catalog\Models\Product;
+use App\Domains\Orders\Enums\BeneficiaryType;
 use App\Domains\Orders\Enums\OrderStatus;
 use App\Domains\Orders\Enums\PaymentMethod;
 use App\Domains\Orders\Exceptions\DiscountExceedsSubtotal;
 use App\Domains\Orders\Exceptions\ProductUnavailable;
 use App\Domains\Orders\Exceptions\SplitMismatch;
 use App\Domains\Orders\Models\Order;
+use App\Domains\Orders\Models\OrderBeneficiary;
 use App\Domains\Orders\Models\OrderItem;
+use App\Domains\Orders\Support\StatutoryTax;
 use App\Domains\Shared\Http\Exceptions\ApiException;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
@@ -38,6 +41,16 @@ use Illuminate\Support\Facades\DB;
  *    afterwards rolls back inside the transaction, counter increment
  *    included — the counter row lock is deliberately held by this same
  *    transaction (see GenerateOrderNumberAction).
+ *
+ * 3. THE TAX DECOMPOSITION IS COMPUTED HERE AND SNAPSHOTTED (P10). The
+ *    merchant's VAT registration and the national rate are frozen onto
+ *    the order, every line records its own net/discount/payable, and the
+ *    four sales buckets are rolled up from the lines — so a later change
+ *    to either the merchant's toggle or the config rate can never
+ *    retroactively re-tax a sale that already happened. The formulas
+ *    themselves live in App\Domains\Orders\Support\StatutoryTax, not
+ *    here: there is exactly one place in the codebase that divides by a
+ *    VAT rate. No literal 1.12 or 0.20 appears in this class.
  *
  * Add-ons are the one thing that IS client-supplied, because no add-on
  * catalog exists to look them up in yet. CheckoutRequest bounds them
@@ -64,9 +77,11 @@ class CheckoutAction
      *     gcash_cents?: int|null,
      *     discount_cents?: int|null,
      *     register_id?: int|null,
+     *     beneficiaries?: list<array{type: string, name: string, id_number: string}>,
      *     items: list<array{
      *         product_id: int,
      *         quantity: int,
+     *         beneficiary?: int|null,
      *         add_ons?: list<array{name: string, price_cents: int}>
      *     }>
      * }  $payload  Already shape-validated by CheckoutRequest, whose `list`
@@ -96,15 +111,74 @@ class CheckoutAction
 
             $products = $this->resolveSellableProducts($payload['items']);
 
-            [$lines, $subtotalCents] = $this->buildLines($payload['items'], $products);
+            // The tax treatment is decided ONCE, here, from the merchant
+            // as it is at this moment, and then frozen onto the order.
+            // Everything below reads these two locals, never the live
+            // merchant or the live config again.
+            $vatRegistered = (bool) $merchant->vat_registered;
+            $vatRateBps = StatutoryTax::vatRateBps();
 
-            $discountCents = $payload['discount_cents'] ?? 0;
+            [$lines, $subtotalCents] = $this->buildLines(
+                $payload['items'],
+                $products,
+                $vatRegistered,
+                $vatRateBps,
+            );
 
-            if ($discountCents > $subtotalCents) {
-                throw new DiscountExceedsSubtotal($subtotalCents, $discountCents);
+            // Statutory first, promo second — the order the law requires,
+            // and the reason the promo cap below is checked against the
+            // POST-statutory subtotal rather than the gross one.
+            $payableCents = array_sum(array_column($lines, 'payable_cents'));
+
+            // THE ORDER'S statutory discount is the TOTAL RELIEF given —
+            // every peso between what a beneficiary's lines would have
+            // cost at the shelf price and what they actually pay. On a
+            // VAT-registered order that is the 20% AND the VAT the
+            // beneficiary is relieved of, because an exempt line's payable
+            // is computed from the VAT-exclusive net while subtotal_cents
+            // is VAT-INCLUSIVE.
+            //
+            // That is not a bookkeeping choice, it is the only way both
+            // invariants this phase promises can hold at once:
+            //
+            //     total = subtotal − discount        (unchanged since P2)
+            //     total = Σ payable(lines) − promo   (P10)
+            //
+            // Using only the 20% here would leave the VAT relieved on
+            // exempt lines unaccounted for, and the two would disagree by
+            // exactly that amount — which is how this was caught.
+            //
+            // The 20%-only figure is still recorded where it belongs: on
+            // each LINE (order_items.discount_cents) and on each
+            // BENEFICIARY (the amount their ID actually saved them, which
+            // is what prints on the slip). See README § Tax & statutory
+            // discounts for the worked example.
+            $statutoryDiscountCents = 0;
+
+            foreach ($lines as $line) {
+                if ($line['beneficiary'] !== null) {
+                    $statutoryDiscountCents += $line['line_total_cents'] - $line['payable_cents'];
+                }
             }
 
+            // `discount_cents` in the payload is the PROMO discount (the
+            // field keeps its old name so existing POS clients keep
+            // working — see CheckoutRequest).
+            $promoDiscountCents = $payload['discount_cents'] ?? 0;
+
+            if ($promoDiscountCents > $payableCents) {
+                // Deliberately the EXISTING code and exception: from a
+                // client's point of view this is the same condition it
+                // always was — "your discount is bigger than what's left
+                // to pay" — and the only thing P10 changed is that "what's
+                // left" is now net of the statutory discount.
+                throw new DiscountExceedsSubtotal($payableCents, $promoDiscountCents);
+            }
+
+            $discountCents = $statutoryDiscountCents + $promoDiscountCents;
             $totalCents = $subtotalCents - $discountCents;
+
+            $buckets = $this->salesBuckets($lines, $vatRegistered);
 
             $method = PaymentMethod::from($payload['payment_method']);
             [$cashCents, $gcashCents] = $this->resolvePaymentSplit($method, $payload, $totalCents);
@@ -117,8 +191,27 @@ class CheckoutAction
             $order->fill([
                 'order_number' => $this->orderNumbers->execute($merchant->getKey()),
                 'subtotal_cents' => $subtotalCents,
+
+                // KEEPS its pre-P10 meaning: every peso off this order.
+                // A CHECK constraint enforces that it equals the two
+                // columns below summed, because every existing report
+                // reads it as "total discounts" and must keep doing so.
                 'discount_cents' => $discountCents,
+                'statutory_discount_cents' => $statutoryDiscountCents,
+                'promo_discount_cents' => $promoDiscountCents,
+
                 'total_cents' => $totalCents,
+
+                // Frozen at sale time, never re-read from the merchant or
+                // the config afterwards — a shop that registers for VAT
+                // in March must not retroactively re-tax January.
+                'vat_registered_snapshot' => $vatRegistered,
+                'vat_rate_bps_snapshot' => $vatRegistered ? $vatRateBps : 0,
+
+                'vatable_sales_cents' => $buckets['vatable_sales_cents'],
+                'vat_cents' => $buckets['vat_cents'],
+                'vat_exempt_sales_cents' => $buckets['vat_exempt_sales_cents'],
+                'nonvat_sales_cents' => $buckets['nonvat_sales_cents'],
                 'currency' => $this->currencyFor($products),
                 'payment_method' => $method,
                 'cash_cents' => $cashCents,
@@ -146,7 +239,13 @@ class CheckoutAction
 
             $order->save();
 
-            $this->persistLines($order, $lines);
+            // Beneficiaries first: the lines carry a FK to them, so the
+            // rows have to exist before persistLines() can point at them.
+            // Both happen inside this same transaction, so a failure in
+            // either takes the whole sale with it.
+            $beneficiaryIds = $this->persistBeneficiaries($order, $payload['beneficiaries'] ?? [], $lines);
+
+            $this->persistLines($order, $lines, $beneficiaryIds);
 
             return $order;
         });
@@ -240,23 +339,40 @@ class CheckoutAction
     }
 
     /**
-     * Prices every line from the resolved products and returns the lines
-     * plus the order subtotal.
+     * Prices every line from the resolved products, decomposes each for
+     * tax, and returns the lines plus the order subtotal.
      *
      * Add-ons are priced PER UNIT: two lattes each with an extra shot is
      * two extra shots. The formula is
      * (unit_price + add_ons_per_unit) * quantity, which is the spec's
      * "unit_price * quantity + add_on_price * quantity" factored.
      *
-     * @param  list<array{product_id: int, quantity: int, add_ons?: list<array{name: string, price_cents: int}>}>  $items
+     * `line_total_cents` is UNCHANGED from before P10 — the pre-discount,
+     * VAT-inclusive amount charged for the line. The three new figures
+     * decompose it, per the rules in StatutoryTax:
+     *
+     *   VAT merchant, beneficiary line:  net = line_total / 1.12
+     *                                    discount = 20% of net
+     *                                    payable  = net - discount
+     *   VAT merchant, ordinary line:     net = line_total / 1.12
+     *                                    payable = line_total (VAT stays in)
+     *   non-VAT, beneficiary line:       discount = 20% of line_total
+     *                                    payable  = line_total - discount
+     *   non-VAT, ordinary line:          payable  = line_total
+     *
+     * Rounding is half-up at each step, and happens ONLY inside
+     * StatutoryTax — there is no rate literal anywhere in this method.
+     *
+     * @param  list<array{product_id: int, quantity: int, beneficiary?: int|null, add_ons?: list<array{name: string, price_cents: int}>}>  $items
      * @param  Collection<int, Product>  $products
      * @return array{0: list<array{
      *     product_id: int, product_name: string, unit_price_cents: int,
-     *     quantity: int, line_total_cents: int,
+     *     quantity: int, line_total_cents: int, beneficiary: int|null,
+     *     net_of_vat_cents: int, discount_cents: int, payable_cents: int,
      *     add_ons: list<array{name: string, price_cents: int}>
      * }>, 1: int}
      */
-    private function buildLines(array $items, Collection $products): array
+    private function buildLines(array $items, Collection $products, bool $vatRegistered, int $vatRateBps): array
     {
         $lines = [];
         $subtotalCents = 0;
@@ -275,12 +391,25 @@ class CheckoutAction
             $unitPriceCents = $product->price_cents;
             $lineTotalCents = ($unitPriceCents + $addOnCentsPerUnit) * $quantity;
 
+            $beneficiaryIndex = isset($item['beneficiary']) ? (int) $item['beneficiary'] : null;
+
+            [$netOfVatCents, $discountCents, $payableCents] = $this->decomposeLine(
+                $lineTotalCents,
+                isBeneficiary: $beneficiaryIndex !== null,
+                vatRegistered: $vatRegistered,
+                vatRateBps: $vatRateBps,
+            );
+
             $lines[] = [
                 'product_id' => $product->getKey(),
                 'product_name' => $product->name,
                 'unit_price_cents' => $unitPriceCents,
                 'quantity' => $quantity,
                 'line_total_cents' => $lineTotalCents,
+                'beneficiary' => $beneficiaryIndex,
+                'net_of_vat_cents' => $netOfVatCents,
+                'discount_cents' => $discountCents,
+                'payable_cents' => $payableCents,
                 'add_ons' => $addOns,
             ];
 
@@ -288,6 +417,99 @@ class CheckoutAction
         }
 
         return [$lines, $subtotalCents];
+    }
+
+    /**
+     * One line's tax decomposition: [net_of_vat, statutory_discount,
+     * payable]. The four cases of the rule, in one place, each expressed
+     * through StatutoryTax rather than arithmetic of its own.
+     *
+     * @return array{0: int, 1: int, 2: int}
+     */
+    private function decomposeLine(
+        int $lineTotalCents,
+        bool $isBeneficiary,
+        bool $vatRegistered,
+        int $vatRateBps,
+    ): array {
+        if (! $vatRegistered) {
+            // No VAT was ever in the price, so the line's "net of VAT" is
+            // its full amount — NOT zero, which would read as "this line
+            // was worth nothing" (see the order_items migration).
+            $discountCents = $isBeneficiary
+                ? StatutoryTax::percentageOf($lineTotalCents, StatutoryTax::statutoryDiscountBps())
+                : 0;
+
+            return [$lineTotalCents, $discountCents, $lineTotalCents - $discountCents];
+        }
+
+        $netOfVatCents = StatutoryTax::netOfVat($lineTotalCents, $vatRateBps);
+
+        if (! $isBeneficiary) {
+            // The VAT stays in what this customer pays; the split into
+            // vatable_sales + vat is a reporting decomposition of the same
+            // money, not a reduction of it.
+            return [$netOfVatCents, 0, $lineTotalCents];
+        }
+
+        // A beneficiary is relieved of BOTH the VAT and a further 20% —
+        // which is why the discount is taken off the NET, never off the
+        // shelf price. The net itself becomes VAT-exempt sales.
+        $discountCents = StatutoryTax::percentageOf($netOfVatCents, StatutoryTax::statutoryDiscountBps());
+
+        return [$netOfVatCents, $discountCents, $netOfVatCents - $discountCents];
+    }
+
+    /**
+     * Rolls the per-line figures up into the order's four sales buckets.
+     *
+     * A VAT-registered order populates the first three and leaves
+     * nonvat_sales at zero; a non-VAT order does the exact reverse. They
+     * are kept apart rather than merged because "sales we owe VAT on" and
+     * "sales we don't" are the two numbers a BIR filing asks for.
+     *
+     * @param  list<array{line_total_cents: int, beneficiary: int|null, net_of_vat_cents: int, discount_cents: int, payable_cents: int}>  $lines
+     * @return array{vatable_sales_cents: int, vat_cents: int, vat_exempt_sales_cents: int, nonvat_sales_cents: int}
+     */
+    private function salesBuckets(array $lines, bool $vatRegistered): array
+    {
+        $buckets = [
+            'vatable_sales_cents' => 0,
+            'vat_cents' => 0,
+            'vat_exempt_sales_cents' => 0,
+            'nonvat_sales_cents' => 0,
+        ];
+
+        foreach ($lines as $line) {
+            if (! $vatRegistered) {
+                // Every line, beneficiary or not, is non-VAT sales. Booked
+                // at the PRE-discount amount, exactly as vatable_sales and
+                // vat_exempt_sales are for a VAT merchant: these buckets
+                // partition the order's SUBTOTAL by tax treatment, and the
+                // discounts are reported separately.
+                $buckets['nonvat_sales_cents'] += $line['line_total_cents'];
+
+                continue;
+            }
+
+            if ($line['beneficiary'] !== null) {
+                // No VAT is due on a beneficiary's line at all — the net
+                // is the exempt sale, and the VAT that would have been on
+                // it is simply never collected.
+                $buckets['vat_exempt_sales_cents'] += $line['net_of_vat_cents'];
+
+                continue;
+            }
+
+            $buckets['vatable_sales_cents'] += $line['net_of_vat_cents'];
+
+            // Derived by subtraction, per line, so the buckets always add
+            // back up to the line totals they came from — see
+            // StatutoryTax::vatOn().
+            $buckets['vat_cents'] += $line['line_total_cents'] - $line['net_of_vat_cents'];
+        }
+
+        return $buckets;
     }
 
     /**
@@ -335,13 +557,75 @@ class CheckoutAction
     }
 
     /**
+     * Writes one row per declared beneficiary, with THAT beneficiary's own
+     * totals rolled up from the lines assigned to them, and returns the
+     * payload-index => database-id map the lines need.
+     *
+     * The totals are stored rather than derived on read for the same
+     * reason line_total_cents is: the figure printed on the slip must
+     * still be the figure years later. Because they are summed here from
+     * the very lines that are about to be written, in the same
+     * transaction, they can never disagree with those lines.
+     *
+     * Every declared beneficiary is guaranteed to own at least one line —
+     * CheckoutRequest rejects the alternative with `beneficiary_unused`
+     * before this runs — so no row written here is ever a zero-discount
+     * orphan.
+     *
+     * @param  list<array{type: string, name: string, id_number: string}>  $beneficiaries
+     * @param  list<array{beneficiary: int|null, net_of_vat_cents: int, discount_cents: int}>  $lines
+     * @return array<int, int> payload index => order_beneficiaries.id
+     */
+    private function persistBeneficiaries(Order $order, array $beneficiaries, array $lines): array
+    {
+        $ids = [];
+
+        foreach ($beneficiaries as $index => $beneficiary) {
+            $discountCents = 0;
+            $vatExemptSalesCents = 0;
+
+            foreach ($lines as $line) {
+                if ($line['beneficiary'] !== (int) $index) {
+                    continue;
+                }
+
+                $discountCents += $line['discount_cents'];
+
+                // Only meaningful on a VAT-registered order; on a non-VAT
+                // one every line's statutory discount is computed off the
+                // gross and there is no exempt sale to record, so this
+                // stays 0 — which is why it reads the order's snapshot
+                // rather than assuming.
+                if ($order->vat_registered_snapshot) {
+                    $vatExemptSalesCents += $line['net_of_vat_cents'];
+                }
+            }
+
+            /** @var OrderBeneficiary $record */
+            $record = $order->beneficiaries()->create([
+                'type' => BeneficiaryType::from($beneficiary['type']),
+                'name' => $beneficiary['name'],
+                'id_number' => $beneficiary['id_number'],
+                'discount_cents' => $discountCents,
+                'vat_exempt_sales_cents' => $vatExemptSalesCents,
+            ]);
+
+            $ids[(int) $index] = (int) $record->getKey();
+        }
+
+        return $ids;
+    }
+
+    /**
      * @param  list<array{
      *     product_id: int, product_name: string, unit_price_cents: int,
-     *     quantity: int, line_total_cents: int,
+     *     quantity: int, line_total_cents: int, beneficiary: int|null,
+     *     net_of_vat_cents: int, discount_cents: int, payable_cents: int,
      *     add_ons: list<array{name: string, price_cents: int}>
      * }>  $lines
+     * @param  array<int, int>  $beneficiaryIds  payload index => database id
      */
-    private function persistLines(Order $order, array $lines): void
+    private function persistLines(Order $order, array $lines, array $beneficiaryIds = []): void
     {
         foreach ($lines as $line) {
             /** @var OrderItem $item */
@@ -351,6 +635,14 @@ class CheckoutAction
                 'unit_price_cents' => $line['unit_price_cents'],
                 'quantity' => $line['quantity'],
                 'line_total_cents' => $line['line_total_cents'],
+
+                'beneficiary_id' => $line['beneficiary'] === null
+                    ? null
+                    : ($beneficiaryIds[$line['beneficiary']] ?? null),
+
+                'net_of_vat_cents' => $line['net_of_vat_cents'],
+                'discount_cents' => $line['discount_cents'],
+                'payable_cents' => $line['payable_cents'],
             ]);
 
             foreach ($line['add_ons'] as $addOn) {

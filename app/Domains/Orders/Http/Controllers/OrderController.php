@@ -34,7 +34,7 @@ class OrderController extends Controller
         $query = Order::query()
             // Eager loaded rather than lazy: an order list of 25 rows with
             // items and add-ons is 3 queries this way and 51 without.
-            ->with(['items.addOns'])
+            ->with(['items.addOns', 'beneficiaries'])
 
             // Newest first. The tiebreak on id is not cosmetic — two
             // orders rung up in the same second would otherwise come back
@@ -64,7 +64,7 @@ class OrderController extends Controller
     {
         $this->authorize('view', $order);
 
-        return new OrderResource($order->load(['items.addOns']));
+        return new OrderResource($order->load(['items.addOns', 'beneficiaries']));
     }
 
     /**
@@ -79,6 +79,6 @@ class OrderController extends Controller
     {
         $this->authorize('view', $order);
 
-        return new ReceiptResource($order->load(['items.addOns', 'createdBy', 'merchant']));
+        return new ReceiptResource($order->load(['items.addOns', 'beneficiaries', 'createdBy', 'merchant']));
     }
 }

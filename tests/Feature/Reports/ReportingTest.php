@@ -482,3 +482,155 @@ test('top-items runs a bounded, small number of queries regardless of item count
     expect($large)->toBe($small)
         ->and($large)->toBeLessThanOrEqual(5);
 });
+
+/*
+|--------------------------------------------------------------------------
+| Statutory / VAT totals (P10)
+|--------------------------------------------------------------------------
+|
+| Additive fields on the SAME report class, under the same accounting
+| rules as every figure beside them — voided orders excluded, pending
+| included.
+|
+| Fixture, BY HAND (a VAT-registered shop, ₱140.00 latte = 14000 incl VAT,
+| and a 20% senior discount at 12% VAT):
+|
+|   A. pending, senior line + ordinary line
+|        senior:   14000 -> net 12500, disc 2500, pay 10000
+|        ordinary: 14000 -> vatable 12500, vat 1500, pay 14000
+|        subtotal 28000; statutory relief = 14000 - 10000 = 4000
+|        promo 0; discount 4000; total 24000
+|        vatable 12500, vat 1500, vat_exempt 12500
+|
+|   B. completed, one ordinary line, ₱5.00 promo
+|        subtotal 14000; vatable 12500; vat 1500; vat_exempt 0
+|        statutory 0; promo 500; discount 500; total 13500
+|
+|   C. VOIDED, senior line — excluded from EVERY figure below
+|        (its 4000 statutory discount and 12500 exempt sales must not
+|         appear anywhere)
+|
+|   Totals over A + B only:
+|     statutory_discount = 4000 + 0    = 4000
+|     promo_discount     =    0 + 500  =  500
+|     discount_cents     = 4000 + 500  = 4500   (the pre-P10 field)
+|     vatable_sales      = 12500 + 12500 = 25000
+|     vat                =  1500 +  1500 =  3000
+|     vat_exempt_sales   = 12500 +     0 = 12500
+|     nonvat_sales       = 0             (a VAT-registered shop)
+*/
+test('sales-summary reports hand-computed statutory and VAT totals, voided excluded', function () {
+    $this->merchant->update(['vat_registered' => true]);
+
+    $latte = Product::factory()->create([
+        'merchant_id' => $this->merchant->id,
+        'name' => 'Cafe Latte (16oz)',
+        'price_cents' => 14000,
+    ]);
+
+    $checkout = fn (array $payload) => $this->withToken($this->token)
+        ->postJson('/api/v1/merchant/orders', $payload)->assertCreated();
+
+    // A — pending, a senior and a full-price line.
+    $checkout([
+        'payment_method' => 'cash',
+        'beneficiaries' => [['type' => 'senior', 'name' => 'Lola', 'id_number' => 'SC-1']],
+        'items' => [
+            ['product_id' => $latte->id, 'quantity' => 1, 'beneficiary' => 0],
+            ['product_id' => $latte->id, 'quantity' => 1],
+        ],
+    ]);
+
+    // B — a plain promo-discounted sale, then completed.
+    $orderB = $checkout([
+        'payment_method' => 'cash',
+        'discount_cents' => 500,
+        'items' => [['product_id' => $latte->id, 'quantity' => 1]],
+    ])->json('id');
+
+    $this->withToken($this->token)->postJson("/api/v1/merchant/orders/{$orderB}/complete")->assertOk();
+
+    // C — a discounted sale that is then VOIDED. Every figure must ignore it.
+    $orderC = $checkout([
+        'payment_method' => 'cash',
+        'beneficiaries' => [['type' => 'senior', 'name' => 'Lolo', 'id_number' => 'SC-2']],
+        'items' => [['product_id' => $latte->id, 'quantity' => 1, 'beneficiary' => 0]],
+    ])->json('id');
+
+    $this->withToken($this->token)->postJson("/api/v1/merchant/orders/{$orderC}/void")->assertOk();
+
+    ($this->summary)()
+        ->assertOk()
+        ->assertJsonPath('orders_count', 3)
+        ->assertJsonPath('voided_count', 1)
+
+        // The pre-P10 field still reports every peso off, voided excluded.
+        ->assertJsonPath('discount_cents', 4500)
+
+        ->assertJsonPath('statutory_discount_cents', 4000)
+        ->assertJsonPath('statutory_discount_formatted', '₱40.00')
+        ->assertJsonPath('promo_discount_cents', 500)
+        ->assertJsonPath('vatable_sales_cents', 25000)
+        ->assertJsonPath('vat_cents', 3000)
+        ->assertJsonPath('vat_formatted', '₱30.00')
+        ->assertJsonPath('vat_exempt_sales_cents', 12500)
+        ->assertJsonPath('nonvat_sales_cents', 0);
+});
+
+test('sales-summary reports nonvat_sales for a non-VAT merchant', function () {
+    // The merchant fixture is non-VAT by default.
+    $latte = Product::factory()->create([
+        'merchant_id' => $this->merchant->id,
+        'name' => 'Cafe Latte (16oz)',
+        'price_cents' => 14000,
+    ]);
+
+    // BY HAND: one senior line (14000, 20% = 2800 off) and one ordinary.
+    // subtotal 28000; nonvat_sales 28000; statutory 2800; every VAT field 0.
+    $this->withToken($this->token)->postJson('/api/v1/merchant/orders', [
+        'payment_method' => 'cash',
+        'beneficiaries' => [['type' => 'pwd', 'name' => 'Juan', 'id_number' => 'PWD-1']],
+        'items' => [
+            ['product_id' => $latte->id, 'quantity' => 1, 'beneficiary' => 0],
+            ['product_id' => $latte->id, 'quantity' => 1],
+        ],
+    ])->assertCreated();
+
+    ($this->summary)()
+        ->assertOk()
+        ->assertJsonPath('nonvat_sales_cents', 28000)
+        ->assertJsonPath('vatable_sales_cents', 0)
+        ->assertJsonPath('vat_cents', 0)
+        ->assertJsonPath('vat_exempt_sales_cents', 0)
+        ->assertJsonPath('statutory_discount_cents', 2800)
+        ->assertJsonPath('promo_discount_cents', 0)
+        ->assertJsonPath('discount_cents', 2800);
+});
+
+test('the statutory totals stay a single aggregate query', function () {
+    // P10 added six sums to the SAME conditional-aggregate row, not six
+    // more queries — the property § Reporting promises.
+    $latte = Product::factory()->create([
+        'merchant_id' => $this->merchant->id,
+        'price_cents' => 14000,
+    ]);
+
+    foreach (range(1, 4) as $ignored) {
+        $this->withToken($this->token)->postJson('/api/v1/merchant/orders', [
+            'payment_method' => 'cash',
+            'beneficiaries' => [['type' => 'senior', 'name' => 'Lola', 'id_number' => 'SC-1']],
+            'items' => [['product_id' => $latte->id, 'quantity' => 1, 'beneficiary' => 0]],
+        ])->assertCreated();
+    }
+
+    $queries = 0;
+    DB::listen(function () use (&$queries) {
+        $queries++;
+    });
+
+    ($this->summary)()->assertOk();
+
+    // Flat in the size of the dataset: the same budget the pre-P10
+    // assertions in this file establish (auth/token lookups included).
+    expect($queries)->toBeLessThanOrEqual(6);
+});

@@ -147,3 +147,65 @@ test('an unauthenticated profile request is 401 JSON, never a redirect', functio
 
     expect($response->headers->get('Location'))->toBeNull();
 });
+
+/*
+|--------------------------------------------------------------------------
+| VAT registration (P10)
+|--------------------------------------------------------------------------
+|
+| Whether a shop is VAT-registered is ordinary profile data it maintains
+| about itself — unlike `status`, which only a platform admin moves.
+*/
+
+test('vat_registered defaults to false and is returned by GET profile', function () {
+    $this->withToken($this->token)
+        ->getJson('/api/v1/merchant/profile')
+        ->assertOk()
+        ->assertJsonPath('vat_registered', false);
+
+    expect($this->merchant->fresh()->vat_registered)->toBeFalse();
+});
+
+test('PATCH profile toggles vat_registered', function () {
+    $this->withToken($this->token)
+        ->patchJson('/api/v1/merchant/profile', ['vat_registered' => true])
+        ->assertOk()
+        ->assertJsonPath('vat_registered', true);
+
+    expect($this->merchant->fresh()->vat_registered)->toBeTrue();
+
+    $this->withToken($this->token)
+        ->patchJson('/api/v1/merchant/profile', ['vat_registered' => false])
+        ->assertOk()
+        ->assertJsonPath('vat_registered', false);
+
+    expect($this->merchant->fresh()->vat_registered)->toBeFalse();
+});
+
+test('PATCH profile validates vat_registered as a boolean', function () {
+    $this->withToken($this->token)
+        ->patchJson('/api/v1/merchant/profile', ['vat_registered' => 'maybe'])
+        ->assertStatus(422)
+        ->assertJsonPath('code', 'validation_failed')
+        ->assertJsonValidationErrors('vat_registered');
+});
+
+test('omitting vat_registered leaves it untouched', function () {
+    $this->merchant->update(['vat_registered' => true]);
+
+    $this->withToken($this->token)
+        ->patchJson('/api/v1/merchant/profile', ['legal_name' => 'Something Else'])
+        ->assertOk()
+        ->assertJsonPath('vat_registered', true);
+
+    expect($this->merchant->fresh()->vat_registered)->toBeTrue();
+});
+
+test('the /auth/me merchant summary carries vat_registered', function () {
+    $this->merchant->update(['vat_registered' => true]);
+
+    $this->withToken($this->token)
+        ->getJson('/api/v1/auth/me')
+        ->assertOk()
+        ->assertJsonPath('merchant.vat_registered', true);
+});

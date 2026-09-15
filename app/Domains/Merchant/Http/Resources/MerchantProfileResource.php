@@ -41,6 +41,11 @@ class MerchantProfileResource extends JsonResource
             'receipt_footer' => $this->receipt_footer,
             'timezone' => $this->timezone,
 
+            // P10: whether this shop is VAT-registered, which decides how
+            // its sales are decomposed for tax. Additive; editable
+            // through PATCH /merchant/profile.
+            'vat_registered' => $this->vat_registered,
+
             'created_at' => $this->created_at->toISOString(),
             'updated_at' => $this->updated_at->toISOString(),
         ];

@@ -52,7 +52,7 @@ class CheckoutController extends Controller
             $cashier,
         );
 
-        $response = OrderResource::make($result->order->load(['items.addOns']))
+        $response = OrderResource::make($result->order->load(['items.addOns', 'beneficiaries']))
             ->response()
             // 201 for a sale that happened, 200 for one that already had.
             // A replay must not claim to have created anything: a POS that

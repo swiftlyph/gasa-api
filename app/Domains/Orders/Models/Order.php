@@ -47,6 +47,14 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
  * @property PaymentMethod $payment_method
  * @property int|null $cash_cents
  * @property int|null $gcash_cents
+ * @property bool $vat_registered_snapshot
+ * @property int $vat_rate_bps_snapshot
+ * @property int $vatable_sales_cents
+ * @property int $vat_cents
+ * @property int $vat_exempt_sales_cents
+ * @property int $nonvat_sales_cents
+ * @property int $statutory_discount_cents
+ * @property int $promo_discount_cents
  * @property int $created_by_user_id
  * @property int|null $cash_session_id
  * @property CarbonInterface|null $completed_at
@@ -96,6 +104,20 @@ class Order extends Model
         // for every order created before P4 (not backfilled; see
         // add_cash_session_id_to_orders_table).
         'cash_session_id',
+
+        // P10: the tax decomposition, all snapshotted at checkout by
+        // CheckoutAction. `discount_cents` above KEEPS its existing
+        // meaning — every peso off the order — and the two new discount
+        // columns say why; a CHECK constraint enforces that they sum to
+        // it (see add_tax_columns_to_orders_table).
+        'vat_registered_snapshot',
+        'vat_rate_bps_snapshot',
+        'vatable_sales_cents',
+        'vat_cents',
+        'vat_exempt_sales_cents',
+        'nonvat_sales_cents',
+        'statutory_discount_cents',
+        'promo_discount_cents',
     ];
 
     /**
@@ -121,6 +143,14 @@ class Order extends Model
             'cash_cents' => 'integer',
             'gcash_cents' => 'integer',
             'cash_session_id' => 'integer',
+            'vat_registered_snapshot' => 'boolean',
+            'vat_rate_bps_snapshot' => 'integer',
+            'vatable_sales_cents' => 'integer',
+            'vat_cents' => 'integer',
+            'vat_exempt_sales_cents' => 'integer',
+            'nonvat_sales_cents' => 'integer',
+            'statutory_discount_cents' => 'integer',
+            'promo_discount_cents' => 'integer',
             'completed_at' => 'datetime',
             'voided_at' => 'datetime',
         ];
@@ -132,6 +162,19 @@ class Order extends Model
     public function items(): HasMany
     {
         return $this->hasMany(OrderItem::class);
+    }
+
+    /**
+     * The senior citizens / PWDs who claimed a statutory discount on this
+     * order (P10). Usually empty; one row per beneficiary, never per
+     * line — a group order can carry two, each entitled only to 20% off
+     * their OWN lines.
+     *
+     * @return HasMany<OrderBeneficiary, $this>
+     */
+    public function beneficiaries(): HasMany
+    {
+        return $this->hasMany(OrderBeneficiary::class);
     }
 
     /**

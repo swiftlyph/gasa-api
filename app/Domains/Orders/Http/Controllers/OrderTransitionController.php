@@ -31,7 +31,7 @@ class OrderTransitionController extends Controller
 
         $completed = $action->execute($order);
 
-        return new OrderResource($completed->load(['items.addOns']));
+        return new OrderResource($completed->load(['items.addOns', 'beneficiaries']));
     }
 
     public function void(Request $request, Order $order, VoidOrderAction $action): OrderResource
@@ -47,6 +47,6 @@ class OrderTransitionController extends Controller
         // request. Who voided the order is an input to the operation.
         $voided = $action->execute($order, $user);
 
-        return new OrderResource($voided->load(['items.addOns']));
+        return new OrderResource($voided->load(['items.addOns', 'beneficiaries']));
     }
 }

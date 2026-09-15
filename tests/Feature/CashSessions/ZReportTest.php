@@ -394,3 +394,121 @@ function attachZReportMember(Merchant $merchant, string $role): array
 
     return [$user, $user->createToken('merchant')->plainTextToken];
 }
+
+/*
+|--------------------------------------------------------------------------
+| Statutory / VAT totals on the shift report (P10)
+|--------------------------------------------------------------------------
+|
+| Same additive fields as sales-summary, attributed by cash_session_id.
+| A Z-report and a date-range report over the SAME orders must never
+| disagree about what those orders were worth, tax included.
+|
+| Fixture, BY HAND (VAT-registered, latte 10000 incl VAT at 12%):
+|   10000 / 1.12 = 8928.571… -> 8929 (half-up); vat = 10000 - 8929 = 1071
+|   20% of 8929  = 1785.8    -> 1786;  payable = 8929 - 1786 = 7143
+|
+|   A. senior line + ordinary line, pending
+|        subtotal 20000
+|        statutory relief = 10000 - 7143 = 2857
+|        vat_exempt 8929; vatable 8929; vat 1071
+|        total = 20000 - 2857 = 17143
+|   B. VOIDED senior line — excluded from every figure
+|
+|   Totals: statutory 2857, promo 0, vatable 8929, vat 1071,
+|           vat_exempt 8929, nonvat 0
+*/
+test('the Z-report carries hand-computed statutory and VAT totals, voided excluded', function () {
+    $this->merchant->update(['vat_registered' => true]);
+
+    $sessionId = ($this->open)()->assertCreated()->json('id');
+
+    ($this->checkout)([
+        'payment_method' => 'cash',
+        'beneficiaries' => [['type' => 'senior', 'name' => 'Lola Remedios', 'id_number' => 'SC-2020-0001']],
+        'items' => [
+            ['product_id' => $this->product->id, 'quantity' => 1, 'beneficiary' => 0],
+            ['product_id' => $this->product->id, 'quantity' => 1],
+        ],
+    ])->assertCreated();
+
+    $voided = ($this->checkout)([
+        'payment_method' => 'cash',
+        'beneficiaries' => [['type' => 'pwd', 'name' => 'Juan Cruz', 'id_number' => 'PWD-1']],
+        'items' => [['product_id' => $this->product->id, 'quantity' => 1, 'beneficiary' => 0]],
+    ])->assertCreated()->json('id');
+
+    $this->withToken($this->token)->postJson("/api/v1/merchant/orders/{$voided}/void")->assertOk();
+
+    ($this->zReport)($sessionId)
+        ->assertOk()
+        ->assertJsonPath('sales.voided_count', 1)
+        // The pre-P10 field is unchanged: every peso off, voided excluded.
+        ->assertJsonPath('sales.discounts_cents', 2857)
+        ->assertJsonPath('sales.statutory_discount_cents', 2857)
+        ->assertJsonPath('sales.statutory_discount_formatted', '₱28.57')
+        ->assertJsonPath('sales.promo_discount_cents', 0)
+        ->assertJsonPath('sales.vatable_sales_cents', 8929)
+        ->assertJsonPath('sales.vat_cents', 1071)
+        ->assertJsonPath('sales.vat_exempt_sales_cents', 8929)
+        ->assertJsonPath('sales.nonvat_sales_cents', 0)
+        ->assertJsonPath('sales.net_cents', 17143);
+});
+
+test('a non-VAT shift reports nonvat_sales and no VAT', function () {
+    $sessionId = ($this->open)()->assertCreated()->json('id');
+
+    // BY HAND, non-VAT: 10000 × 20% = 2000 off the senior's drink.
+    // subtotal 20000; nonvat_sales 20000; statutory 2000; total 18000.
+    ($this->checkout)([
+        'payment_method' => 'cash',
+        'beneficiaries' => [['type' => 'senior', 'name' => 'Lola', 'id_number' => 'SC-1']],
+        'items' => [
+            ['product_id' => $this->product->id, 'quantity' => 1, 'beneficiary' => 0],
+            ['product_id' => $this->product->id, 'quantity' => 1],
+        ],
+    ])->assertCreated();
+
+    ($this->zReport)($sessionId)
+        ->assertOk()
+        ->assertJsonPath('sales.nonvat_sales_cents', 20000)
+        ->assertJsonPath('sales.vatable_sales_cents', 0)
+        ->assertJsonPath('sales.vat_cents', 0)
+        ->assertJsonPath('sales.vat_exempt_sales_cents', 0)
+        ->assertJsonPath('sales.statutory_discount_cents', 2000)
+        ->assertJsonPath('sales.net_cents', 18000);
+});
+
+/*
+|--------------------------------------------------------------------------
+| Reconciliation is untouched by this phase (P10)
+|--------------------------------------------------------------------------
+*/
+test('a senior-discounted cash sale contributes exactly its total to expected cash', function () {
+    // The point: reconciliation derives expected cash from what was PAID
+    // — totals only — so a statutory discount reduces the drawer by
+    // reducing the total, and by nothing else. Not the subtotal, not the
+    // pre-discount amount, not the discount subtracted twice.
+    $sessionId = ($this->open)(['opening_float_cents' => 100000])->assertCreated()->json('id');
+
+    // BY HAND, non-VAT merchant: one latte at 10000 for a senior.
+    //   statutory = 10000 × 20% = 2000; total = 8000.
+    // expected cash = float 100000 + 8000 = 108000. Nothing else.
+    ($this->checkout)([
+        'payment_method' => 'cash',
+        'beneficiaries' => [['type' => 'senior', 'name' => 'Lola', 'id_number' => 'SC-1']],
+        'items' => [['product_id' => $this->product->id, 'quantity' => 1, 'beneficiary' => 0]],
+    ])->assertCreated()
+        ->assertJsonPath('total_cents', 8000)
+        ->assertJsonPath('discount_cents', 2000);
+
+    ($this->zReport)($sessionId)
+        ->assertOk()
+        ->assertJsonPath('cash.cash_sales_gross_cents', 8000)
+        ->assertJsonPath('cash.expected_cash_cents', 108000);
+
+    $this->withToken($this->token)
+        ->getJson("/api/v1/merchant/cash-sessions/{$sessionId}")
+        ->assertOk()
+        ->assertJsonPath('reconciliation.expected_cash_cents', 108000);
+});

@@ -44,6 +44,17 @@ class OrderItemResource extends JsonResource
             'line_total_cents' => $this->line_total_cents,
             'line_total_formatted' => Money::format($this->line_total_cents, $this->currency),
 
+            // P10. `line_total_cents` above is unchanged — the
+            // pre-discount, VAT-inclusive amount charged for the line.
+            // These say what the statutory (senior/PWD) discount took off
+            // it and what is actually owed; `discount_cents` is 0 on every
+            // ordinary line, and the order-level promo never appears here.
+            'beneficiary_id' => $this->beneficiary_id,
+            'discount_cents' => $this->discount_cents,
+            'discount_formatted' => Money::format($this->discount_cents, $this->currency),
+            'payable_cents' => $this->payable_cents,
+            'payable_formatted' => Money::format($this->payable_cents, $this->currency),
+
             'add_ons' => $this->addOns->map(
                 fn ($addOn) => new OrderItemAddOnResource($addOn, $this->currency),
             )->values(),

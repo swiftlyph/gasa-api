@@ -241,3 +241,118 @@ test('the receipt endpoint runs a bounded, small number of queries — no N+1', 
 
     expect($large)->toBe($small);
 });
+
+/*
+|--------------------------------------------------------------------------
+| The statutory block (P10)
+|--------------------------------------------------------------------------
+|
+| The slip has to print who claimed a discount, the ID they presented, and
+| what it saved them — and it has to state the VAT position rather than
+| leave it to be inferred from zeroes.
+*/
+
+test('a VAT-registered order prints the VAT block and every beneficiary', function () {
+    $this->merchant->update(['vat_registered' => true]);
+
+    $latte = Product::factory()->create([
+        'merchant_id' => $this->merchant->id,
+        'name' => 'Cafe Latte (16oz)',
+        'price_cents' => 14000,
+    ]);
+
+    // BY HAND, 12% VAT / 20% discount, one latte for a senior and one for
+    // nobody:
+    //   senior line: net = 14000/1.12 = 12500, disc = 2500, pay = 10000
+    //   other line:  vatable 12500, vat 1500, pay 14000
+    //   subtotal 28000; statutory relief = 14000 − 10000 = 4000
+    //   total = 28000 − 4000 = 24000
+    $orderId = $this->withToken($this->token)
+        ->postJson('/api/v1/merchant/orders', [
+            'payment_method' => 'cash',
+            'beneficiaries' => [['type' => 'senior', 'name' => 'Lola Remedios', 'id_number' => 'SC-2020-0001']],
+            'items' => [
+                ['product_id' => $latte->id, 'quantity' => 1, 'beneficiary' => 0],
+                ['product_id' => $latte->id, 'quantity' => 1],
+            ],
+        ])->assertCreated()->json('id');
+
+    ($this->receipt)($orderId)->assertOk()
+        ->assertJsonPath('order.tax.vat_registered', true)
+        ->assertJsonPath('order.tax.vat_rate_bps', 1200)
+        ->assertJsonPath('order.tax.vatable_sales_cents', 12500)
+        ->assertJsonPath('order.tax.vat_cents', 1500)
+        ->assertJsonPath('order.tax.vat_formatted', '₱15.00')
+        ->assertJsonPath('order.tax.vat_exempt_sales_cents', 12500)
+        // A VAT slip must NOT carry the non-VAT note.
+        ->assertJsonMissingPath('order.tax.non_vat_note')
+
+        ->assertJsonCount(1, 'order.beneficiaries')
+        ->assertJsonPath('order.beneficiaries.0.type', 'senior')
+        ->assertJsonPath('order.beneficiaries.0.type_label', 'Senior Citizen')
+        ->assertJsonPath('order.beneficiaries.0.name', 'Lola Remedios')
+        ->assertJsonPath('order.beneficiaries.0.id_number', 'SC-2020-0001')
+        ->assertJsonPath('order.beneficiaries.0.discount_cents', 2500)
+        ->assertJsonPath('order.beneficiaries.0.discount_formatted', '₱25.00')
+
+        ->assertJsonPath('order.statutory_discount_cents', 4000)
+        ->assertJsonPath('order.promo_discount_cents', 0)
+        ->assertJsonPath('order.total_cents', 24000)
+
+        // Per line, so a slip can show what each drink actually cost.
+        ->assertJsonPath('order.lines.0.discount_cents', 2500)
+        ->assertJsonPath('order.lines.0.payable_cents', 10000)
+        ->assertJsonPath('order.lines.1.discount_cents', 0)
+        ->assertJsonPath('order.lines.1.payable_cents', 14000);
+});
+
+test('a non-VAT order prints the Non-VAT note and no VAT lines', function () {
+    // The merchant fixture is non-VAT by default (the column's default).
+    $latte = Product::factory()->create([
+        'merchant_id' => $this->merchant->id,
+        'name' => 'Cafe Latte (16oz)',
+        'price_cents' => 14000,
+    ]);
+
+    // BY HAND: 14000 × 20% = 2800 off the senior's latte.
+    $orderId = $this->withToken($this->token)
+        ->postJson('/api/v1/merchant/orders', [
+            'payment_method' => 'cash',
+            'beneficiaries' => [['type' => 'pwd', 'name' => 'Juan Cruz', 'id_number' => 'PWD-1234-5678']],
+            'items' => [['product_id' => $latte->id, 'quantity' => 1, 'beneficiary' => 0]],
+        ])->assertCreated()->json('id');
+
+    ($this->receipt)($orderId)->assertOk()
+        ->assertJsonPath('order.tax.vat_registered', false)
+        ->assertJsonPath('order.tax.non_vat_note', 'This is a NON-VAT registered sale.')
+        ->assertJsonPath('order.tax.nonvat_sales_cents', 14000)
+        // No VAT lines at all on a slip for a shop that charges none.
+        ->assertJsonMissingPath('order.tax.vat_cents')
+        ->assertJsonMissingPath('order.tax.vatable_sales_cents')
+        ->assertJsonMissingPath('order.tax.vat_exempt_sales_cents')
+
+        ->assertJsonPath('order.beneficiaries.0.type', 'pwd')
+        ->assertJsonPath('order.beneficiaries.0.type_label', 'Person with Disability')
+        ->assertJsonPath('order.beneficiaries.0.id_number', 'PWD-1234-5678')
+        ->assertJsonPath('order.beneficiaries.0.discount_cents', 2800)
+        ->assertJsonPath('order.total_cents', 11200);
+});
+
+test('an ordinary order still prints an empty beneficiary list', function () {
+    $order = Order::factory()->forMerchant($this->merchant, $this->user)->completed()->cash()
+        ->create(['subtotal_cents' => 10000, 'discount_cents' => 0, 'total_cents' => 10000]);
+
+    OrderItem::factory()->for($order)->create([
+        'product_name' => 'Americano',
+        'quantity' => 1,
+        'unit_price_cents' => 10000,
+        'line_total_cents' => 10000,
+        'net_of_vat_cents' => 10000,
+        'payable_cents' => 10000,
+    ]);
+
+    ($this->receipt)($order->id)->assertOk()
+        ->assertJsonCount(0, 'order.beneficiaries')
+        ->assertJsonPath('order.tax.vat_registered', false)
+        ->assertJsonPath('order.statutory_discount_cents', 0);
+});

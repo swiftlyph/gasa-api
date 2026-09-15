@@ -28,6 +28,7 @@ class UpdateMerchantProfileAction
      *     tax_identifier?: string|null,
      *     receipt_header?: string|null,
      *     receipt_footer?: string|null,
+     *     vat_registered?: bool,
      * }  $payload
      */
     public function execute(Merchant $merchant, array $payload): Merchant

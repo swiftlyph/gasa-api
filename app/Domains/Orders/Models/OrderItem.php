@@ -30,6 +30,10 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
  * @property int $unit_price_cents
  * @property int $quantity
  * @property int $line_total_cents
+ * @property int|null $beneficiary_id
+ * @property int $net_of_vat_cents
+ * @property int $discount_cents
+ * @property int $payable_cents
  */
 class OrderItem extends Model
 {
@@ -46,6 +50,15 @@ class OrderItem extends Model
         'unit_price_cents',
         'quantity',
         'line_total_cents',
+
+        // P10. `line_total_cents` above is UNCHANGED — still the
+        // pre-discount, VAT-inclusive amount charged for the line. These
+        // decompose it: `discount_cents` is this line's STATUTORY
+        // (senior/PWD) discount only, never the order-level promo.
+        'beneficiary_id',
+        'net_of_vat_cents',
+        'discount_cents',
+        'payable_cents',
     ];
 
     protected static function newFactory(): OrderItemFactory
@@ -62,6 +75,10 @@ class OrderItem extends Model
             'unit_price_cents' => 'integer',
             'quantity' => 'integer',
             'line_total_cents' => 'integer',
+            'beneficiary_id' => 'integer',
+            'net_of_vat_cents' => 'integer',
+            'discount_cents' => 'integer',
+            'payable_cents' => 'integer',
         ];
     }
 
@@ -82,6 +99,18 @@ class OrderItem extends Model
     public function product(): BelongsTo
     {
         return $this->belongsTo(Product::class);
+    }
+
+    /**
+     * The beneficiary this line was consumed by, if any (P10). Null for
+     * every ordinary line — most lines belong to nobody — and it is only
+     * a line with a beneficiary that ever carries a statutory discount.
+     *
+     * @return BelongsTo<OrderBeneficiary, $this>
+     */
+    public function beneficiary(): BelongsTo
+    {
+        return $this->belongsTo(OrderBeneficiary::class, 'beneficiary_id');
     }
 
     /**

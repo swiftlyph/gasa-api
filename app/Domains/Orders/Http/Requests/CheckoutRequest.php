@@ -2,7 +2,9 @@
 
 namespace App\Domains\Orders\Http\Requests;
 
+use App\Domains\Orders\Enums\BeneficiaryType;
 use App\Domains\Orders\Enums\PaymentMethod;
+use App\Domains\Orders\Exceptions\BeneficiaryUnused;
 use Illuminate\Foundation\Http\FormRequest;
 use Illuminate\Support\Arr;
 use Illuminate\Validation\Rule;
@@ -40,6 +42,14 @@ class CheckoutRequest extends FormRequest
      * radius of a bad or malicious payload until one exists.
      */
     public const MAX_ADD_ON_PRICE_CENTS = 1_000_000;
+
+    /**
+     * A cap on how many statutory beneficiaries one order may declare
+     * (P10). A table of eight seniors is a real thing; a basket claiming
+     * fifty is a client bug or an abuse attempt, and each one costs a row
+     * and a 20% discount.
+     */
+    public const MAX_BENEFICIARIES = 10;
 
     /**
      * The request header carrying the client-generated idempotency key.
@@ -109,7 +119,29 @@ class CheckoutRequest extends FormRequest
                 'min:1',
             ],
 
+            // P10: this is the PROMO (manual) discount, applied AFTER the
+            // statutory senior/PWD discounts. The field KEEPS ITS NAME so
+            // every POS already in the field keeps working unchanged —
+            // renaming it would break clients to say something they
+            // already meant. See README § Tax & statutory discounts.
             'discount_cents' => ['sometimes', 'integer', 'min:0'],
+
+            // P10: the senior citizens / PWDs on this order. Positional —
+            // a line claims one by INDEX into this list (see
+            // items.*.beneficiary below), which is why `list` is enforced:
+            // a JSON object would arrive with client-controlled keys and
+            // the indexes would stop meaning what the lines think they
+            // mean.
+            'beneficiaries' => ['sometimes', 'array', 'list', 'max:'.self::MAX_BENEFICIARIES],
+            'beneficiaries.*.type' => ['required', Rule::enum(BeneficiaryType::class)],
+
+            // Both REQUIRED and non-empty: the discount is only lawful
+            // against a presented ID, and both print on the slip. `min:1`
+            // after `string` rejects "" and "   " (trimmed by Laravel's
+            // TrimStrings middleware) rather than storing a blank where a
+            // name should be.
+            'beneficiaries.*.name' => ['required', 'string', 'min:1', 'max:255'],
+            'beneficiaries.*.id_number' => ['required', 'string', 'min:1', 'max:60'],
 
             // P4: which till this sale is rung up on, for cash-session
             // attribution only — see CheckoutAction::resolveOpenCashSessionId().
@@ -129,6 +161,28 @@ class CheckoutRequest extends FormRequest
             'items.*.product_id' => ['required', 'integer', 'min:1'],
             'items.*.quantity' => ['required', 'integer', 'min:1', 'max:999'],
 
+            // P10: which declared beneficiary consumed this line, as an
+            // INDEX into `beneficiaries`. Most lines have none. Bounded
+            // by an explicit in-range check rather than just `integer`,
+            // so an index pointing past the end of the list is a
+            // validation error naming the line, not a silent null (which
+            // would quietly sell a senior's coffee at full price).
+            // `lt` against the DECLARED count, with no fallback: when no
+            // beneficiaries were declared the bound is 0, so every index
+            // is out of range and any line claiming one is rejected.
+            // (A `?: 1` fallback here would make index 0 legal on an
+            // order with nobody on it — a line silently claiming a person
+            // who does not exist, which is the whole thing this rule is
+            // for.) `prohibited_unless` can't express it: the bound
+            // depends on the length of another field, not its presence.
+            'items.*.beneficiary' => [
+                'sometimes',
+                'nullable',
+                'integer',
+                'min:0',
+                'lt:'.count((array) $this->input('beneficiaries', [])),
+            ],
+
             'items.*.add_ons' => ['sometimes', 'array', 'list', 'max:'.self::MAX_ADD_ONS_PER_ITEM],
             'items.*.add_ons.*.name' => ['required', 'string', 'min:1', 'max:100'],
             'items.*.add_ons.*.price_cents' => [
@@ -138,6 +192,54 @@ class CheckoutRequest extends FormRequest
                 'max:'.self::MAX_ADD_ON_PRICE_CENTS,
             ],
         ];
+    }
+
+    /**
+     * The cross-field rule that can't be expressed as a per-field rule:
+     * EVERY declared beneficiary must own at least one line.
+     *
+     * Runs only once the per-field rules have passed (passedValidation,
+     * not withValidator), so it can trust that `beneficiaries` is a list
+     * and every `items.*.beneficiary` is an in-range integer — and so a
+     * request that is malformed in both ways reports the shape problem
+     * first, which is the more actionable of the two.
+     *
+     * Throws BeneficiaryUnused (422 `beneficiary_unused`) rather than
+     * adding a validation error, because it is a distinct, actionable
+     * condition a client should be able to branch on — see that
+     * exception's docblock for why this is rejected rather than ignored.
+     */
+    protected function passedValidation(): void
+    {
+        /** @var list<array<string, mixed>> $beneficiaries */
+        $beneficiaries = $this->validated('beneficiaries', []);
+
+        if ($beneficiaries === []) {
+            return;
+        }
+
+        /** @var list<array<string, mixed>> $items */
+        $items = $this->validated('items', []);
+
+        $claimed = [];
+
+        foreach ($items as $item) {
+            if (isset($item['beneficiary'])) {
+                $claimed[(int) $item['beneficiary']] = true;
+            }
+        }
+
+        $unused = [];
+
+        foreach (array_keys($beneficiaries) as $index) {
+            if (! isset($claimed[(int) $index])) {
+                $unused[] = (int) $index;
+            }
+        }
+
+        if ($unused !== []) {
+            throw new BeneficiaryUnused($unused);
+        }
     }
 
     /**
@@ -175,9 +277,11 @@ class CheckoutRequest extends FormRequest
      *     gcash_cents?: int|null,
      *     discount_cents?: int|null,
      *     register_id?: int,
+     *     beneficiaries?: list<array{type: string, name: string, id_number: string}>,
      *     items: list<array{
      *         product_id: int,
      *         quantity: int,
+     *         beneficiary?: int|null,
      *         add_ons?: list<array{name: string, price_cents: int}>
      *     }>
      * }
@@ -191,7 +295,8 @@ class CheckoutRequest extends FormRequest
          *     gcash_cents?: int|null,
          *     discount_cents?: int|null,
          *     register_id?: int,
-         *     items: list<array{product_id: int, quantity: int, add_ons?: list<array{name: string, price_cents: int}>}>
+         *     beneficiaries?: list<array{type: string, name: string, id_number: string}>,
+         *     items: list<array{product_id: int, quantity: int, beneficiary?: int|null, add_ons?: list<array{name: string, price_cents: int}>}>
          * } $payload
          */
         $payload = Arr::except($this->validated(), ['idempotency_key']);
@@ -211,6 +316,9 @@ class CheckoutRequest extends FormRequest
             'gcash_cents.prohibited_unless' => 'A GCash amount may only be sent with a split payment.',
             'cash_cents.required_if' => 'A split payment needs a cash amount.',
             'gcash_cents.required_if' => 'A split payment needs a GCash amount.',
+            'beneficiaries.*.name.required' => 'A senior/PWD discount needs the beneficiary\'s name.',
+            'beneficiaries.*.id_number.required' => 'A senior/PWD discount needs the beneficiary\'s ID number.',
+            'items.*.beneficiary.lt' => 'This item names a beneficiary that was not declared.',
         ];
     }
 }

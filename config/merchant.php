@@ -24,4 +24,31 @@ return [
 
     'day_timezone' => env('MERCHANT_DAY_TIMEZONE', 'Asia/Manila'),
 
+    /*
+    |--------------------------------------------------------------------------
+    | Statutory Tax & Discount Constants (P10)
+    |--------------------------------------------------------------------------
+    |
+    | Philippine statutory figures, kept HERE rather than inline in any
+    | Action so an accountant can correct a rate without reading PHP. They
+    | are deliberately NOT per-merchant columns: the VAT rate and the
+    | senior/PWD discount rate are set by national law, identical for every
+    | merchant on the platform. What IS per-merchant is whether the shop is
+    | VAT-registered at all — that's `merchants.vat_registered`, a column.
+    |
+    | Expressed in BASIS POINTS (1/100th of a percent) so the arithmetic
+    | stays in integers end to end, exactly like every money value in this
+    | codebase: 12% VAT is 1200 bps, a 20% discount is 2000 bps. A float
+    | rate here would reintroduce the floating-point money the whole
+    | project bans, in the one place it would be least visible.
+    |
+    | Nothing reads these but App\Domains\Orders\Support\StatutoryTax —
+    | see its docblock for the formulas and the rounding rule.
+    |
+    */
+
+    'vat_rate_bps' => (int) env('MERCHANT_VAT_RATE_BPS', 1200),
+
+    'statutory_discount_bps' => (int) env('MERCHANT_STATUTORY_DISCOUNT_BPS', 2000),
+
 ];

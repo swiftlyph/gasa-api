@@ -3,6 +3,7 @@
 namespace App\Domains\Orders\Http\Resources;
 
 use App\Domains\Orders\Models\Order;
+use App\Domains\Orders\Models\OrderBeneficiary;
 use App\Domains\Shared\Support\Money;
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
@@ -58,6 +59,48 @@ class OrderResource extends JsonResource
             'voided_at' => $this->voided_at?->toISOString(),
             'created_at' => $this->created_at->toISOString(),
             'updated_at' => $this->updated_at->toISOString(),
+
+            // P10. `discount_cents` above KEEPS meaning "every peso off
+            // this order" (statutory + promo); this block says how that
+            // total was reached and how the sale decomposes for tax. Every
+            // figure is the order's OWN SNAPSHOT — `vat_registered` here
+            // is what the merchant was at SALE TIME, not what it is now,
+            // so toggling registration never rewrites a past order.
+            'tax' => [
+                'vat_registered' => $this->vat_registered_snapshot,
+                'vat_rate_bps' => $this->vat_rate_bps_snapshot,
+
+                'vatable_sales_cents' => $this->vatable_sales_cents,
+                'vatable_sales_formatted' => Money::format($this->vatable_sales_cents, $currency),
+                'vat_cents' => $this->vat_cents,
+                'vat_formatted' => Money::format($this->vat_cents, $currency),
+                'vat_exempt_sales_cents' => $this->vat_exempt_sales_cents,
+                'vat_exempt_sales_formatted' => Money::format($this->vat_exempt_sales_cents, $currency),
+                'nonvat_sales_cents' => $this->nonvat_sales_cents,
+                'nonvat_sales_formatted' => Money::format($this->nonvat_sales_cents, $currency),
+
+                'statutory_discount_cents' => $this->statutory_discount_cents,
+                'statutory_discount_formatted' => Money::format($this->statutory_discount_cents, $currency),
+                'promo_discount_cents' => $this->promo_discount_cents,
+                'promo_discount_formatted' => Money::format($this->promo_discount_cents, $currency),
+            ],
+
+            // Usually empty. One entry per person who claimed a statutory
+            // discount, never per line — the lines point back via
+            // `beneficiary_id`.
+            'beneficiaries' => $this->beneficiaries->map(
+                fn (OrderBeneficiary $beneficiary) => [
+                    'id' => $beneficiary->id,
+                    'type' => $beneficiary->type->value,
+                    'type_label' => $beneficiary->type->label(),
+                    'name' => $beneficiary->name,
+                    'id_number' => $beneficiary->id_number,
+                    'discount_cents' => $beneficiary->discount_cents,
+                    'discount_formatted' => Money::format($beneficiary->discount_cents, $currency),
+                    'vat_exempt_sales_cents' => $beneficiary->vat_exempt_sales_cents,
+                    'vat_exempt_sales_formatted' => Money::format($beneficiary->vat_exempt_sales_cents, $currency),
+                ],
+            )->values(),
 
             'items' => $this->items->map(
                 fn ($item) => new OrderItemResource($item, $currency),
