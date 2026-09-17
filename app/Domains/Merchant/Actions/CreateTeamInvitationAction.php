@@ -10,8 +10,13 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 
 /**
- * Generates a one-time invite token for a newly-added team member and
- * stores only its SHA-256 hash — see the team_invitations migration.
+ * Generates a one-time invite token and stores only its SHA-256 hash —
+ * see the team_invitations migration.
+ *
+ * `$merchant` is NULLABLE as of P11: POST /admin/users invites platform
+ * and company accounts, which belong to no merchant team. Redemption is
+ * unaffected — AcceptInviteAction resolves by token_hash alone and never
+ * reads merchant_id.
  *
  * No frontend-URL config exists yet to build a real link from: the only
  * frontend-adjacent config in this repo is FRONTEND_ORIGINS
@@ -33,14 +38,14 @@ class CreateTeamInvitationAction
     /**
      * @return array{token: string, expires_at: Carbon, invite_url: string}
      */
-    public function execute(Merchant $merchant, User $user): array
+    public function execute(?Merchant $merchant, User $user): array
     {
         $plaintext = Str::random(40);
         $hash = hash('sha256', $plaintext);
         $expiresAt = now()->addHours(72);
 
         TeamInvitation::query()->create([
-            'merchant_id' => $merchant->getKey(),
+            'merchant_id' => $merchant?->getKey(),
             'user_id' => $user->getKey(),
             'token_hash' => $hash,
             'expires_at' => $expiresAt,
@@ -55,7 +60,7 @@ class CreateTeamInvitationAction
         // real email — return/log the invite link in local/dev only."
         if (app()->environment(['local', 'development'])) {
             Log::info('Team invite created', [
-                'merchant_id' => $merchant->getKey(),
+                'merchant_id' => $merchant?->getKey(),
                 'user_id' => $user->getKey(),
                 'invite_url' => $url,
             ]);
