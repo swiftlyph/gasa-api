@@ -4,11 +4,7 @@ use App\Domains\Auth\Models\User;
 use App\Domains\CashSessions\Models\CashRemittance;
 use App\Domains\CashSessions\Models\CashSession;
 use App\Domains\CashSessions\Models\Register;
-use App\Domains\Catalog\Models\Ingredient;
 use App\Domains\Catalog\Models\Product;
-use App\Domains\Company\Models\Company;
-use App\Domains\Company\Models\Department;
-use App\Domains\Company\Models\Employee;
 use App\Domains\Merchant\Models\Merchant;
 use App\Domains\Orders\Models\CheckoutIdempotencyKey;
 use App\Domains\Orders\Models\Order;
@@ -1564,4 +1560,3 @@ test('merchant two\'s vat_registered toggle never affects merchant one\'s orders
         ->assertJsonPath('tax.vat_registered', true)
         ->assertJsonPath('tax.vat_cents', 1500);
 });
-
