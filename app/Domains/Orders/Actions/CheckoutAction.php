@@ -7,6 +7,7 @@ use App\Domains\CashSessions\Exceptions\NoRegisterConfigured;
 use App\Domains\CashSessions\Models\CashSession;
 use App\Domains\CashSessions\Models\Register;
 use App\Domains\CashSessions\Support\DefaultRegister;
+use App\Domains\Catalog\Actions\DeductIngredientsForOrderAction;
 use App\Domains\Catalog\Models\Product;
 use App\Domains\Orders\Enums\BeneficiaryType;
 use App\Domains\Orders\Enums\OrderStatus;
@@ -68,6 +69,7 @@ class CheckoutAction
 {
     public function __construct(
         private readonly GenerateOrderNumberAction $orderNumbers,
+        private readonly DeductIngredientsForOrderAction $deductIngredients,
     ) {}
 
     /**
@@ -247,6 +249,14 @@ class CheckoutAction
 
             $this->persistLines($order, $lines, $beneficiaryIds);
 
+            // Ingredient stock is the last thing checked, after pricing —
+            // it throws InsufficientIngredientStock and rolls back this
+            // entire transaction (order, lines, beneficiaries included) if
+            // the basket can't actually be fulfilled, so a rejected sale
+            // never leaves a half-written order or an order number burnt
+            // for nothing.
+            $this->deductIngredients->execute($order, $payload['items'], $products);
+
             return $order;
         });
     }
@@ -305,6 +315,15 @@ class CheckoutAction
      * they just paid for. The cashier gets told which tiles failed and
      * re-rings the order.
      *
+     * "Cannot be sold" is Product::isSellable() — the merchant's own
+     * is_available toggle AND, for a product with a recipe, enough of
+     * every ingredient for at least one unit — NOT a hard guarantee
+     * (DeductIngredientsForOrderAction, called later in this same
+     * transaction, is the real row-locked check), but good enough to
+     * reject an obviously-empty basket before any pricing work happens.
+     * recipeItems.ingredient is eager-loaded here so isSellable() (and
+     * the deduction step afterwards) never N+1s.
+     *
      * @param  list<array{product_id: int, quantity: int, add_ons?: list<array{name: string, price_cents: int}>}>  $items
      * @return Collection<int, Product> keyed by product id
      */
@@ -323,12 +342,13 @@ class CheckoutAction
         // alongside genuinely missing and unavailable ids.
         /** @var Collection<int, Product> $products */
         $products = Product::query()
+            ->with('recipeItems.ingredient')
             ->whereIn('id', $requestedIds)
             ->get()
             ->keyBy('id');
 
         $unsellable = $requestedIds
-            ->reject(fn (int $id): bool => $products->get($id)?->is_available === true)
+            ->reject(fn (int $id): bool => $products->get($id)?->isSellable() === true)
             ->values();
 
         if ($unsellable->isNotEmpty()) {

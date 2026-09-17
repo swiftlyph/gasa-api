@@ -16,9 +16,15 @@ use Illuminate\Http\Resources\Json\JsonResource;
  * will want its own richer product resource — this one stays the POS's
  * view, so growing the catalog doesn't silently grow every till payload.
  *
- * `is_available` is included even though the default listing only returns
- * available items, because ?include_unavailable=1 exists for a manager
- * screen that needs to see the greyed-out ones.
+ * `is_available` reports Product::isSellable() — the merchant's manual
+ * toggle AND, for a product with a recipe, enough of every ingredient
+ * for at least one unit — so a depleted ingredient greys out the tile
+ * automatically, without the merchant having to notice and flip a
+ * switch. Requires recipeItems.ingredient eager-loaded by the caller
+ * (MenuController always does); is_available is included even though the
+ * default listing only returns available items, because
+ * ?include_unavailable=1 exists for a manager screen that needs to see
+ * the greyed-out ones.
  *
  * @mixin Product
  */
@@ -35,7 +41,7 @@ class MenuItemResource extends JsonResource
             'price_cents' => $this->price_cents,
             'price_formatted' => Money::format($this->price_cents, $this->currency),
             'currency' => $this->currency,
-            'is_available' => $this->is_available,
+            'is_available' => $this->isSellable(),
         ];
     }
 }
