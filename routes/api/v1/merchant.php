@@ -4,6 +4,10 @@ use App\Domains\CashSessions\Http\Controllers\CashMovementController;
 use App\Domains\CashSessions\Http\Controllers\CashRemittanceController;
 use App\Domains\CashSessions\Http\Controllers\CashSessionController;
 use App\Domains\CashSessions\Http\Controllers\RegisterController;
+use App\Domains\Catalog\Http\Controllers\CategoryController;
+use App\Domains\Catalog\Http\Controllers\IngredientController;
+use App\Domains\Catalog\Http\Controllers\ProductController;
+use App\Domains\Catalog\Http\Controllers\RecipeController;
 use App\Domains\Merchant\Http\Controllers\MerchantProfileController;
 use App\Domains\Merchant\Http\Controllers\TeamController;
 use App\Domains\Orders\Http\Controllers\CheckoutController;
@@ -51,6 +55,39 @@ Route::prefix('team')->name('merchant.team.')->group(function (): void {
     Route::post('/', [TeamController::class, 'store'])->name('store');
     Route::patch('/{user}', [TeamController::class, 'update'])->name('update');
     Route::delete('/{user}', [TeamController::class, 'destroy'])->name('destroy');
+});
+
+// The catalog module: full product management (create, edit, delete,
+// browse) over the shared `products` contract table (see that
+// migration's docblock), each product's recipe, and the ingredients that
+// recipe draws from — the ingredients ARE this merchant's inventory now
+// (see README § Catalog). {product}/{ingredient} resolve through their
+// merchant-scoped models, so a foreign id is a 404 on every verb, never
+// a 403.
+Route::get('/catalog/categories', [CategoryController::class, 'index'])->name('merchant.catalog.categories');
+
+Route::prefix('products')->name('merchant.products.')->group(function (): void {
+    Route::get('/', [ProductController::class, 'index'])->name('index');
+    Route::post('/', [ProductController::class, 'store'])->name('store');
+    Route::get('/{product}', [ProductController::class, 'show'])->name('show');
+    Route::match(['put', 'patch'], '/{product}', [ProductController::class, 'update'])->name('update');
+    Route::delete('/{product}', [ProductController::class, 'destroy'])->name('destroy');
+
+    // Replaces the whole recipe in one call — see UpdateRecipeRequest's
+    // docblock for why that's the shape rather than add/remove-one-line.
+    Route::put('/{product}/recipe', [RecipeController::class, 'update'])->name('recipe.update');
+});
+
+// Ingredients: the merchant's actual inventory (quantity on hand, in the
+// ingredient's own base unit, plus a low-stock threshold). Selling a
+// product that recipes one deducts it automatically at checkout — see
+// App\Domains\Catalog\Actions\DeductIngredientsForOrderAction.
+Route::prefix('ingredients')->name('merchant.ingredients.')->group(function (): void {
+    Route::get('/', [IngredientController::class, 'index'])->name('index');
+    Route::post('/', [IngredientController::class, 'store'])->name('store');
+    Route::get('/{ingredient}', [IngredientController::class, 'show'])->name('show');
+    Route::match(['put', 'patch'], '/{ingredient}', [IngredientController::class, 'update'])->name('update');
+    Route::delete('/{ingredient}', [IngredientController::class, 'destroy'])->name('destroy');
 });
 
 // The POS product list. A read-only projection of the shared `products`

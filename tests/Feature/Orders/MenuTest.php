@@ -1,7 +1,10 @@
 <?php
 
 use App\Domains\Auth\Models\User;
+use App\Domains\Catalog\Enums\Unit;
+use App\Domains\Catalog\Models\Ingredient;
 use App\Domains\Catalog\Models\Product;
+use App\Domains\Catalog\Models\RecipeItem;
 use App\Domains\Merchant\Models\Merchant;
 use App\Domains\Shared\Support\MenuCache;
 use Database\Seeders\RoleSeeder;
@@ -213,4 +216,75 @@ test('the menu requires authentication', function () {
     $this->getJson('/api/v1/merchant/menu')
         ->assertStatus(401)
         ->assertJsonPath('code', 'unauthenticated');
+});
+
+/*
+|--------------------------------------------------------------------------
+| Sellability (P12) — a recipe's ingredient stock, not just the manual
+| toggle, decides is_available. See Product::isSellable()'s docblock.
+|--------------------------------------------------------------------------
+*/
+
+test('a manually-available product with a depleted ingredient is excluded from the default menu, but shown as unavailable under include_unavailable', function () {
+    $matchaPowder = Ingredient::factory()->mass()->outOfStock()->create(['merchant_id' => $this->merchantOne->id, 'name' => 'Matcha Powder']);
+    $matchaLatte = Product::factory()->create(['merchant_id' => $this->merchantOne->id, 'name' => 'Matcha Latte', 'price_cents' => 16500, 'is_available' => true]);
+    RecipeItem::factory()->of(30, Unit::Gram)->create(['merchant_id' => $this->merchantOne->id, 'product_id' => $matchaLatte->id, 'ingredient_id' => $matchaPowder->id]);
+
+    $this->withToken($this->tokenOne)
+        ->getJson('/api/v1/merchant/menu')
+        ->assertOk()
+        ->assertJsonCount(1, 'data')
+        ->assertJsonMissing(['name' => 'Matcha Latte']);
+
+    $response = $this->withToken($this->tokenOne)
+        ->getJson('/api/v1/merchant/menu?include_unavailable=1')
+        ->assertOk();
+
+    $tile = collect($response->json('data'))->firstWhere('name', 'Matcha Latte');
+    expect($tile)->not->toBeNull()
+        ->and($tile['is_available'])->toBeFalse();
+});
+
+test('a product becomes sellable again once its ingredient is restocked, after the cache is invalidated by the stock change', function () {
+    $matchaPowder = Ingredient::factory()->mass()->outOfStock()->create(['merchant_id' => $this->merchantOne->id, 'name' => 'Matcha Powder']);
+    $matchaLatte = Product::factory()->create(['merchant_id' => $this->merchantOne->id, 'name' => 'Matcha Latte', 'price_cents' => 16500]);
+    RecipeItem::factory()->of(30, Unit::Gram)->create(['merchant_id' => $this->merchantOne->id, 'product_id' => $matchaLatte->id, 'ingredient_id' => $matchaPowder->id]);
+
+    $this->withToken($this->tokenOne)
+        ->getJson('/api/v1/merchant/menu')
+        ->assertOk()
+        ->assertJsonCount(1, 'data');
+
+    // A plain Eloquent update, exactly like a manual stock correction —
+    // IngredientObserver fires on save() and invalidates the cache with
+    // no test-side forget() call.
+    $matchaPowder->update(['quantity_on_hand' => Unit::Kilogram->toBaseUnits(5)]);
+
+    $response = $this->withToken($this->tokenOne)
+        ->getJson('/api/v1/merchant/menu')
+        ->assertOk()
+        ->assertJsonCount(2, 'data');
+
+    expect(collect($response->json('data'))->pluck('name')->all())
+        ->toContain('Cafe Latte (16oz)')
+        ->toContain('Matcha Latte');
+});
+
+test('a product with exactly enough stock for one sale is sellable; one short is not', function () {
+    $milk = Ingredient::factory()->volume()->create(['merchant_id' => $this->merchantOne->id, 'name' => 'Milk', 'quantity_on_hand' => Unit::Milliliter->toBaseUnits(100)]);
+    $latte = Product::factory()->create(['merchant_id' => $this->merchantOne->id, 'name' => 'Milk Tea', 'price_cents' => 12000]);
+    RecipeItem::factory()->of(100, Unit::Milliliter)->create(['merchant_id' => $this->merchantOne->id, 'product_id' => $latte->id, 'ingredient_id' => $milk->id]);
+
+    $this->withToken($this->tokenOne)->getJson('/api/v1/merchant/menu')
+        ->assertOk()
+        ->assertJsonPath('data.1.name', 'Milk Tea')
+        ->assertJsonPath('data.1.is_available', true);
+
+    $milk->update(['quantity_on_hand' => Unit::Milliliter->toBaseUnits(99)]);
+
+    $this->withToken($this->tokenOne)
+        ->getJson('/api/v1/merchant/menu')
+        ->assertOk()
+        ->assertJsonCount(1, 'data')
+        ->assertJsonMissing(['name' => 'Milk Tea']);
 });
