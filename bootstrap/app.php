@@ -1,5 +1,6 @@
 <?php
 
+use App\Domains\Company\Http\Middleware\EnsureCompanyActive;
 use App\Domains\Merchant\Http\Middleware\EnsureMerchantActive;
 use App\Domains\Orders\Console\PruneCheckoutIdempotencyKeysCommand;
 use App\Domains\Shared\Http\Exceptions\ApiExceptionRenderer;
@@ -66,7 +67,11 @@ return Application::configure(basePath: dirname(__DIR__))
         // non-merchant gets the role middleware's "forbidden" rather than
         // "merchant_inactive" — the latter would leak that the route exists
         // for merchants and invite probing.
-        // Both gatekeepers must run BEFORE route-model binding.
+        //
+        // company.api: EnsureCompanyActive runs AFTER role:company_admin for
+        // exactly the same reason, and sits in the priority list for the
+        // same reason as its merchant twin.
+        // All three gatekeepers must run BEFORE route-model binding.
         //
         // Laravel's priority list puts SubstituteBindings after
         // authentication but ahead of any middleware it doesn't know
@@ -85,9 +90,10 @@ return Application::configure(basePath: dirname(__DIR__))
         // `forbidden` rather than `merchant_inactive`.
         $middleware->prependToPriorityList(SubstituteBindings::class, RoleMiddleware::class);
         $middleware->prependToPriorityList(SubstituteBindings::class, EnsureMerchantActive::class);
+        $middleware->prependToPriorityList(SubstituteBindings::class, EnsureCompanyActive::class);
 
         $middleware->group('admin.api', ['auth:sanctum', 'role:platform_admin', AllowsAdminContext::class]);
-        $middleware->group('company.api', ['auth:sanctum', 'role:company_admin']);
+        $middleware->group('company.api', ['auth:sanctum', 'role:company_admin', EnsureCompanyActive::class]);
         $middleware->group('employee.api', ['auth:sanctum', 'role:employee']);
         $middleware->group('merchant.api', ['auth:sanctum', 'role:merchant', EnsureMerchantActive::class]);
         $middleware->group('public.api', []);

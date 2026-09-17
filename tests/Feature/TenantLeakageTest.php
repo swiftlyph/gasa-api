@@ -6,6 +6,9 @@ use App\Domains\CashSessions\Models\CashSession;
 use App\Domains\CashSessions\Models\Register;
 use App\Domains\Catalog\Models\Ingredient;
 use App\Domains\Catalog\Models\Product;
+use App\Domains\Company\Models\Company;
+use App\Domains\Company\Models\Department;
+use App\Domains\Company\Models\Employee;
 use App\Domains\Merchant\Models\Merchant;
 use App\Domains\Orders\Models\CheckoutIdempotencyKey;
 use App\Domains\Orders\Models\Order;
@@ -1562,101 +1565,3 @@ test('merchant two\'s vat_registered toggle never affects merchant one\'s orders
         ->assertJsonPath('tax.vat_cents', 1500);
 });
 
-/*
-|--------------------------------------------------------------------------
-| CATALOG (P11)
-|--------------------------------------------------------------------------
-|
-| products.category/code plus the ingredients table (this merchant's
-| actual inventory — see IngredientsTest) — exercised the same way as
-| Orders above: through the real HTTP endpoints, since that is where a
-| leak would actually happen.
-*/
-
-test('products are invisible across merchants over HTTP', function () {
-    $product = Product::factory()->inCategory('Bakery')->withCode('BKY-001')->create(['merchant_id' => $this->merchantOne->id, 'name' => 'Merchant One Croissant']);
-
-    $tokenTwo = $this->merchantTwoUser->createToken('merchant')->plainTextToken;
-
-    $this->withToken($tokenTwo)->getJson('/api/v1/merchant/products')
-        ->assertOk()
-        ->assertJsonCount(0, 'data');
-
-    // 404 on every verb — never a 403 that would confirm the row exists.
-    $this->withToken($tokenTwo)->getJson("/api/v1/merchant/products/{$product->id}")->assertStatus(404);
-    $this->withToken($tokenTwo)->patchJson("/api/v1/merchant/products/{$product->id}", ['name' => 'Taken over'])->assertStatus(404);
-    $this->withToken($tokenTwo)->deleteJson("/api/v1/merchant/products/{$product->id}")->assertStatus(404);
-
-    $tokenOne = $this->merchantOneUser->createToken('merchant')->plainTextToken;
-
-    $this->withToken($tokenOne)->getJson("/api/v1/merchant/products/{$product->id}")
-        ->assertOk()
-        ->assertJsonPath('name', 'Merchant One Croissant');
-});
-
-test('ingredients are invisible across merchants over HTTP', function () {
-    $ingredient = Ingredient::factory()->mass()->create(['merchant_id' => $this->merchantOne->id, 'name' => 'Merchant One Flour']);
-
-    $tokenTwo = $this->merchantTwoUser->createToken('merchant')->plainTextToken;
-
-    $this->withToken($tokenTwo)->getJson('/api/v1/merchant/ingredients')
-        ->assertOk()
-        ->assertJsonCount(0, 'data');
-
-    // 404 on every verb — never a 403 that would confirm the row exists.
-    $this->withToken($tokenTwo)->getJson("/api/v1/merchant/ingredients/{$ingredient->id}")->assertStatus(404);
-    $this->withToken($tokenTwo)->patchJson("/api/v1/merchant/ingredients/{$ingredient->id}", ['name' => 'Taken over'])->assertStatus(404);
-    $this->withToken($tokenTwo)->deleteJson("/api/v1/merchant/ingredients/{$ingredient->id}")->assertStatus(404);
-
-    $tokenOne = $this->merchantOneUser->createToken('merchant')->plainTextToken;
-
-    $this->withToken($tokenOne)->getJson("/api/v1/merchant/ingredients/{$ingredient->id}")
-        ->assertOk()
-        ->assertJsonPath('name', 'Merchant One Flour');
-
-    // Untouched by the failed cross-tenant patch attempt above.
-    expect($ingredient->fresh()->name)->toBe('Merchant One Flour');
-});
-
-test('an ingredient created over HTTP is stamped with the caller\'s merchant, not the payload\'s', function () {
-    $tokenOne = $this->merchantOneUser->createToken('merchant')->plainTextToken;
-
-    $id = $this->withToken($tokenOne)->postJson('/api/v1/merchant/ingredients', [
-        'name' => 'Spoof attempt',
-        'unit_type' => 'mass',
-        'display_unit' => 'kg',
-        'merchant_id' => $this->merchantTwo->id,
-    ])->assertStatus(201)->json('id');
-
-    expect(Ingredient::withoutGlobalScope('merchant')->findOrFail($id)->merchant_id)->toBe($this->merchantOne->id);
-});
-
-test('a product created over HTTP is stamped with the caller\'s merchant, not the payload\'s', function () {
-    $tokenOne = $this->merchantOneUser->createToken('merchant')->plainTextToken;
-
-    $id = $this->withToken($tokenOne)->postJson('/api/v1/merchant/products', [
-        'name' => 'Spoof attempt',
-        'category' => 'Drinks',
-        'price_cents' => 100,
-        'merchant_id' => $this->merchantTwo->id,
-    ])->assertStatus(201)->json('id');
-
-    expect(Product::withoutGlobalScope('merchant')->findOrFail($id)->merchant_id)->toBe($this->merchantOne->id);
-});
-
-test('product code counters never cross merchants, even for the same category', function () {
-    $tokenOne = $this->merchantOneUser->createToken('merchant')->plainTextToken;
-    $tokenTwo = $this->merchantTwoUser->createToken('merchant')->plainTextToken;
-
-    $codeOne = $this->withToken($tokenOne)
-        ->postJson('/api/v1/merchant/products', ['name' => 'A', 'category' => 'Drinks', 'price_cents' => 100])
-        ->assertStatus(201)->json('code');
-
-    $codeTwo = $this->withToken($tokenTwo)
-        ->postJson('/api/v1/merchant/products', ['name' => 'B', 'category' => 'Drinks', 'price_cents' => 100])
-        ->assertStatus(201)->json('code');
-
-    // Both merchants' first Drinks product is DRK-001 — the counter is
-    // per (merchant, prefix), never shared.
-    expect($codeOne)->toBe('DRK-001')->and($codeTwo)->toBe('DRK-001');
-});

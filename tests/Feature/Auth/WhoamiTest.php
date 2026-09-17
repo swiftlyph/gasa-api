@@ -1,6 +1,7 @@
 <?php
 
 use App\Domains\Auth\Models\User;
+use App\Domains\Company\Models\Company;
 use App\Domains\Merchant\Models\Merchant;
 use Database\Seeders\RoleSeeder;
 
@@ -10,9 +11,11 @@ beforeEach(function () {
 
 /**
  * The merchant portal additionally requires an ACTIVE merchant
- * (EnsureMerchantActive), so merchant users in these tests need one to
- * reach their own portal. The "no/suspended merchant" paths are covered
- * in TenantLeakageTest, not here — this file is about role routing.
+ * (EnsureMerchantActive), and the company portal an ACTIVE company
+ * (EnsureCompanyActive), so those users need one to reach their own
+ * portal. The "no/suspended" paths are covered in TenantLeakageTest and
+ * tests/Feature/Company/ProfileTest.php, not here — this file is about
+ * role routing.
  */
 function makeUserWithRole(string $role): User
 {
@@ -20,6 +23,10 @@ function makeUserWithRole(string $role): User
 
     if ($role === 'merchant') {
         Merchant::factory()->ownedBy($user)->create();
+    }
+
+    if ($role === 'company_admin') {
+        Company::factory()->ownedBy($user)->create();
     }
 
     return $user;

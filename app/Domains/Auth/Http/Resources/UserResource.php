@@ -3,6 +3,7 @@
 namespace App\Domains\Auth\Http\Resources;
 
 use App\Domains\Auth\Models\User;
+use App\Domains\Company\Http\Resources\CompanySummaryResource;
 use App\Domains\Merchant\Http\Resources\MerchantSummaryResource;
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
@@ -32,6 +33,17 @@ class UserResource extends JsonResource
             // would serialize as {} rather than null, so guard explicitly.
             'merchant' => ($merchant = $this->merchants->first())
                 ? MerchantSummaryResource::make($merchant)
+                : null,
+
+            // The company twin of `merchant`, and for the same reason
+            // the plain relation rather than User::activeCompany(): a
+            // suspended company's admin must still see the status here
+            // to render a suspended screen. Null for users with no
+            // company (platform admins, merchants, employees without a
+            // portal account yet). Guarded explicitly, like `merchant`,
+            // because ::make(null) would serialize as {} rather than null.
+            'company' => ($company = $this->company)
+                ? CompanySummaryResource::make($company)
                 : null,
 
             // P8: this user's merchant permissions, resolved from
