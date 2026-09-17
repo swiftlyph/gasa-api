@@ -2,6 +2,7 @@
 
 use App\Domains\Merchant\Http\Controllers\AdminMerchantController;
 use App\Domains\Platform\Http\Controllers\AdminAuditLogController;
+use App\Domains\Platform\Http\Controllers\AdminUserController;
 use Illuminate\Support\Facades\Route;
 
 /*
@@ -37,4 +38,28 @@ Route::prefix('merchants')->name('admin.merchants.')->group(function (): void {
 // docblock).
 Route::prefix('audit-logs')->name('admin.audit-logs.')->group(function (): void {
     Route::get('/', [AdminAuditLogController::class, 'index'])->name('index');
+});
+
+// P11: user management across every audience. `{user}` binds withTrashed()
+// so a deactivated account stays viewable and restorable — the default
+// binding would 404 the moment a user was deactivated, stranding them.
+//
+// No policy layer, matching the merchant routes above: every
+// platform_admin may act on every user, so this route group is the
+// authorization boundary. The lockout guards (self, last admin, merchant
+// owner) live in the Actions, not here.
+Route::prefix('users')->name('admin.users.')->group(function (): void {
+    Route::get('/', [AdminUserController::class, 'index'])->name('index');
+    Route::post('/', [AdminUserController::class, 'store'])->name('store');
+
+    Route::get('/{user}', [AdminUserController::class, 'show'])
+        ->withTrashed()->name('show');
+    Route::patch('/{user}/role', [AdminUserController::class, 'updateRole'])
+        ->withTrashed()->name('update-role');
+    Route::delete('/{user}', [AdminUserController::class, 'destroy'])
+        ->name('destroy');
+    Route::post('/{user}/restore', [AdminUserController::class, 'restore'])
+        ->withTrashed()->name('restore');
+    Route::post('/{user}/resend-invite', [AdminUserController::class, 'resendInvite'])
+        ->withTrashed()->name('resend-invite');
 });
