@@ -2,10 +2,14 @@
 
 namespace Database\Seeders;
 
+use App\Domains\Allowance\Enums\LedgerEntryType;
+use App\Domains\Allowance\Models\AllowanceAccount;
+use App\Domains\Allowance\Models\AllowanceLedgerEntry;
 use App\Domains\Auth\Models\User;
 use App\Domains\Company\Enums\CompanyStatus;
 use App\Domains\Company\Enums\EmployeeStatus;
 use App\Domains\Company\Models\Company;
+use App\Domains\Company\Models\Department;
 use App\Domains\Company\Models\Employee;
 use App\Domains\Shared\Concerns\TenantContext;
 use Illuminate\Database\Seeder;
@@ -69,10 +73,27 @@ class StagingCompanySeeder extends Seeder
         // stamp a null tenant on every row.
         app(TenantContext::class)->runInAdminContext(function () use ($company): void {
             foreach ($this->roster() as $row) {
+                // The roster names each department; find or create the row.
+                $department = Department::firstOrCreate([
+                    'company_id' => $company->getKey(),
+                    'name' => $row['department'],
+                ]);
+
+                unset($row['department']);
+
                 Employee::updateOrCreate(
                     ['company_id' => $company->getKey(), 'email' => $row['email']],
-                    [...$row, 'status' => EmployeeStatus::Active],
+                    [...$row, 'department_id' => $department->getKey(), 'status' => EmployeeStatus::Active],
                 );
+            }
+
+            foreach ($this->roster() as $row) {
+                $employee = Employee::query()
+                    ->where('company_id', $company->getKey())
+                    ->where('email', $row['email'])
+                    ->firstOrFail();
+
+                $this->seedAllowance($employee, 100000, 'Staging allowance fixture', 'staging-allowance-'.$employee->employee_no);
             }
         });
     }
@@ -89,5 +110,32 @@ class StagingCompanySeeder extends Seeder
             ['employee_no' => 'STG-0004', 'first_name' => 'Paolo', 'last_name' => 'Garcia', 'email' => 'paolo.garcia@staging.gasa.test', 'department' => 'Sales', 'job_title' => 'Account Executive', 'hired_at' => '2022-11-02'],
             ['employee_no' => 'STG-0005', 'first_name' => 'Liza', 'last_name' => 'Mendoza', 'email' => 'liza.mendoza@staging.gasa.test', 'department' => 'Human Resources', 'job_title' => 'HR Specialist', 'hired_at' => '2024-09-09'],
         ];
+    }
+
+    private function seedAllowance(Employee $employee, int $amountCents, string $reason, string $idempotencyKey): void
+    {
+        $account = AllowanceAccount::query()->firstOrCreate([
+            'company_id' => $employee->company_id,
+            'employee_id' => $employee->getKey(),
+            'purse' => 'allowance',
+        ]);
+
+        if (AllowanceLedgerEntry::query()->where('idempotency_key', $idempotencyKey)->exists()) {
+            return;
+        }
+
+        $balance = (int) AllowanceLedgerEntry::query()
+            ->where('allowance_account_id', $account->getKey())
+            ->sum('amount_cents');
+
+        AllowanceLedgerEntry::create([
+            'company_id' => $employee->company_id,
+            'allowance_account_id' => $account->getKey(),
+            'type' => LedgerEntryType::Grant,
+            'amount_cents' => $amountCents,
+            'balance_after_cents' => $balance + $amountCents,
+            'reason' => $reason,
+            'idempotency_key' => $idempotencyKey,
+        ]);
     }
 }

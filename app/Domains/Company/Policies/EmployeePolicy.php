@@ -46,6 +46,11 @@ class EmployeePolicy
         return $this->ownsEmployee($user, $employee);
     }
 
+    public function manageAllowance(User $user, Employee $employee): bool
+    {
+        return $this->ownsEmployee($user, $employee);
+    }
+
     private function ownsEmployee(User $user, Employee $employee): bool
     {
         $ownCompany = $user->activeCompany();

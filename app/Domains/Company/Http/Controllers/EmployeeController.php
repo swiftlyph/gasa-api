@@ -12,6 +12,7 @@ use App\Domains\Company\Http\Requests\UpdateEmployeeRequest;
 use App\Domains\Company\Http\Resources\EmployeeResource;
 use App\Domains\Company\Models\Company;
 use App\Domains\Company\Models\Employee;
+use App\Domains\Company\Support\EmployeeFilters;
 use App\Http\Controllers\Controller;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Resources\Json\AnonymousResourceCollection;
@@ -23,37 +24,24 @@ use Illuminate\Http\Resources\Json\AnonymousResourceCollection;
  * the row exists). Soft-deleted employees are likewise 404 (SoftDeletes'
  * own scope). EmployeePolicy is auto-discovered for Employee::class, so
  * $this->authorize() works here without the TeamController workaround.
+ *
+ * Every response eager-loads `department`, so EmployeeResource never
+ * issues a query of its own.
  */
 class EmployeeController extends Controller
 {
     /**
-     * Two queries regardless of roster size: one count for pagination,
-     * one page. Ordered by surname, then given name, tiebroken by id so
-     * two employees with the same name paginate stably.
+     * Three queries regardless of roster size: one count for pagination,
+     * one page, one for that page's departments. Filters and ordering
+     * live in EmployeeFilters, shared with the CSV export.
      */
     public function index(IndexEmployeesRequest $request): AnonymousResourceCollection
     {
         $this->authorize('viewAny', Employee::class);
 
-        $query = Employee::query()
-            ->orderBy('last_name')
-            ->orderBy('first_name')
-            ->orderBy('id');
-
-        if ($status = $request->validated('status')) {
-            $query->where('status', $status);
-        }
-
-        if ($search = $request->validated('search')) {
-            $query->where(function ($query) use ($search) {
-                $query->where('first_name', 'ilike', "%{$search}%")
-                    ->orWhere('last_name', 'ilike', "%{$search}%")
-                    ->orWhere('email', 'ilike', "%{$search}%")
-                    ->orWhere('employee_no', 'ilike', "%{$search}%");
-            });
-        }
-
-        $employees = $query->paginate($request->validated('per_page', 25))->withQueryString();
+        $employees = EmployeeFilters::query($request->validated())
+            ->paginate($request->validated('per_page', 25))
+            ->withQueryString();
 
         return EmployeeResource::collection($employees);
     }
@@ -70,7 +58,7 @@ class EmployeeController extends Controller
 
         $employee = $action->execute($company, $request->payload());
 
-        return EmployeeResource::make($employee)
+        return EmployeeResource::make($employee->load('department'))
             ->response()
             ->setStatusCode(JsonResponse::HTTP_CREATED);
     }
@@ -79,7 +67,7 @@ class EmployeeController extends Controller
     {
         $this->authorize('view', $employee);
 
-        return EmployeeResource::make($employee);
+        return EmployeeResource::make($employee->load('department'));
     }
 
     public function update(
@@ -89,7 +77,9 @@ class EmployeeController extends Controller
     ): EmployeeResource {
         $this->authorize('update', $employee);
 
-        return EmployeeResource::make($action->execute($employee, $request->payload()));
+        $updated = $action->execute($employee, $request->payload());
+
+        return EmployeeResource::make($updated->load('department'));
     }
 
     public function destroy(Employee $employee, DeleteEmployeeAction $action): JsonResponse

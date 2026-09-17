@@ -101,6 +101,14 @@ class Company extends Model
         return $this->hasMany(Employee::class);
     }
 
+    /**
+     * @return HasMany<Department, $this>
+     */
+    public function departments(): HasMany
+    {
+        return $this->hasMany(Department::class);
+    }
+
     public function isActive(): bool
     {
         return $this->status === CompanyStatus::Active;

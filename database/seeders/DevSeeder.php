@@ -2,6 +2,9 @@
 
 namespace Database\Seeders;
 
+use App\Domains\Allowance\Enums\LedgerEntryType;
+use App\Domains\Allowance\Models\AllowanceAccount;
+use App\Domains\Allowance\Models\AllowanceLedgerEntry;
 use App\Domains\Auth\Models\User;
 use App\Domains\CashSessions\Actions\CloseCashSessionAction;
 use App\Domains\CashSessions\Actions\ConfirmRemittanceAction;
@@ -13,6 +16,7 @@ use App\Domains\Catalog\Models\Product;
 use App\Domains\Company\Enums\CompanyStatus;
 use App\Domains\Company\Enums\EmployeeStatus;
 use App\Domains\Company\Models\Company;
+use App\Domains\Company\Models\Department;
 use App\Domains\Company\Models\Employee;
 use App\Domains\Merchant\Enums\MerchantStatus;
 use App\Domains\Merchant\Models\Merchant;
@@ -149,6 +153,9 @@ class DevSeeder extends Seeder
                 ['employee_no' => 'C2-003', 'first_name' => 'Noel', 'last_name' => 'Aquino', 'email' => 'noel.aquino@companytwo.test',
                     'department' => 'Logistics', 'job_title' => 'Dispatcher', 'hired_at' => '2025-05-12'],
             ]);
+
+            $this->seedAllowance($companyOne, 'maria.santos@companyone.test', 150000, 'Monthly allowance fixture', 'dev-allowance-company-one-maria');
+            $this->seedAllowance($companyTwo, 'ramon.villanueva@companytwo.test', 100000, 'Monthly allowance fixture', 'dev-allowance-company-two-ramon');
         });
     }
 
@@ -205,6 +212,15 @@ class DevSeeder extends Seeder
             $user = $row['user'] ?? null;
             unset($row['user']);
 
+            // The roster above names each department; departments are
+            // rows now, found or created per company.
+            $departmentName = $row['department'] ?? null;
+            unset($row['department']);
+
+            $row['department_id'] = is_string($departmentName)
+                ? Department::firstOrCreate(['company_id' => $company->getKey(), 'name' => $departmentName])->getKey()
+                : null;
+
             $employee = Employee::updateOrCreate(
                 ['company_id' => $company->getKey(), 'email' => $row['email']],
                 [...$row, 'status' => EmployeeStatus::Active],
@@ -222,6 +238,48 @@ class DevSeeder extends Seeder
                 $user->save();
             }
         }
+    }
+
+    /**
+     * Seeds one fixed grant per demo employee without ever editing an
+     * existing ledger entry. The stable idempotency key makes re-seeding
+     * safe and keeps the fixture's balance deterministic.
+     */
+    private function seedAllowance(
+        Company $company,
+        string $employeeEmail,
+        int $amountCents,
+        string $reason,
+        string $idempotencyKey,
+    ): void {
+        $employee = Employee::query()
+            ->where('company_id', $company->getKey())
+            ->where('email', $employeeEmail)
+            ->firstOrFail();
+
+        $account = AllowanceAccount::query()->firstOrCreate([
+            'company_id' => $company->getKey(),
+            'employee_id' => $employee->getKey(),
+            'purse' => 'allowance',
+        ]);
+
+        if (AllowanceLedgerEntry::query()->where('idempotency_key', $idempotencyKey)->exists()) {
+            return;
+        }
+
+        $balance = (int) AllowanceLedgerEntry::query()
+            ->where('allowance_account_id', $account->getKey())
+            ->sum('amount_cents');
+
+        AllowanceLedgerEntry::create([
+            'company_id' => $company->getKey(),
+            'allowance_account_id' => $account->getKey(),
+            'type' => LedgerEntryType::Grant,
+            'amount_cents' => $amountCents,
+            'balance_after_cents' => $balance + $amountCents,
+            'reason' => $reason,
+            'idempotency_key' => $idempotencyKey,
+        ]);
     }
 
     /**

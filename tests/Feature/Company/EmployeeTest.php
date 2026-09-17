@@ -30,7 +30,6 @@ function validEmployeePayload(array $overrides = []): array
         'last_name' => 'Santos',
         'email' => 'maria.santos@companyone.test',
         'mobile' => '+63 917 000 0001',
-        'department' => 'Finance',
         'job_title' => 'Accountant',
         'hired_at' => '2024-03-01',
         ...$overrides,
@@ -52,8 +51,12 @@ test('POST creates an active employee with no account and returns it flat as 201
         ->assertJsonPath('last_name', 'Santos')
         ->assertJsonPath('full_name', 'Maria Santos')
         ->assertJsonPath('email', 'maria.santos@companyone.test')
-        ->assertJsonPath('mobile', '+63 917 000 0001')
-        ->assertJsonPath('department', 'Finance')
+        // Normalized to E.164 on the way in (see EmployeeFieldsTest).
+        ->assertJsonPath('mobile', '+639170000001')
+        ->assertJsonPath('department_id', null)
+        ->assertJsonPath('department', null)
+        ->assertJsonPath('employment_type', 'regular')
+        ->assertJsonPath('separated_at', null)
         ->assertJsonPath('job_title', 'Accountant')
         ->assertJsonPath('hired_at', '2024-03-01')
         ->assertJsonPath('status', 'active')
@@ -225,13 +228,13 @@ test('PATCH updates only the given fields and can pause or reactivate', function
         'first_name' => 'Maria',
         'last_name' => 'Santos',
         'email' => 'maria.santos@companyone.test',
-        'department' => 'Finance',
+        'job_title' => 'Accountant',
     ]);
 
     $this->withToken($this->token)
-        ->patchJson("/api/v1/company/employees/{$employee->id}", ['department' => 'Treasury', 'status' => 'inactive'])
+        ->patchJson("/api/v1/company/employees/{$employee->id}", ['job_title' => 'Treasurer', 'status' => 'inactive'])
         ->assertOk()
-        ->assertJsonPath('department', 'Treasury')
+        ->assertJsonPath('job_title', 'Treasurer')
         ->assertJsonPath('status', 'inactive')
         ->assertJsonPath('first_name', 'Maria')
         ->assertJsonPath('email', 'maria.santos@companyone.test');

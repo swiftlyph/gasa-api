@@ -171,6 +171,12 @@ header — never a redirect.
 | 422    | `cannot_demote_owner`  | `PATCH /merchant/team/{user}` — the target is the merchant's owner, and the new `role_in_merchant` isn't `owner` |
 | 422    | `employee_email_taken` | `POST`/`PATCH /company/employees`: the email is already on another employee of this company; `errors.email` names it (see § Company & employees) |
 | 422    | `employee_number_taken` | Same, for `employee_no`; `errors.employee_no` names it |
+| 422    | `invalid_department`   | An employee write whose `department_id` isn't one of the caller's own departments (another company's and a non-existent id are never told apart) |
+| 422    | `department_name_taken` | `POST`/`PATCH /company/departments`: the company already has a department with that name, case-insensitively |
+| 422    | `department_in_use`    | `DELETE /company/departments/{department}`: employees are still assigned to it |
+| 422    | `employee_not_eligible` | `POST /company/employees/{employee}/allowance/grants`: the employee is inactive or separated |
+| 409    | `idempotency_key_reuse` | The allowance grant key was already used with different grant details |
+| 422    | `invalid_import_file`  | `POST /company/employees/import`: the CSV can't be read at all (empty, a required column missing, more than 1000 rows). Bad ROWS are not an error; they come back in the 200 report |
 | 403    | `permission_denied`    | The caller's `role_in_merchant` preset doesn't carry the permission a merchant Policy requires — `errors.permission` names it (see § Permissions) |
 | 422    | `invalid_invite`       | `/auth/accept-invite` — token missing, already used, or expired (never distinguished) |
 | 429    | `too_many_attempts`    | `/auth/login` — 6th+ attempt from the same email+IP within a minute |
@@ -529,8 +535,8 @@ asserts isolation through the actual HTTP endpoints, which is the surface
 an attacker really has.
 
 Tenant-owned tables so far: `merchants` (the tenant itself), `products`,
-`orders`; and on the company side `companies` (the tenant itself) and
-`employees`. `order_items` and `order_item_add_ons` deliberately have **no**
+`orders`; and on the company side `companies` (the tenant itself), `departments`
+and `employees`. `order_items` and `order_item_add_ons` deliberately have **no**
 `merchant_id` — they inherit tenancy structurally, since they are only ever
 reachable through a scoped order. A second owner column on those tables
 would be a second source of truth that could disagree with the first.
@@ -2063,11 +2069,32 @@ endpoints' shape. Every route below sits behind the `company.api` group
 | Method   | Route                                  | Notes |
 | -------- | -------------------------------------- | ----- |
 | `GET`    | `/api/v1/company/profile`              | The caller's own company, flat, every profile field |
-| `GET`    | `/api/v1/company/employees`            | Paginated; filterable by `status` and `search`; `per_page` capped at 100 |
-| `POST`   | `/api/v1/company/employees`            | Add an employee: `{ first_name, last_name, email, employee_no?, mobile?, department?, job_title?, hired_at? }` |
+| `GET`    | `/api/v1/company/employees`            | Paginated; filterable by `status`, `employment_type`, `department_id` and `search`; `per_page` capped at 100 |
+| `POST`   | `/api/v1/company/employees`            | Add an employee: `{ first_name, last_name, email, employee_no?, middle_name?, suffix?, mobile?, birthdate?, department_id?, job_title?, employment_type?, hired_at? }` |
 | `GET`    | `/api/v1/company/employees/{employee}` | One employee, flat |
-| `PATCH`  | `/api/v1/company/employees/{employee}` | Partial update: the same fields plus `status` (`active` \| `inactive`) |
+| `PATCH`  | `/api/v1/company/employees/{employee}` | Partial update: the same fields plus `status` (`active` \| `inactive` \| `separated`) and `separated_at` |
 | `DELETE` | `/api/v1/company/employees/{employee}` | Soft-deletes the record; `200 { message, code: "employee_removed" }` |
+| `GET`    | `/api/v1/company/employees/export`     | The filtered roster as CSV (see § Import and export) |
+| `POST`   | `/api/v1/company/employees/import`     | CSV upsert with a `preview` / `commit` mode (see § Import and export) |
+| `GET`, `POST`, `PATCH`, `DELETE` | `/api/v1/company/departments[/{department}]` | See § Departments |
+| `GET`    | `/api/v1/company/employees/{employee}/allowance` | Current allowance balance and the 20 latest ledger entries |
+| `POST`   | `/api/v1/company/employees/{employee}/allowance/grants` | Grant `{ amount_cents, reason, idempotency_key }` to an active employee |
+
+### Employee allowance
+
+Allowance is an employer-funded spending entitlement, not stored money or
+e-money. The employee row contains identity and eligibility only. A grant
+creates an append-only `allowance_ledger_entries` row linked to the employee's
+company-scoped `allowance_accounts` row. The balance is the sum of the ledger's
+signed `amount_cents`, and every entry records the balance after that movement.
+
+`POST /api/v1/company/employees/{employee}/allowance/grants` accepts positive
+integer cents up to 1,000,000 pesos, a required reason, and a client-generated
+idempotency key. Repeating the exact request is safe; changing the amount or
+reason for an existing key returns `409 idempotency_key_reuse`. Only active
+employees can receive a grant. The current slice records grants and exposes
+the ledger; merchant checkout consumption, reversals, expiry, and allowance
+plans are later phases.
 
 ### Companies
 
@@ -2103,9 +2130,10 @@ merchants). It sits alongside `merchant`; a user has one or the other.
 ### Employees
 
 An employee is an **HR record, not a login.** `employees` carries
-`employee_no`, `first_name`, `last_name`, `email`, `mobile`,
-`department`, `job_title`, `hired_at`, `status` (`active` | `inactive`,
-`App\Domains\Company\Enums\EmployeeStatus`) and a nullable `user_id`
+`employee_no`, the name (`first_name`, `middle_name`, `last_name`,
+`suffix`), `email`, `mobile`, `birthdate`, `department_id`, `job_title`,
+`employment_type`, `hired_at`, `status` with `separated_at`
+(`App\Domains\Company\Enums\EmployeeStatus`), and a nullable `user_id`
 that stays null until a later phase invites the employee into the
 employee portal, the same order the merchant vertical shipped in
 (profile first, team after). `has_account` in the payload is that
@@ -2140,19 +2168,114 @@ name, last name, email or employee number, case-insensitively.
   "id": 1,
   "employee_no": "EMP-0001",
   "first_name": "Maria",
+  "middle_name": "Reyes",
   "last_name": "Santos",
+  "suffix": null,
   "full_name": "Maria Santos",
   "email": "maria.santos@companyone.test",
-  "mobile": "+63 917 000 0001",
-  "department": "Finance",
+  "mobile": "+639170000001",
+  "birthdate": "1992-05-14",
+  "department_id": 3,
+  "department": { "id": 3, "name": "Finance" },
   "job_title": "Accountant",
+  "employment_type": "regular",
   "hired_at": "2024-03-01",
   "status": "active",
+  "separated_at": null,
   "has_account": false,
   "created_at": "2026-09-16T00:00:00.000000Z",
   "updated_at": "2026-09-16T00:00:00.000000Z"
 }
 ```
+
+### Status, separation and what the record is for
+
+The employee record holds **identity and eligibility only**. What an
+employee may spend is never a column here: the allowance balance, the
+allowance rules and the QR/card credential are (future) records that point
+at the employee, so every peso stays explainable and none of it can be
+changed by editing a profile.
+
+`status` is `active`, `inactive` (a pause: leave, suspension) or
+`separated` (left the company). `separated_at` and `status` move together,
+and `UpdateEmployeeAction` is the only place that decides how: a separated
+employee always has a date (the one sent, else the one already stored, else
+today in `config('company.day_timezone')`), and any other status never has
+one. That transition is where the allowance module will stop grants and
+expire what is left.
+
+`employment_type` (`regular`, `probationary`, `contractual`, `part_time`,
+`intern`; default `regular`) and the department exist because allowance
+will be targeted by them.
+
+`mobile` is normalized to E.164 before validation
+(`App\Domains\Company\Support\PhoneNumber`): `0917 123 4567`, `9171234567`
+and `+63 917 123 4567` all store as `+639171234567`. A number without a
+country code is read as a Philippine mobile.
+
+### Departments
+
+| Method   | Route                                      | Notes |
+| -------- | ------------------------------------------ | ----- |
+| `GET`    | `/api/v1/company/departments`              | Unpaginated `{ data: [...] }`, ordered by name, each with `employees_count` |
+| `POST`   | `/api/v1/company/departments`              | `{ name }`, returns 201 flat |
+| `PATCH`  | `/api/v1/company/departments/{department}` | Rename; employees follow, they point at the row |
+| `DELETE` | `/api/v1/company/departments/{department}` | Only an empty one; `200 { message, code: "department_deleted" }` |
+
+A table rather than the free text it replaced, because "Finance",
+"finance" and "Fin." are three groups to a query. Names are unique per
+company, case-insensitively (`(company_id, lower(name))`): a duplicate is
+`422 department_name_taken`. A department that still has employees can't be
+deleted (`422 department_in_use`): un-grouping people behind the caller's
+back would change who an allowance reaches. An employee write whose
+`department_id` is not one of the caller's own departments is
+`422 invalid_department`, whether the id belongs to another company or to
+nobody; the two are never told apart. It is checked in the Actions, since
+an `exists:` rule is not tenant-scoped.
+
+### Import and export
+
+`POST /api/v1/company/employees/import` takes a multipart `file` (CSV, 1 MB,
+at most 1000 rows) and a `mode`: `preview` (the default) or `commit`. Both
+run the **same code inside a transaction**; preview rolls it back, commit
+commits it, so a preview can never promise what the commit then does
+differently. The response is always a 200 report:
+
+```json
+{
+  "mode": "preview",
+  "summary": { "total": 3, "create": 1, "update": 1, "unchanged": 0, "invalid": 1 },
+  "ignored_columns": ["Notes"],
+  "rows": [
+    { "line": 2, "action": "create", "employee_no": "EMP-0009", "first_name": "Ana", "last_name": "Cruz", "email": "ana.cruz@companyone.test", "errors": null },
+    { "line": 4, "action": "invalid", "employee_no": null, "first_name": "Jo", "last_name": null, "email": "not-an-email", "errors": { "last_name": ["The last name field is required."], "email": ["The email field must be a valid email address."] } }
+  ]
+}
+```
+
+- Columns: `first_name`, `last_name`, `email` are required; `employee_no`,
+  `middle_name`, `suffix`, `mobile`, `department`, `job_title`,
+  `employment_type`, `hired_at`, `birthdate` are optional, in any order.
+  Common header variants (`Surname`, `Position`, `Date Hired`, ...) are
+  mapped; anything else is listed in `ignored_columns`.
+- Rows are **upserts**: matched by `employee_no` when the row has one, else
+  by `email`. A column that is in the file is authoritative (an empty cell
+  clears the field); a column that is not is left alone. `status` is never
+  imported.
+- `department` is a NAME, found case-insensitively or created.
+- Every row passes the same rules (`EmployeeFieldRules`) and the same
+  Actions as the form. A bad row is `invalid` with its `errors` and is
+  skipped; the rest still import. The same email or employee number twice
+  in one file is invalid on its second appearance.
+- Only a file that can't be read at all (empty, a required column missing,
+  too many rows) is refused: `422 invalid_import_file`.
+
+`GET /api/v1/company/employees/export` streams the roster as CSV and takes
+the same query string as the list. Its first columns are the import's, in
+order, so an exported file re-imports unchanged; `status` and
+`separated_at` follow for the reader and are ignored on the way back in.
+Cells a spreadsheet would execute (a leading `=` or `@`) are prefixed with
+an apostrophe.
 
 ### Seeding
 

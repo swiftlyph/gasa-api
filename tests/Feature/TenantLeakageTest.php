@@ -6,6 +6,7 @@ use App\Domains\CashSessions\Models\CashSession;
 use App\Domains\CashSessions\Models\Register;
 use App\Domains\Catalog\Models\Product;
 use App\Domains\Company\Models\Company;
+use App\Domains\Company\Models\Department;
 use App\Domains\Company\Models\Employee;
 use App\Domains\Merchant\Models\Merchant;
 use App\Domains\Orders\Models\CheckoutIdempotencyKey;
@@ -1688,4 +1689,49 @@ test('a merchant token on a company route is 403 from the role middleware, and t
         ->getJson('/api/v1/merchant/orders')
         ->assertStatus(403)
         ->assertJson(['code' => 'forbidden']);
+});
+
+test('a company only sees, renames and deletes its own departments', function () {
+    [$adminOne, $companyOne, $adminTwo, $companyTwo] = twoCompaniesWithAnEmployeeEach();
+
+    $financeOne = Department::factory()->forCompany($companyOne)->create(['name' => 'Finance']);
+    Department::factory()->forCompany($companyTwo)->create(['name' => 'Finance']);
+
+    $tokenTwo = $adminTwo->createToken('company')->plainTextToken;
+
+    // Same name in both companies: each sees exactly its own one.
+    $list = $this->withToken($tokenTwo)->getJson('/api/v1/company/departments')->assertOk();
+
+    expect($list->json('data'))->toHaveCount(1)
+        ->and($list->json('data.0.id'))->not->toBe($financeOne->id);
+
+    $this->withToken($tokenTwo)
+        ->patchJson("/api/v1/company/departments/{$financeOne->id}", ['name' => 'Hijacked'])
+        ->assertStatus(404)->assertJson(['code' => 'not_found']);
+
+    $this->withToken($tokenTwo)
+        ->deleteJson("/api/v1/company/departments/{$financeOne->id}")
+        ->assertStatus(404)->assertJson(['code' => 'not_found']);
+
+    expect(DB::table('departments')->where('id', $financeOne->id)->value('name'))->toBe('Finance');
+});
+
+test('an employee can never be put in another company\'s department', function () {
+    [$adminOne, , , $companyTwo] = twoCompaniesWithAnEmployeeEach();
+
+    $foreign = Department::factory()->forCompany($companyTwo)->create(['name' => 'Foreign']);
+
+    // Indistinguishable from an id that doesn't exist at all: both are
+    // "not one of yours", so nothing about company two is confirmed.
+    $this->withToken($adminOne->createToken('company')->plainTextToken)
+        ->postJson('/api/v1/company/employees', [
+            'first_name' => 'Cross',
+            'last_name' => 'Tenant',
+            'email' => 'cross.department@companyone.test',
+            'department_id' => $foreign->id,
+        ])
+        ->assertStatus(422)
+        ->assertJson(['code' => 'invalid_department']);
+
+    expect(DB::table('employees')->where('email', 'cross.department@companyone.test')->exists())->toBeFalse();
 });

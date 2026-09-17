@@ -2,9 +2,9 @@
 
 namespace App\Domains\Company\Http\Requests;
 
-use App\Domains\Company\Enums\EmployeeStatus;
+use App\Domains\Company\Support\EmployeeFieldRules;
+use App\Domains\Company\Support\PhoneNumber;
 use Illuminate\Foundation\Http\FormRequest;
-use Illuminate\Validation\Rule;
 
 /**
  * Shape validation for PATCH /company/employees/{employee}. Every field
@@ -13,41 +13,56 @@ use Illuminate\Validation\Rule;
  * nullable (an employee always has a first name, last name and email);
  * the rest may be cleared with null.
  *
- * `status` lives here and not in StoreEmployeeRequest: a new employee is
- * always active, and PATCH is the only way to pause or reactivate one.
- * Roster uniqueness is, as on create, the Action's question.
+ * `status` and `separated_at` live here and not in StoreEmployeeRequest:
+ * a new employee is always active, and PATCH is the only way to pause,
+ * separate or reinstate one. How the two move together is
+ * UpdateEmployeeAction's decision, not a validation rule. Roster
+ * uniqueness and department ownership are, as on create, the Action's
+ * questions.
  */
 class UpdateEmployeeRequest extends FormRequest
 {
+    protected function prepareForValidation(): void
+    {
+        if ($this->has('mobile')) {
+            $mobile = $this->input('mobile');
+
+            $this->merge(['mobile' => is_string($mobile) ? PhoneNumber::normalize($mobile) : $mobile]);
+        }
+    }
+
     /**
      * @return array<string, mixed>
      */
     public function rules(): array
     {
-        return [
-            'employee_no' => ['sometimes', 'nullable', 'string', 'max:50'],
-            'first_name' => ['sometimes', 'string', 'max:100'],
-            'last_name' => ['sometimes', 'string', 'max:100'],
-            'email' => ['sometimes', 'string', 'email', 'max:255'],
-            'mobile' => ['sometimes', 'nullable', 'string', 'max:30'],
-            'department' => ['sometimes', 'nullable', 'string', 'max:120'],
-            'job_title' => ['sometimes', 'nullable', 'string', 'max:120'],
-            'hired_at' => ['sometimes', 'nullable', 'date_format:Y-m-d'],
-            'status' => ['sometimes', 'string', Rule::in(EmployeeStatus::values())],
-        ];
+        return EmployeeFieldRules::forUpdate();
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    public function messages(): array
+    {
+        return EmployeeFieldRules::messages();
     }
 
     /**
      * @return array{
      *     employee_no?: string|null,
      *     first_name?: string,
+     *     middle_name?: string|null,
      *     last_name?: string,
+     *     suffix?: string|null,
      *     email?: string,
      *     mobile?: string|null,
-     *     department?: string|null,
+     *     department_id?: int|null,
      *     job_title?: string|null,
+     *     employment_type?: string,
      *     hired_at?: string|null,
+     *     birthdate?: string|null,
      *     status?: string,
+     *     separated_at?: string|null,
      * }
      */
     public function payload(): array
@@ -56,13 +71,18 @@ class UpdateEmployeeRequest extends FormRequest
          * @var array{
          *     employee_no?: string|null,
          *     first_name?: string,
+         *     middle_name?: string|null,
          *     last_name?: string,
+         *     suffix?: string|null,
          *     email?: string,
          *     mobile?: string|null,
-         *     department?: string|null,
+         *     department_id?: int|null,
          *     job_title?: string|null,
+         *     employment_type?: string,
          *     hired_at?: string|null,
+         *     birthdate?: string|null,
          *     status?: string,
+         *     separated_at?: string|null,
          * } $payload
          */
         $payload = $this->validated();
