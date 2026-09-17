@@ -3,6 +3,7 @@
 namespace App\Domains\Orders\Actions;
 
 use App\Domains\Auth\Models\User;
+use App\Domains\Catalog\Actions\RestoreIngredientsForOrderAction;
 use App\Domains\Orders\Enums\OrderStatus;
 use App\Domains\Orders\Models\Order;
 use Illuminate\Support\Facades\DB;
@@ -18,10 +19,19 @@ use Illuminate\Support\Facades\DB;
  * theft. The acting user is a required argument for that reason; there is
  * no path that voids anonymously.
  *
+ * Also restores any ingredient stock the order's checkout deducted (see
+ * RestoreIngredientsForOrderAction) — a void means the sale didn't
+ * happen, so neither should its effect on stock. Restoration reads
+ * exactly what THIS order deducted, never the product's current recipe.
+ *
  * Same transition guard and same lock rationale as CompleteOrderAction.
  */
 class VoidOrderAction
 {
+    public function __construct(
+        private readonly RestoreIngredientsForOrderAction $restoreIngredients,
+    ) {}
+
     public function execute(Order $order, User $voidedBy): Order
     {
         return DB::transaction(function () use ($order, $voidedBy): Order {
@@ -37,6 +47,8 @@ class VoidOrderAction
             $locked->voided_at = now();
             $locked->voided_by_user_id = $voidedBy->getKey();
             $locked->save();
+
+            $this->restoreIngredients->execute($locked);
 
             return $locked;
         });

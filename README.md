@@ -154,7 +154,9 @@ header — never a redirect.
 | 404    | `not_found`            | Route or model not found                                        |
 | 422    | `validation_failed`    | FormRequest validation failure                                  |
 | 422    | `invalid_transition`   | Order status change the transition map forbids (e.g. completing a voided order), OR a merchant status change `PATCH /admin/merchants/{merchant}/status` forbids (e.g. `pending` → `pending`) — one shared code across both, see § Platform admin |
-| 422    | `product_unavailable`  | Checkout referenced a product that is missing, not the caller's, or flagged unavailable — `errors.product_ids` lists them |
+| 422    | `product_unavailable`  | Checkout referenced a product that is missing, not the caller's, flagged unavailable, or lacks enough of a recipe ingredient for even one unit — `errors.product_ids` lists them |
+| 422    | `insufficient_ingredient_stock` | Checkout's whole-basket ingredient requirement exceeds stock, even though each product individually looked sellable — `errors.ingredients` names the short ones (see § Ingredients & recipes) |
+| 409    | `ingredient_in_use`    | `DELETE /merchant/ingredients/{id}` — the ingredient is still referenced by a product's recipe |
 | 422    | `discount_exceeds_subtotal` | Checkout promo discount is larger than the server-computed post-statutory subtotal (see § Tax & statutory discounts) |
 | 422    | `beneficiary_unused`   | Checkout declared a senior/PWD beneficiary that no line was assigned to — `errors.beneficiaries` names the indexes |
 | 422    | `split_mismatch`       | Split payment whose `cash_cents` + `gcash_cents` don't equal the server-computed total |
@@ -966,11 +968,17 @@ return the same tickets in the same order.
 Available items only by default; `?include_unavailable=1` returns
 everything, for a manager screen that needs to see the greyed-out ones.
 
+`is_available` is `Product::isSellable()`, not the raw column: the
+merchant's manual toggle **and**, for a recipe-bearing product, enough of
+every recipe ingredient in stock for at least one unit — see §
+Ingredients & recipes below. A depleted ingredient greys out every
+product that uses it automatically, with no merchant action required.
+
 It is a **read-only projection** of the shared `products` table, owned by
 the POS lane and living in `App\Domains\Orders` for that reason. Product
-management — categories, images, availability rules — belongs to the
-catalog module and will arrive in its own namespace. Nothing in the POS
-lane writes to `products`.
+management (categories, codes, images, availability rules) belongs to the
+catalog module — see § Catalog below. Nothing in the POS lane writes to
+`products`.
 
 **The cache key is namespaced by merchant, and nothing may bypass that.**
 
@@ -1001,10 +1009,11 @@ two, and assert the key shape as well as the behaviour.
 `products` is a deliberately minimal table (`merchant_id`, `name`,
 `price_cents`, `currency`, `is_available`) created here only because orders
 need something to FK against and checkout needs a server-side price to
-read. **The catalog module owns it** and extends it with its own
-migrations; the POS lane never widens it, and
-`App\Domains\Catalog\Models\Product` stays a bare model with no controller,
-policy, or resource.
+read. **The catalog module owns it** and has extended it with its own
+migrations (`category`, `code`, `description` — see § Catalog); the POS
+lane never widens it. `App\Domains\Catalog\Models\Product` now carries a
+controller, policies, resources, and an observer, all in the catalog
+module's own files — nothing here in the Orders lane changed.
 
 `ProductSeeder` fills it with demo menus — data only, not a module. The two
 merchants get **deliberately different** catalogs: identical ones would make
@@ -1804,6 +1813,8 @@ and `TenantLeakageTest.php`).
 | `orders.void` | Void orders |
 | `queue.view` | View the kitchen queue |
 | `menu.view` | View the menu |
+| `catalog.view` | View the product catalog |
+| `catalog.manage` | Manage the product catalog (add, edit, delete products) |
 | `drawer.view` | View cash sessions |
 | `drawer.open` | Open the drawer |
 | `drawer.close` | Close the drawer |
@@ -1820,7 +1831,7 @@ and `TenantLeakageTest.php`).
 
 | Preset | Permissions |
 | --- | --- |
-| `owner` | **All** 17 catalog permissions. |
+| `owner` | **All** 19 catalog permissions. |
 | `manager` | Every permission **except** `profile.edit` and `team.manage`. |
 | `staff` | `orders.view`, `orders.create`, `orders.complete`, `queue.view`, `menu.view`, `drawer.view`, `drawer.open`, `drawer.movements`, `remittances.create`. **Not** `orders.void`, `drawer.close`, `remittances.confirm` (all three are "someone signs off" actions), **not** `reports.view`, and **not** `profile.*`/`team.*`. |
 
@@ -1835,6 +1846,11 @@ and `TenantLeakageTest.php`).
 | `OrderPolicy` | `viewKitchenQueue` | `queue.view` |
 | `OrderPolicy` | `viewReports` | `reports.view` |
 | — (`MenuController`, no Policy class) | `hasMerchantPermission()` directly | `menu.view` |
+| `ProductPolicy` | `viewAny`, `view` | `catalog.view` |
+| `ProductPolicy` | `create`, `update`, `delete` | `catalog.manage` |
+| `ProductPolicy` | `update` (also gates `RecipeController@update`) | `catalog.manage` |
+| `IngredientPolicy` | `viewAny`, `view` | `catalog.view` |
+| `IngredientPolicy` | `create`, `update`, `delete` | `catalog.manage` |
 | `CashSessionPolicy` | `viewAny`, `view` | `drawer.view` |
 | `CashSessionPolicy` | `create` | `drawer.open` |
 | `CashSessionPolicy` | `close` | `drawer.close` |
@@ -1917,6 +1933,275 @@ EnsureDefaultRegisterAction`, invoked from `Merchant::booted()`'s
 **narrows** when `DefaultRegister`'s `NoRegisterConfigured` fallback (see
 § Registers) can be hit — it does not replace it; a merchant created
 before this phase shipped still falls through to that graceful behavior.
+
+## Catalog
+
+`App\Domains\Catalog` (P11/P12) — full product management (create, edit,
+delete, browse), each product's **recipe**, and the **ingredients** that
+recipe draws stock from, owned by the module the POS lane's `products`
+migration and `MenuController`'s docblocks always pointed at ("the
+catalog module... will bring its own management endpoints"). It
+**extends** that shared contract table rather than replacing it — see
+`database/migrations/2026_09_09_040000_create_products_table.php`'s
+docblock and `App\Domains\Catalog\Models\Product`, the same model class
+the Orders and Menu lanes already depend on.
+
+| Method | Path | Controller | Permission |
+| --- | --- | --- | --- |
+| GET | `/merchant/catalog/categories` | `CategoryController@index` | `catalog.view` |
+| GET | `/merchant/products` | `ProductController@index` | `catalog.view` |
+| POST | `/merchant/products` | `ProductController@store` → `CreateProductAction` | `catalog.manage` |
+| GET | `/merchant/products/{id}` | `ProductController@show` | `catalog.view` |
+| PUT/PATCH | `/merchant/products/{id}` | `ProductController@update` → `UpdateProductAction` | `catalog.manage` |
+| DELETE | `/merchant/products/{id}` | `ProductController@destroy` → `DeleteProductAction` | `catalog.manage` |
+| PUT | `/merchant/products/{id}/recipe` | `RecipeController@update` → `UpdateRecipeAction` | `catalog.manage` |
+| GET | `/merchant/ingredients` | `IngredientController@index` | `catalog.view` |
+| POST | `/merchant/ingredients` | `IngredientController@store` → `CreateIngredientAction` | `catalog.manage` |
+| GET | `/merchant/ingredients/{id}` | `IngredientController@show` | `catalog.view` |
+| PUT/PATCH | `/merchant/ingredients/{id}` | `IngredientController@update` → `UpdateIngredientAction` | `catalog.manage` |
+| DELETE | `/merchant/ingredients/{id}` | `IngredientController@destroy` → `DeleteIngredientAction` | `catalog.manage` |
+
+`{product}`/`{ingredient}` resolve through their merchant-scoped models,
+so a foreign id is a 404 on every verb, never a 403 (see § Tenancy).
+`ProductResource`:
+
+```json
+{
+  "id": 20, "code": "DRK-004", "name": "Matcha Latte", "category": "Drinks",
+  "description": null, "currency": "PHP",
+  "price_cents": 16500, "price_formatted": "₱165.00",
+  "status": "active", "in_stock": true,
+  "recipe": [
+    { "id": 1, "ingredient_id": 1, "ingredient_code": "0001", "ingredient_name": "Matcha Powder", "quantity": 30, "unit": "g", "ingredient_stock_status": "in_stock" },
+    { "id": 2, "ingredient_id": 2, "ingredient_code": "0002", "ingredient_name": "Milk", "quantity": 100, "unit": "ml", "ingredient_stock_status": "in_stock" },
+    { "id": 3, "ingredient_id": 3, "ingredient_code": "0003", "ingredient_name": "Cups (16oz)", "quantity": 1, "unit": "pcs", "ingredient_stock_status": "in_stock" }
+  ],
+  "created_at": "…", "updated_at": "…"
+}
+```
+
+### Product codes
+
+Every catalog-created product gets a human-facing **code** (`DRK-001`) —
+the category's prefix (`config/catalog.php`) plus a per-merchant counter,
+issued by `App\Domains\Catalog\Support\ProductCodeGenerator` inside the
+same transaction as the insert, under a `FOR UPDATE` row lock on
+`product_code_sequences`, so two concurrent creates in the same category
+can never collide. `id` stays the plain numeric key used in URLs; `code`
+is what a person reads.
+
+A code always matches the product's **current** category: changing
+category on update (`UpdateProductAction`) issues a fresh code from the
+new prefix, replacing the old one — a Drinks product moved to Food gets a
+new `FOD-###` rather than keeping a now-mismatched `DRK-###` on a shelf
+label. Client input is still never trusted for the value itself: `code`
+isn't accepted in any request body, on create or update. Vacated numbers
+are **never reused**: moving `DRK-003` out of Drinks leaves that number
+permanently unused, the same as deleting a product does — the next new
+Drinks product is still `DRK-004`. A product NOT created through this
+module (`ProductSeeder`'s demo menu, another domain's factory row) has a
+`null` code and category, and is still a perfectly valid row on the
+shared table — `code`/`category` are nullable specifically so those rows
+never need one; if an update later gives such a product a category, it
+gets its first code by the same rule ("category changed" also covers
+null → something).
+
+### `status` vs `is_available`
+
+The catalog API's own vocabulary (`"active"`/`"inactive"`) sits over the
+shared table's `is_available` boolean — `ProductResource` and the
+FormRequests translate at the boundary; nothing outside this module ever
+sees `"active"`/`"inactive"`, and this module never invents a second
+availability column.
+
+`in_stock` (on `ProductResource`) is a **different statement** from
+`status`: it says nothing about the merchant's manual toggle, only
+whether every recipe ingredient currently has enough on hand for one
+more unit — `every($item => ingredient.quantity_on_hand >= item.quantity_base_units)`
+over an empty recipe is vacuously `true`, so a plain resale item with no
+recipe is always "in stock". This is the same computation
+`Product::isSellable()` does for the POS menu's `is_available` (see §
+"The POS menu, and its cache"), just without also checking the manual
+toggle — a manager browsing the product list wants to know "would this
+sell right now if I turned it on", not "is it on".
+
+### Ingredients & recipes
+
+Ingredients **are** this merchant's inventory now — a product itself
+carries no stock of its own; only its `Ingredient` rows do
+(`App\Domains\Catalog\Models\Ingredient` / `RecipeItem`, replacing an
+earlier per-product `inventory_items` design entirely — see the
+`2026_09_18_000400_drop_inventory_items_table` migration).
+
+**The example that shaped this design:**
+
+```
+Product: Matcha Latte (category: Drinks)
+Recipe:  Matcha Powder  30 g
+         Milk           100 ml
+         Cup (16oz)     1 pcs
+
+Ingredient: Matcha Powder — id 1, code "0001", unit_type mass, display_unit kg,
+            quantity_on_hand 5 kg, low_stock_threshold 1 kg
+```
+
+Ice and hot water are deliberately **not** recipe lines — they aren't
+stock-tracked, so a made-to-order Americano or Iced Latte can have no
+recipe at all and simply always be "in stock" (see above).
+
+**Ingredients** (`IngredientResource`):
+
+```json
+{
+  "id": 1, "code": "0001", "name": "Matcha Powder",
+  "unit_type": "mass", "display_unit": "kg",
+  "quantity_on_hand": 5000000, "quantity_on_hand_formatted": "5 kg",
+  "low_stock_threshold": 1000000, "low_stock_threshold_formatted": "1 kg",
+  "stock_status": "in_stock", "available_units": ["mg", "g", "kg"],
+  "created_at": "…", "updated_at": "…"
+}
+```
+
+- `code` is a **display-only, zero-padded rendering of the numeric id**
+  (`str_pad($id, 4, '0', STR_PAD_LEFT)`, so "0001", "0002", …) — there is
+  no separate generated sequence the way `Product::code` has one; the
+  auto-incrementing id already *is* the unique identifier a merchant
+  asked for. It is not guaranteed to start at `0001` on a given
+  merchant/environment (ids are a single global sequence across every
+  merchant, unlike `Product::code`'s per-merchant counter).
+- `quantity_on_hand` / `low_stock_threshold` are always stored as
+  **integers in the unit family's smallest ("base") unit** — milligrams
+  for mass, milliliters for volume, pieces for count — never as a float,
+  exactly like every money column in this codebase is integer cents (see
+  § Money). `display_unit` is purely which unit a merchant reads them
+  back in; entering/updating a quantity converts through it once, on the
+  way in (`CreateIngredientAction`/`UpdateIngredientAction`), and every
+  later reader (deduction, sellability, the resource's `_formatted`
+  strings) only ever touches the base-unit integer.
+- `unit_type` is **immutable after creation** — every stock quantity and
+  every recipe line pointing at this ingredient is already stored in its
+  base unit; changing the family after the fact would silently redefine
+  what the existing numbers mean. `UpdateIngredientRequest` doesn't even
+  accept the field. A merchant who genuinely needs a different family
+  creates a new ingredient and retires the old one.
+- `stock_status` is **derived, never stored** — `Ingredient::stockStatus()`
+  is the PHP rule and `scopeWithStockStatus()` its SQL twin for `GET
+  /merchant/ingredients?status=`; change both together or neither. `<= 0`
+  → `out_of_stock`, `<= low_stock_threshold` → `low_stock`, else
+  `in_stock`.
+- Deleting an ingredient still referenced by any recipe is refused
+  (`409 ingredient_in_use`) — see `DeleteIngredientAction`.
+
+**Unit conversion — the part this feature exists to get right.** Every
+unit belongs to exactly one family (`App\Domains\Catalog\Enums\UnitType`:
+`mass`, `volume`, `count`), and `App\Domains\Catalog\Enums\Unit`
+**structurally refuses to convert across families**: there is no code
+path anywhere that turns a volume quantity into a mass one, because doing
+so would require guessing a density this system doesn't collect —
+exactly the "30ml of matcha powder against a kg-tracked ingredient"
+mistake a merchant could type by accident. `Unit::fromFamily()` throws
+rather than coercing, and every validator that accepts a `(quantity,
+unit)` pair against a specific ingredient — `StoreIngredientRequest`,
+`UpdateIngredientRequest`, `UpdateRecipeRequest` — checks the unit's
+family against the ingredient's `unit_type` before anything is saved. All
+conversion is **exact integer multiplication** (1 kg is always exactly
+1,000,000 mg), never a float division, so it can never drift across
+thousands of deductions; `Unit::formatQuantity()` divides only to build a
+*display* string, the same one-way rule `Money::format()` already follows
+for prices.
+
+**Recipes** — `PUT /merchant/products/{id}/recipe` replaces a product's
+**entire** recipe in one call (`UpdateRecipeAction`, inside a
+transaction: delete every existing line, insert the new set), the
+simplest shape for a recipe-builder form that's really editing one list.
+Sending `"ingredients": []` clears the recipe. Each line's `unit` must
+belong to the *referenced ingredient's own* `unit_type` — this is the
+check that makes the "ml against a kg-tracked ingredient" mistake
+impossible to save, enforced in `UpdateRecipeRequest::withValidator()`,
+not left to the database. `quantity_base_units` is computed **once**,
+here, from the (quantity, unit) pair; every later reader (deduction,
+sellability) only ever reads that integer, never re-converts.
+
+### Selling a recipe — deduction, and the two-layer stock guard
+
+Selling a recipe-bearing product must deduct exactly the right,
+unit-converted amount from every ingredient it uses, and must never
+oversell. Two layers, deliberately:
+
+1. **`Product::isSellable()`** — a fast, unlocked, moment-in-time signal:
+   the manual `is_available` toggle **and** enough of every recipe
+   ingredient on hand for at least **one** unit. This is what
+   `MenuItemResource.is_available` and `ProductResource.in_stock` report,
+   and what greys out a POS tile before a cashier even taps it. It is
+   only ever a *signal* — two terminals can both see "sellable" and both
+   reach for the last cup of milk a beat apart.
+2. **`DeductIngredientsForOrderAction`** — the real guard, called from
+   inside `CheckoutAction`'s transaction, after pricing but before the
+   order commits. It aggregates every ingredient's requirement across the
+   **whole basket** first (two different drinks that both use matcha
+   powder are summed together, not checked line-by-line — a basket that
+   would individually pass but overshoot in aggregate is still caught),
+   locks every needed `Ingredient` row (`lockForUpdate()`, sorted by id
+   so two concurrent checkouts sharing ingredients can never deadlock
+   each other), and only then checks sufficiency. **Nothing is deducted
+   until every ingredient in the basket is verified** — the same
+   all-or-nothing rule the rest of checkout already follows. Falling
+   short throws `InsufficientIngredientStock` (`422
+   insufficient_ingredient_stock`, `errors.ingredients` names the short
+   ones), which rolls back the entire order — same as `ProductUnavailable`.
+
+   A product can pass layer 1 (enough for **one**) and still fail layer 2
+   (not enough for the **two** this particular basket asked for) — that
+   gap is exactly what layer 2 exists to close.
+
+Each successful deduction writes an `OrderIngredientDeduction` snapshot
+row (`ingredient_id` nullable + `nullOnDelete`, `ingredient_name` frozen
+at sale time, `quantity_base_units` taken, `restored_at`) — the same
+"snapshot, don't re-derive" pattern `order_items` already uses for
+product name/price. **Voiding an order** (`VoidOrderAction` →
+`RestoreIngredientsForOrderAction`) reads that snapshot, not the
+product's *current* recipe (which could reference different ingredients
+by now, or none), and adds each `quantity_base_units` back under the same
+row-locked, sorted-by-id discipline; `restored_at` makes it idempotent
+per deduction row, and a deduction whose ingredient was since deleted is
+skipped rather than erroring.
+
+### The POS menu cache, invalidated automatically
+
+This is the module's half of the cross-lane contract `MenuCache`'s
+docblock describes (see § "The POS menu, and its cache" above), and it
+has **two** observers now, since a product's sellability depends on both
+the product row and its ingredients' stock:
+
+- `App\Domains\Catalog\Observers\ProductObserver`, on `Product::observe()`
+  — calls `MenuCache::forget($product->merchant_id)` on every
+  `saved`/`deleted` event, **scoped to catalog-managed rows only**
+  (`code !== null`): a raw Eloquent write on a non-catalog product
+  (`ProductSeeder`'s menu, a test fixture) does *not* auto-invalidate,
+  which is deliberate — `tests/Feature/Orders/MenuTest.php`'s "a stale
+  menu is served until the cache is invalidated" case exists specifically
+  to prove the cache needs an *explicit* `forget()` there, and a blanket
+  observer would make that assertion false.
+- `App\Domains\Catalog\Observers\IngredientObserver`, on
+  `Ingredient::observe()` — **unscoped**, fires on every `saved`/`deleted`
+  event unconditionally (a manual stock correction, a checkout deduction,
+  a void restoration): there is no "non-catalog ingredient" the way
+  there's a "non-catalog product", so there's no precedent to preserve.
+
+### Demo data
+
+`CatalogDemoSeeder` (called from `DevSeeder`, guarded so it only runs
+once per fresh database) gives Merchant One its catalog products,
+ingredients, and the Matcha Latte / Croissant / Bagel / Blueberry Muffin
+recipes (in a mix of stock states — in stock, low, and out — so the demo
+account shows all three at a glance), and Merchant Two four plain,
+recipe-less products. Everything is issued through the real
+`CreateProductAction` / `CreateIngredientAction` / `UpdateRecipeAction` —
+the seeded codes, ids, and quantities are exactly what a client hitting
+the endpoints would produce, never a parallel fake scheme. Separate from,
+and never overlapping, `ProductSeeder`'s plain POS menu (no
+category/code/recipe) — the two exist for different lanes and neither
+touches the other's rows.
 
 ## Platform admin
 
