@@ -90,6 +90,16 @@ class DevSeeder extends Seeder
             // from real products, so the menu has to exist before them.
             $this->call(ProductSeeder::class);
 
+            // P11: the catalog module's OWN demo rows (category + a real
+            // server-issued code + inventory) — separate from
+            // ProductSeeder's plain menu above, never overlapping it.
+            // Guarded rather than idempotent by row: CreateProductAction
+            // issues a fresh code every call, so re-running unguarded
+            // would append a second batch on every `db:seed`.
+            if (! Product::withoutGlobalScope('merchant')->whereIn('merchant_id', [$merchantOne->id, $merchantTwo->id])->whereNotNull('code')->exists()) {
+                $this->call(CatalogDemoSeeder::class);
+            }
+
             $this->seedCatalogAndOrders($merchantOne, $users['merchant@gasa.test']);
             $this->seedCatalogAndOrders($merchantTwo, $users['merchant2@gasa.test']);
 

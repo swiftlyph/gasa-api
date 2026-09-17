@@ -8,9 +8,14 @@ use Database\Factories\Concerns\CreatesAcrossTenants;
 use Illuminate\Database\Eloquent\Factories\Factory;
 
 /**
- * Minimal factory for the stub Product model — enough to give order items
- * something real to snapshot from and FK to. The catalog module owns
- * anything richer.
+ * Base definition stays the minimal joint-contract shape other domains
+ * (Orders, CashSessions, Reports) already rely on — category/code are
+ * deliberately left NULL by default, exactly like a product seeded
+ * outside the catalog module, so every existing `Product::factory()`
+ * call across the codebase keeps working unchanged.
+ *
+ * Catalog's own tests opt into a real category/code via the
+ * catalogItem()/withCode() states below.
  *
  * @extends Factory<Product>
  */
@@ -45,5 +50,20 @@ class ProductFactory extends Factory
     public function unavailable(): static
     {
         return $this->state(fn () => ['is_available' => false]);
+    }
+
+    /** A catalog-managed row: a real category, matching the fixed list. */
+    public function inCategory(string $category): static
+    {
+        return $this->state(fn () => ['category' => $category]);
+    }
+
+    /**
+     * Explicit code for tests that assert on it. Not fillable, so applied
+     * via setAttribute rather than state()/fill().
+     */
+    public function withCode(string $code): static
+    {
+        return $this->afterMaking(fn (Product $product) => $product->setAttribute('code', $code));
     }
 }
