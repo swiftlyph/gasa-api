@@ -8,6 +8,8 @@ use App\Domains\CashSessions\Exceptions\SessionAlreadyOpen;
 use App\Domains\CashSessions\Models\CashSession;
 use App\Domains\CashSessions\Models\Register;
 use App\Domains\CashSessions\Support\DefaultRegister;
+use App\Domains\Merchant\Actions\RecordMerchantAuditLogAction;
+use App\Domains\Merchant\Support\MerchantAuditAction;
 use App\Domains\Shared\Http\Exceptions\ApiException;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\DB;
@@ -25,6 +27,10 @@ use Illuminate\Support\Facades\DB;
  */
 class OpenCashSessionAction
 {
+    public function __construct(
+        private readonly RecordMerchantAuditLogAction $recordAuditLog,
+    ) {}
+
     /**
      * @param  array{register_id?: int|null, opening_float_cents: int, notes?: string|null}  $payload
      *
@@ -51,7 +57,7 @@ class OpenCashSessionAction
         }
 
         try {
-            return DB::transaction(function () use ($register, $payload, $opener): CashSession {
+            return DB::transaction(function () use ($register, $payload, $opener, $merchant): CashSession {
                 $session = new CashSession([
                     'register_id' => $register->getKey(),
                     'opened_by_user_id' => $opener->getKey(),
@@ -69,6 +75,14 @@ class OpenCashSessionAction
                 // immediately after this call.
                 $session->status = CashSessionStatus::Open;
                 $session->save();
+
+                $this->recordAuditLog->execute(
+                    actor: $opener,
+                    merchant: $merchant,
+                    action: MerchantAuditAction::CashSessionOpened,
+                    subject: $session,
+                    newValues: ['opening_float_cents' => $session->opening_float_cents],
+                );
 
                 return $session;
             });

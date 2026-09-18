@@ -6,6 +6,8 @@ use App\Domains\Auth\Models\User;
 use App\Domains\CashSessions\Exceptions\SessionClosed;
 use App\Domains\CashSessions\Models\CashMovement;
 use App\Domains\CashSessions\Models\CashSession;
+use App\Domains\Merchant\Actions\RecordMerchantAuditLogAction;
+use App\Domains\Merchant\Support\MerchantAuditAction;
 
 /**
  * Records one cash-in or cash-out event against an open session.
@@ -17,6 +19,10 @@ use App\Domains\CashSessions\Models\CashSession;
  */
 class RecordCashMovementAction
 {
+    public function __construct(
+        private readonly RecordMerchantAuditLogAction $recordAuditLog,
+    ) {}
+
     /**
      * @param  array{type: string, amount_cents: int, reason: string}  $payload
      *
@@ -28,11 +34,25 @@ class RecordCashMovementAction
             throw new SessionClosed($cashSession->getKey());
         }
 
-        return $cashSession->movements()->create([
+        $movement = $cashSession->movements()->create([
             'type' => $payload['type'],
             'amount_cents' => $payload['amount_cents'],
             'reason' => $payload['reason'],
             'created_by_user_id' => $recordedBy->getKey(),
         ]);
+
+        $this->recordAuditLog->execute(
+            actor: $recordedBy,
+            merchant: $cashSession->merchant,
+            action: MerchantAuditAction::CashMovementRecorded,
+            subject: $movement,
+            newValues: [
+                'type' => $movement->type->value,
+                'amount_cents' => $movement->amount_cents,
+                'reason' => $movement->reason,
+            ],
+        );
+
+        return $movement;
     }
 }

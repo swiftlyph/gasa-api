@@ -1,6 +1,8 @@
 <?php
 
 use App\Domains\Auth\Models\User;
+use App\Domains\CashSessions\Models\CashSession;
+use App\Domains\CashSessions\Models\Register;
 use App\Domains\Catalog\Models\Product;
 use App\Domains\Merchant\Enums\RoleInMerchant;
 use App\Domains\Merchant\Models\Merchant;
@@ -15,6 +17,15 @@ use Database\Seeders\RoleSeeder;
  * side is covered in PermissionsTest (catalog coverage) and
  * TenantLeakageTest — this file is about WHAT gets recorded and WHAT it
  * looks like.
+ *
+ * Assertions that query MerchantAuditLog directly BETWEEN two HTTP calls
+ * (rather than as the test's last statement) use
+ * withoutGlobalScope('merchant'): MerchantAuditLog uses BelongsToMerchant,
+ * whose scope reads Auth::user() at query time — calling it from the test
+ * body outside a request resolves and caches a guard user that can then
+ * leak into the NEXT ->withToken(...) call's request, silently
+ * authenticating it as the wrong user. See TenantLeakageTest's
+ * `Order::withoutGlobalScope('merchant')` for the same precedent.
  */
 beforeEach(function () {
     $this->seed(RoleSeeder::class);
@@ -28,6 +39,8 @@ beforeEach(function () {
         'price_cents' => 15000,
         'is_available' => true,
     ]);
+
+    $this->register = Register::factory()->forMerchant($this->merchant)->create();
 });
 
 /**
@@ -87,7 +100,7 @@ test('checkout writes exactly one order.checked_out entry, and a replayed checko
         ], ['Idempotency-Key' => 'idem-key-1'])
         ->assertOk();
 
-    expect(MerchantAuditLog::where('action', 'order.checked_out')->count())->toBe(1);
+    expect(MerchantAuditLog::withoutGlobalScope('merchant')->where('action', 'order.checked_out')->count())->toBe(1);
 });
 
 test('completing and voiding an order each write their own entry naming the acting user', function () {
@@ -105,11 +118,6 @@ test('completing and voiding an order each write their own entry naming the acti
         ->postJson("/api/v1/merchant/orders/{$orderId}/complete")
         ->assertOk();
 
-    $entry = MerchantAuditLog::where('action', 'order.completed')->firstOrFail();
-    expect($entry->actor_user_id)->toBe($manager->id)
-        ->and($entry->merchant_id)->toBe($this->merchant->id)
-        ->and($entry->subject_id)->toBe($orderId);
-
     $secondOrderId = $this->withToken($this->ownerToken)
         ->postJson('/api/v1/merchant/orders', [
             'payment_method' => 'cash',
@@ -122,7 +130,78 @@ test('completing and voiding an order each write their own entry naming the acti
         ->postJson("/api/v1/merchant/orders/{$secondOrderId}/void")
         ->assertOk();
 
-    $voidEntry = MerchantAuditLog::where('action', 'order.voided')->firstOrFail();
-    expect($voidEntry->actor_user_id)->toBe($this->owner->id)
-        ->and($voidEntry->subject_id)->toBe($secondOrderId);
+    $entries = MerchantAuditLog::withoutGlobalScope('merchant')
+        ->whereIn('action', ['order.completed', 'order.voided'])
+        ->get()
+        ->keyBy('action');
+
+    expect($entries['order.completed']->actor_user_id)->toBe($manager->id)
+        ->and($entries['order.completed']->merchant_id)->toBe($this->merchant->id)
+        ->and($entries['order.completed']->subject_id)->toBe($orderId)
+        ->and($entries['order.voided']->actor_user_id)->toBe($this->owner->id)
+        ->and($entries['order.voided']->subject_id)->toBe($secondOrderId);
+});
+
+test('opening, recording a movement, and closing a cash session each write their own entry', function () {
+    $sessionId = $this->withToken($this->ownerToken)
+        ->postJson('/api/v1/merchant/cash-sessions', [
+            'register_id' => $this->register->id,
+            'opening_float_cents' => 50000,
+        ])
+        ->assertCreated()
+        ->json('id');
+
+    $this->withToken($this->ownerToken)
+        ->postJson("/api/v1/merchant/cash-sessions/{$sessionId}/movements", [
+            'type' => 'cash_in',
+            'amount_cents' => 5000,
+            'reason' => 'Change fund top-up',
+        ])
+        ->assertCreated();
+
+    $this->withToken($this->ownerToken)
+        ->postJson("/api/v1/merchant/cash-sessions/{$sessionId}/close", ['counted_cash_cents' => 55000])
+        ->assertOk();
+
+    $entries = MerchantAuditLog::withoutGlobalScope('merchant')
+        ->whereIn('action', ['cash_session.opened', 'cash_session.movement_recorded', 'cash_session.closed'])
+        ->get()
+        ->keyBy('action');
+
+    expect($entries['cash_session.opened']->subject_id)->toBe($sessionId)
+        ->and($entries['cash_session.opened']->new_values)->toBe(['opening_float_cents' => 50000])
+        ->and($entries['cash_session.movement_recorded'])->not->toBeNull()
+        ->and($entries['cash_session.closed']->subject_id)->toBe($sessionId);
+});
+
+test('creating and confirming a remittance each write their own entry', function () {
+    [$manager, $managerToken] = attachAuditMember($this->merchant, RoleInMerchant::Manager);
+
+    // Session opened directly via factory, not HTTP, matching
+    // RemittanceTest's own setup.
+    $session = CashSession::factory()
+        ->forMerchant($this->merchant, $this->register, $this->owner)
+        ->open()
+        ->create(['opening_float_cents' => 100000]);
+
+    $remittanceId = $this->withToken($this->ownerToken)
+        ->postJson("/api/v1/merchant/cash-sessions/{$session->id}/remittances", ['amount_cents' => 5000])
+        ->assertCreated()
+        ->json('id');
+
+    // A different user must confirm (segregation of duties) — the manager
+    // confirming the owner's remittance.
+    $this->withToken($managerToken)
+        ->postJson("/api/v1/merchant/remittances/{$remittanceId}/confirm")
+        ->assertOk();
+
+    $entries = MerchantAuditLog::withoutGlobalScope('merchant')
+        ->whereIn('action', ['remittance.created', 'remittance.confirmed'])
+        ->get()
+        ->keyBy('action');
+
+    expect($entries['remittance.created']->subject_id)->toBe($remittanceId)
+        ->and($entries['remittance.created']->actor_user_id)->toBe($this->owner->id)
+        ->and($entries['remittance.confirmed']->subject_id)->toBe($remittanceId)
+        ->and($entries['remittance.confirmed']->actor_user_id)->toBe($manager->id);
 });
