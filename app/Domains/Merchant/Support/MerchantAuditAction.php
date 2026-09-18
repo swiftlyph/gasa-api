@@ -34,6 +34,7 @@ enum MerchantAuditAction: string
     case TeamMemberAdded = 'team.member_added';
     case TeamMemberRoleUpdated = 'team.member_role_updated';
     case TeamMemberRemoved = 'team.member_removed';
+    case TeamMemberPasswordReset = 'team.member_password_reset';
 
     case ProfileUpdated = 'profile.updated';
 }

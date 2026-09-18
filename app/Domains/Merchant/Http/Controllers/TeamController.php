@@ -6,6 +6,7 @@ use App\Domains\Auth\Models\User;
 use App\Domains\Merchant\Actions\AddTeamMemberAction;
 use App\Domains\Merchant\Actions\RecordMerchantAuditLogAction;
 use App\Domains\Merchant\Actions\RemoveTeamMemberAction;
+use App\Domains\Merchant\Actions\ResetTeamMemberPasswordAction;
 use App\Domains\Merchant\Actions\UpdateTeamMemberRoleAction;
 use App\Domains\Merchant\Http\Requests\AddTeamMemberRequest;
 use App\Domains\Merchant\Http\Requests\UpdateTeamMemberRequest;
@@ -21,8 +22,9 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
 /**
- * GET/POST /merchant/team, PATCH/DELETE /merchant/team/{user} — team
- * members and invitations for the caller's own merchant.
+ * GET/POST /merchant/team, PATCH/DELETE /merchant/team/{user}, and POST
+ * /merchant/team/{user}/reset-password — team members and invitations for
+ * the caller's own merchant.
  *
  * AUTHORIZATION:
  *
@@ -205,5 +207,55 @@ class TeamController extends Controller
         // Mirrors AuthController::logout()'s confirmation shape/tone
         // exactly: a small 200 JSON body, never a bare 204.
         return response()->json(['message' => 'Removed from team.', 'code' => 'team_member_removed']);
+    }
+
+    public function resetPassword(
+        Request $request,
+        User $user,
+        ResetTeamMemberPasswordAction $action,
+        RecordMerchantAuditLogAction $recordAuditLog,
+    ): JsonResponse {
+        /** @var User $actingUser */
+        $actingUser = $request->user();
+
+        /** @var Merchant $merchant */
+        $merchant = $actingUser->merchant();
+
+        // Same tenant-membership 404 check as update() — see its comment.
+        if (! $merchant->users()->where('users.id', $user->id)->exists()) {
+            throw new ModelNotFoundException;
+        }
+
+        // Resetting a password is managing the roster, like changing a
+        // role or removing a member — the same team.manage permission.
+        if (! app(TeamMemberPolicy::class)->update($actingUser, $merchant)) {
+            throw new AuthorizationException;
+        }
+
+        $invitation = $action->execute($merchant, $user);
+
+        $recordAuditLog->execute(
+            actor: $actingUser,
+            merchant: $merchant,
+            action: MerchantAuditAction::TeamMemberPasswordReset,
+            subject: $user,
+        );
+
+        $payload = [
+            'message' => 'Password reset. The member must set a new password from their invite link.',
+            'code' => 'team_member_password_reset',
+        ];
+
+        // Dev-only, like store(): the plaintext token is never returned
+        // in production — see CreateTeamInvitationAction's docblock.
+        if (app()->environment(['local', 'development'])) {
+            $payload['invite'] = [
+                'token' => $invitation['token'],
+                'expires_at' => $invitation['expires_at']->toISOString(),
+                'url' => $invitation['invite_url'],
+            ];
+        }
+
+        return response()->json($payload);
     }
 }

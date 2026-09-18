@@ -170,6 +170,7 @@ header — never a redirect.
 | 422    | `member_already_exists` | `POST /merchant/team` — the email is already attached to this merchant |
 | 422    | `email_unavailable`    | `POST /merchant/team` — the email belongs to a user not already on this merchant (never reveals which merchant); also `POST /admin/merchants` — the owner email already belongs to any user |
 | 422    | `cannot_remove_owner`  | `DELETE /merchant/team/{user}` — the target is the merchant's owner |
+| 422    | `cannot_reset_owner_password` | `POST /merchant/team/{user}/reset-password` — the target is the merchant's owner |
 | 422    | `cannot_demote_owner`  | `PATCH /merchant/team/{user}` — the target is the merchant's owner, and the new `role_in_merchant` isn't `owner` |
 | 422    | `employee_email_taken` | `POST`/`PATCH /company/employees`: the email is already on another employee of this company; `errors.email` names it (see § Company & employees) |
 | 422    | `employee_number_taken` | Same, for `employee_no`; `errors.employee_no` names it |
@@ -1701,6 +1702,7 @@ than its creator" rule impossible to satisfy in practice.
 | `POST`   | `/api/v1/merchant/team`               | Add a member: `{ name, email, role_in_merchant }` |
 | `PATCH`  | `/api/v1/merchant/team/{user}`        | Change `role_in_merchant` only |
 | `DELETE` | `/api/v1/merchant/team/{user}`        | Detach from the merchant (never deletes the user row) |
+| `POST`   | `/api/v1/merchant/team/{user}/reset-password` | Replace the member's password with an unusable one, revoke their sessions, and issue a fresh invite link so they set their own (`team.manage`; the owner cannot be reset). The link is returned in local/development only |
 | `POST`   | `/api/v1/auth/accept-invite`          | Public. `{ token, password }` → sets the password, returns a token like login |
 
 ### Profile

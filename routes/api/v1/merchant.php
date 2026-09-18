@@ -56,6 +56,7 @@ Route::prefix('team')->name('merchant.team.')->group(function (): void {
     Route::post('/', [TeamController::class, 'store'])->name('store');
     Route::patch('/{user}', [TeamController::class, 'update'])->name('update');
     Route::delete('/{user}', [TeamController::class, 'destroy'])->name('destroy');
+    Route::post('/{user}/reset-password', [TeamController::class, 'resetPassword'])->name('reset-password');
 });
 
 // The catalog module: full product management (create, edit, delete,

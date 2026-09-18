@@ -333,3 +333,117 @@ test('P7.1: an existing "cashier" pivot row reads as "staff" after the rename mi
         'updated_at' => now(),
     ]))->toThrow(QueryException::class);
 });
+
+test('resetting a member\'s password replaces it, revokes their sessions, and issues a new invite link locally', function () {
+    app()->detectEnvironment(fn () => 'local');
+
+    $created = $this->withToken($this->ownerToken)
+        ->postJson('/api/v1/merchant/team', [
+            'name' => 'Reset Me', 'email' => 'resetme@merchantone.test', 'role_in_merchant' => 'staff',
+        ])
+        ->assertCreated();
+
+    $member = User::where('email', 'resetme@merchantone.test')->firstOrFail();
+    $oldToken = $created->json('invite.token');
+
+    $accepted = $this->postJson('/api/v1/auth/accept-invite', [
+        'token' => $oldToken, 'password' => 'the-old-password',
+    ])->assertOk();
+    $memberToken = $accepted->json('token');
+
+    $this->withToken($memberToken)->getJson('/api/v1/merchant/menu')->assertOk();
+
+    $response = $this->withToken($this->ownerToken)
+        ->postJson("/api/v1/merchant/team/{$member->id}/reset-password")
+        ->assertOk()
+        ->assertJsonPath('code', 'team_member_password_reset')
+        ->assertJsonStructure(['invite' => ['token', 'expires_at', 'url']]);
+
+    app()->detectEnvironment(fn () => 'testing');
+
+    // The old password no longer logs in, and the old session is gone.
+    $this->postJson('/api/v1/auth/login', [
+        'email' => 'resetme@merchantone.test', 'password' => 'the-old-password', 'portal' => 'merchant',
+    ])->assertStatus(401)->assertJsonPath('code', 'invalid_credentials');
+
+    $this->app['auth']->forgetGuards();
+    $this->withToken($memberToken)->getJson('/api/v1/merchant/menu')->assertStatus(401);
+
+    // The new link works; a fresh password is set through it.
+    $this->postJson('/api/v1/auth/accept-invite', [
+        'token' => $response->json('invite.token'), 'password' => 'the-new-password',
+    ])->assertOk();
+
+    $this->postJson('/api/v1/auth/login', [
+        'email' => 'resetme@merchantone.test', 'password' => 'the-new-password', 'portal' => 'merchant',
+    ])->assertOk();
+});
+
+test('resetting a password spends any still-live invite for that member', function () {
+    app()->detectEnvironment(fn () => 'local');
+
+    $created = $this->withToken($this->ownerToken)
+        ->postJson('/api/v1/merchant/team', [
+            'name' => 'Pending', 'email' => 'pending@merchantone.test', 'role_in_merchant' => 'staff',
+        ])
+        ->assertCreated();
+
+    $member = User::where('email', 'pending@merchantone.test')->firstOrFail();
+
+    $this->withToken($this->ownerToken)
+        ->postJson("/api/v1/merchant/team/{$member->id}/reset-password")
+        ->assertOk();
+
+    app()->detectEnvironment(fn () => 'testing');
+
+    $this->postJson('/api/v1/auth/accept-invite', [
+        'token' => $created->json('invite.token'), 'password' => 'a-valid-password',
+    ])->assertStatus(422)->assertJsonPath('code', 'invalid_invite');
+});
+
+test('the invite link is not returned by a password reset outside local/development', function () {
+    $member = User::factory()->withRole('merchant')->create();
+    $this->merchant->users()->attach($member->id, ['role_in_merchant' => 'staff']);
+
+    $this->withToken($this->ownerToken)
+        ->postJson("/api/v1/merchant/team/{$member->id}/reset-password")
+        ->assertOk()
+        ->assertJsonMissingPath('invite');
+});
+
+test('resetting the owner\'s password is 422 cannot_reset_owner_password and changes nothing', function () {
+    $before = $this->owner->fresh()->password;
+
+    $this->withToken($this->ownerToken)
+        ->postJson("/api/v1/merchant/team/{$this->owner->id}/reset-password")
+        ->assertStatus(422)
+        ->assertJsonPath('code', 'cannot_reset_owner_password');
+
+    expect($this->owner->fresh()->password)->toBe($before)
+        ->and($this->owner->tokens()->count())->toBe(1);
+});
+
+test('a foreign merchant\'s user id is 404 on reset-password, never 403', function () {
+    $otherOwner = User::factory()->withRole('merchant')->create();
+    Merchant::factory()->ownedBy($otherOwner)->create(['name' => 'Merchant Two']);
+
+    $this->withToken($this->ownerToken)
+        ->postJson("/api/v1/merchant/team/{$otherOwner->id}/reset-password")
+        ->assertStatus(404)
+        ->assertJsonPath('code', 'not_found');
+});
+
+test('a manager cannot reset a password — team.manage is required', function () {
+    $manager = User::factory()->withRole('merchant')->create();
+    $this->merchant->users()->attach($manager->id, ['role_in_merchant' => 'manager']);
+    $managerToken = $manager->createToken('merchant')->plainTextToken;
+
+    $staff = User::factory()->withRole('merchant')->create();
+    $this->merchant->users()->attach($staff->id, ['role_in_merchant' => 'staff']);
+
+    $this->withToken($managerToken)
+        ->postJson("/api/v1/merchant/team/{$staff->id}/reset-password")
+        ->assertStatus(403)
+        ->assertJsonPath('code', 'permission_denied')
+        ->assertJsonPath('errors.permission.0', 'team.manage');
+});

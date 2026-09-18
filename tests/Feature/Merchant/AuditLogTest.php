@@ -309,6 +309,23 @@ test('adding, changing the role of, and removing a team member each write their 
     expect($removeEntry->subject_id)->toBe($memberId);
 });
 
+test('resetting a team member\'s password writes its own entry', function () {
+    $memberId = $this->withToken($this->ownerToken)
+        ->postJson('/api/v1/merchant/team', [
+            'name' => 'New Hire', 'email' => 'newhire@merchantone.test', 'role_in_merchant' => 'staff',
+        ])
+        ->assertCreated()
+        ->json('id');
+
+    $this->withToken($this->ownerToken)
+        ->postJson("/api/v1/merchant/team/{$memberId}/reset-password")
+        ->assertOk();
+
+    $entry = MerchantAuditLog::withoutGlobalScope('merchant')
+        ->where('action', 'team.member_password_reset')->firstOrFail();
+    expect($entry->subject_id)->toBe($memberId);
+});
+
 test('updating the merchant profile writes an entry with old and new values', function () {
     $this->merchant->update(['legal_name' => 'Old Legal Name']);
 
