@@ -9,6 +9,8 @@ use App\Domains\CashSessions\Models\Register;
 use App\Domains\CashSessions\Support\DefaultRegister;
 use App\Domains\Catalog\Actions\DeductIngredientsForOrderAction;
 use App\Domains\Catalog\Models\Product;
+use App\Domains\Merchant\Actions\RecordMerchantAuditLogAction;
+use App\Domains\Merchant\Support\MerchantAuditAction;
 use App\Domains\Orders\Enums\BeneficiaryType;
 use App\Domains\Orders\Enums\OrderStatus;
 use App\Domains\Orders\Enums\PaymentMethod;
@@ -70,6 +72,7 @@ class CheckoutAction
     public function __construct(
         private readonly GenerateOrderNumberAction $orderNumbers,
         private readonly DeductIngredientsForOrderAction $deductIngredients,
+        private readonly RecordMerchantAuditLogAction $recordAuditLog,
     ) {}
 
     /**
@@ -256,6 +259,18 @@ class CheckoutAction
             // never leaves a half-written order or an order number burnt
             // for nothing.
             $this->deductIngredients->execute($order, $payload['items'], $products);
+
+            $this->recordAuditLog->execute(
+                actor: $cashier,
+                merchant: $merchant,
+                action: MerchantAuditAction::OrderCheckedOut,
+                subject: $order,
+                newValues: [
+                    'order_number' => $order->order_number,
+                    'total_cents' => $order->total_cents,
+                    'payment_method' => $order->payment_method->value,
+                ],
+            );
 
             return $order;
         });
