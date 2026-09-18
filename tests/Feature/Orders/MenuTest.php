@@ -57,6 +57,9 @@ test('the menu returns the merchant\'s available products in a data envelope', f
         ->assertJsonCount(1, 'data')
         ->assertJsonPath('data.0.id', $this->latte->id)
         ->assertJsonPath('data.0.name', 'Cafe Latte (16oz)')
+        // Seeded outside the catalog module (Product::factory() default),
+        // so it carries no category — null, not a placeholder string.
+        ->assertJsonPath('data.0.category', null)
         ->assertJsonPath('data.0.price_cents', 14000)
         ->assertJsonPath('data.0.price_formatted', '₱140.00')
         ->assertJsonPath('data.0.currency', 'PHP')
@@ -64,6 +67,20 @@ test('the menu returns the merchant\'s available products in a data envelope', f
         // Unpaginated: a data key, but no links/meta.
         ->assertJsonMissingPath('links')
         ->assertJsonMissingPath('meta');
+});
+
+test('a catalog-managed product reports its category on the menu', function () {
+    Product::factory()->create([
+        'merchant_id' => $this->merchantOne->id,
+        'name' => 'Croissant',
+        'category' => 'Bakery',
+        'price_cents' => 8500,
+    ]);
+
+    $this->withToken($this->tokenOne)
+        ->getJson('/api/v1/merchant/menu')
+        ->assertOk()
+        ->assertJsonFragment(['name' => 'Croissant', 'category' => 'Bakery']);
 });
 
 test('unavailable items are hidden by default and shown on request', function () {
