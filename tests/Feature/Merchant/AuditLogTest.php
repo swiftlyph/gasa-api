@@ -276,3 +276,49 @@ test('creating, updating, and deleting an ingredient each write their own entry'
         ->where('action', 'ingredient.deleted')->firstOrFail();
     expect($deleteEntry->old_values)->toBe(['id' => $ingredientId, 'name' => 'Espresso Beans (Dark Roast)']);
 });
+
+test('adding, changing the role of, and removing a team member each write their own entry', function () {
+    $memberId = $this->withToken($this->ownerToken)
+        ->postJson('/api/v1/merchant/team', [
+            'name' => 'New Hire', 'email' => 'newhire@merchantone.test', 'role_in_merchant' => 'staff',
+        ])
+        ->assertCreated()
+        ->json('id');
+
+    $addEntry = MerchantAuditLog::withoutGlobalScope('merchant')
+        ->where('action', 'team.member_added')->firstOrFail();
+    expect($addEntry->subject_id)->toBe($memberId)
+        ->and($addEntry->new_values)->toBe(['email' => 'newhire@merchantone.test', 'role_in_merchant' => 'staff']);
+
+    $this->withToken($this->ownerToken)
+        ->patchJson("/api/v1/merchant/team/{$memberId}", ['role_in_merchant' => 'manager'])
+        ->assertOk();
+
+    $roleEntry = MerchantAuditLog::withoutGlobalScope('merchant')
+        ->where('action', 'team.member_role_updated')->firstOrFail();
+    expect($roleEntry->subject_id)->toBe($memberId)
+        ->and($roleEntry->old_values)->toBe(['role_in_merchant' => 'staff'])
+        ->and($roleEntry->new_values)->toBe(['role_in_merchant' => 'manager']);
+
+    $this->withToken($this->ownerToken)
+        ->deleteJson("/api/v1/merchant/team/{$memberId}")
+        ->assertOk();
+
+    $removeEntry = MerchantAuditLog::withoutGlobalScope('merchant')
+        ->where('action', 'team.member_removed')->firstOrFail();
+    expect($removeEntry->subject_id)->toBe($memberId);
+});
+
+test('updating the merchant profile writes an entry with old and new values', function () {
+    $this->merchant->update(['legal_name' => 'Old Legal Name']);
+
+    $this->withToken($this->ownerToken)
+        ->patchJson('/api/v1/merchant/profile', ['legal_name' => 'New Legal Name'])
+        ->assertOk();
+
+    $entry = MerchantAuditLog::withoutGlobalScope('merchant')
+        ->where('action', 'profile.updated')->firstOrFail();
+    expect($entry->subject_id)->toBe($this->merchant->id)
+        ->and($entry->old_values)->toBe(['legal_name' => 'Old Legal Name'])
+        ->and($entry->new_values)->toBe(['legal_name' => 'New Legal Name']);
+});
