@@ -12,9 +12,13 @@ use App\Domains\Catalog\Http\Requests\StoreIngredientRequest;
 use App\Domains\Catalog\Http\Requests\UpdateIngredientRequest;
 use App\Domains\Catalog\Http\Resources\IngredientResource;
 use App\Domains\Catalog\Models\Ingredient;
+use App\Domains\Merchant\Actions\RecordMerchantAuditLogAction;
+use App\Domains\Merchant\Support\MerchantAuditAction;
 use App\Http\Controllers\Controller;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\AnonymousResourceCollection;
+use Illuminate\Support\Arr;
 
 /**
  * Full CRUD, mirroring ProductController's shape exactly: validate
@@ -42,14 +46,24 @@ class IngredientController extends Controller
         return IngredientResource::collection($ingredients);
     }
 
-    public function store(StoreIngredientRequest $request, CreateIngredientAction $action): JsonResponse
+    public function store(StoreIngredientRequest $request, CreateIngredientAction $action, RecordMerchantAuditLogAction $recordAuditLog): JsonResponse
     {
         $this->authorize('create', Ingredient::class);
 
         /** @var User $user */
         $user = $request->user();
 
-        $ingredient = $action->execute($user->merchant(), $request->validated());
+        $merchant = $user->merchant();
+
+        $ingredient = $action->execute($merchant, $request->validated());
+
+        $recordAuditLog->execute(
+            actor: $user,
+            merchant: $merchant,
+            action: MerchantAuditAction::IngredientCreated,
+            subject: $ingredient,
+            newValues: $request->validated(),
+        );
 
         return (new IngredientResource($ingredient))->response()->setStatusCode(201);
     }
@@ -61,18 +75,49 @@ class IngredientController extends Controller
         return new IngredientResource($ingredient);
     }
 
-    public function update(UpdateIngredientRequest $request, Ingredient $ingredient, UpdateIngredientAction $action): IngredientResource
+    public function update(UpdateIngredientRequest $request, Ingredient $ingredient, UpdateIngredientAction $action, RecordMerchantAuditLogAction $recordAuditLog): IngredientResource
     {
         $this->authorize('update', $ingredient);
 
-        return new IngredientResource($action->execute($ingredient, $request->validated()));
+        /** @var User $user */
+        $user = $request->user();
+
+        $before = $ingredient->getOriginal();
+
+        $updated = $action->execute($ingredient, $request->validated());
+
+        $recordAuditLog->execute(
+            actor: $user,
+            merchant: $updated->merchant,
+            action: MerchantAuditAction::IngredientUpdated,
+            subject: $updated,
+            oldValues: Arr::only($before, array_keys($request->validated())),
+            newValues: $request->validated(),
+        );
+
+        return new IngredientResource($updated);
     }
 
-    public function destroy(Ingredient $ingredient, DeleteIngredientAction $action): JsonResponse
+    public function destroy(Request $request, Ingredient $ingredient, DeleteIngredientAction $action, RecordMerchantAuditLogAction $recordAuditLog): JsonResponse
     {
         $this->authorize('delete', $ingredient);
 
+        /** @var User $user */
+        $user = $request->user();
+
+        $merchant = $ingredient->merchant;
+        $ingredientId = $ingredient->getKey();
+        $ingredientName = $ingredient->name;
+
         $action->execute($ingredient);
+
+        $recordAuditLog->execute(
+            actor: $user,
+            merchant: $merchant,
+            action: MerchantAuditAction::IngredientDeleted,
+            subject: $ingredient,
+            oldValues: ['id' => $ingredientId, 'name' => $ingredientName],
+        );
 
         return response()->json(null, 204);
     }

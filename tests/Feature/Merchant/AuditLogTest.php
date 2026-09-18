@@ -3,6 +3,7 @@
 use App\Domains\Auth\Models\User;
 use App\Domains\CashSessions\Models\CashSession;
 use App\Domains\CashSessions\Models\Register;
+use App\Domains\Catalog\Models\Ingredient;
 use App\Domains\Catalog\Models\Product;
 use App\Domains\Merchant\Enums\RoleInMerchant;
 use App\Domains\Merchant\Models\Merchant;
@@ -204,4 +205,74 @@ test('creating and confirming a remittance each write their own entry', function
         ->and($entries['remittance.created']->actor_user_id)->toBe($this->owner->id)
         ->and($entries['remittance.confirmed']->subject_id)->toBe($remittanceId)
         ->and($entries['remittance.confirmed']->actor_user_id)->toBe($manager->id);
+});
+
+test('creating, updating, and deleting a product each write their own entry', function () {
+    $productId = $this->withToken($this->ownerToken)
+        ->postJson('/api/v1/merchant/products', [
+            'name' => 'Iced Latte', 'category' => 'Drinks', 'price_cents' => 12000,
+        ])
+        ->assertCreated()
+        ->json('id');
+
+    $createEntry = MerchantAuditLog::withoutGlobalScope('merchant')
+        ->where('action', 'product.created')->firstOrFail();
+    expect($createEntry->subject_id)->toBe($productId);
+
+    $this->withToken($this->ownerToken)
+        ->putJson("/api/v1/merchant/products/{$productId}", ['name' => 'Iced Latte (Large)'])
+        ->assertOk();
+
+    $updateEntry = MerchantAuditLog::withoutGlobalScope('merchant')
+        ->where('action', 'product.updated')->firstOrFail();
+    expect($updateEntry->subject_id)->toBe($productId)
+        ->and($updateEntry->old_values)->toBe(['name' => 'Iced Latte'])
+        ->and($updateEntry->new_values)->toBe(['name' => 'Iced Latte (Large)']);
+
+    $this->withToken($this->ownerToken)
+        ->deleteJson("/api/v1/merchant/products/{$productId}")
+        ->assertNoContent();
+
+    $deleteEntry = MerchantAuditLog::withoutGlobalScope('merchant')
+        ->where('action', 'product.deleted')->firstOrFail();
+    expect($deleteEntry->old_values)->toBe(['id' => $productId, 'name' => 'Iced Latte (Large)']);
+});
+
+test('updating a recipe writes an entry', function () {
+    $ingredient = Ingredient::factory()->create(['merchant_id' => $this->merchant->id]);
+
+    $this->withToken($this->ownerToken)
+        ->putJson("/api/v1/merchant/products/{$this->product->id}/recipe", [
+            'ingredients' => [['ingredient_id' => $ingredient->id, 'quantity' => 1, 'unit' => $ingredient->display_unit->value]],
+        ])
+        ->assertOk();
+
+    $entry = MerchantAuditLog::withoutGlobalScope('merchant')
+        ->where('action', 'recipe.updated')->firstOrFail();
+    expect($entry->subject_id)->toBe($this->product->id);
+});
+
+test('creating, updating, and deleting an ingredient each write their own entry', function () {
+    $ingredientId = $this->withToken($this->ownerToken)
+        ->postJson('/api/v1/merchant/ingredients', [
+            'name' => 'Espresso Beans', 'unit_type' => 'mass', 'display_unit' => 'kg',
+        ])
+        ->assertCreated()
+        ->json('id');
+
+    expect(MerchantAuditLog::withoutGlobalScope('merchant')->where('action', 'ingredient.created')->count())->toBe(1);
+
+    $this->withToken($this->ownerToken)
+        ->putJson("/api/v1/merchant/ingredients/{$ingredientId}", ['name' => 'Espresso Beans (Dark Roast)'])
+        ->assertOk();
+
+    expect(MerchantAuditLog::withoutGlobalScope('merchant')->where('action', 'ingredient.updated')->count())->toBe(1);
+
+    $this->withToken($this->ownerToken)
+        ->deleteJson("/api/v1/merchant/ingredients/{$ingredientId}")
+        ->assertNoContent();
+
+    $deleteEntry = MerchantAuditLog::withoutGlobalScope('merchant')
+        ->where('action', 'ingredient.deleted')->firstOrFail();
+    expect($deleteEntry->old_values)->toBe(['id' => $ingredientId, 'name' => 'Espresso Beans (Dark Roast)']);
 });
