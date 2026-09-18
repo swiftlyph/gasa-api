@@ -8,6 +8,7 @@ use App\Domains\Catalog\Http\Controllers\CategoryController;
 use App\Domains\Catalog\Http\Controllers\IngredientController;
 use App\Domains\Catalog\Http\Controllers\ProductController;
 use App\Domains\Catalog\Http\Controllers\RecipeController;
+use App\Domains\Merchant\Http\Controllers\MerchantAuditLogController;
 use App\Domains\Merchant\Http\Controllers\MerchantProfileController;
 use App\Domains\Merchant\Http\Controllers\TeamController;
 use App\Domains\Orders\Http\Controllers\CheckoutController;
@@ -191,3 +192,10 @@ Route::prefix('reports')->name('merchant.reports.')->group(function (): void {
     Route::get('/sales-by-day', [ReportController::class, 'salesByDay'])->name('sales-by-day');
     Route::get('/top-items', [ReportController::class, 'topItems'])->name('top-items');
 });
+
+// The merchant's own audit trail (P?) — owner/manager only (audit_log.view,
+// see RolePresets; staff never holds it). Tenant-scoped automatically via
+// MerchantAuditLog's BelongsToMerchant. Deliberately a SEPARATE table from
+// the platform-admin audit_logs (see that model's docblock) — platform_admin
+// has no route into this one at all.
+Route::get('/audit-log', [MerchantAuditLogController::class, 'index'])->name('merchant.audit-log.index');

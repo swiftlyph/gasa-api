@@ -2,11 +2,14 @@
 
 namespace App\Domains\Catalog\Http\Controllers;
 
+use App\Domains\Auth\Models\User;
 use App\Domains\Catalog\Actions\UpdateRecipeAction;
 use App\Domains\Catalog\Http\Requests\UpdateRecipeRequest;
 use App\Domains\Catalog\Http\Resources\ProductResource;
 use App\Domains\Catalog\Models\Product;
 use App\Domains\Catalog\Policies\ProductPolicy;
+use App\Domains\Merchant\Actions\RecordMerchantAuditLogAction;
+use App\Domains\Merchant\Support\MerchantAuditAction;
 use App\Http\Controllers\Controller;
 
 /**
@@ -20,13 +23,26 @@ use App\Http\Controllers\Controller;
  */
 class RecipeController extends Controller
 {
-    public function update(UpdateRecipeRequest $request, Product $product, UpdateRecipeAction $action): ProductResource
+    public function update(UpdateRecipeRequest $request, Product $product, UpdateRecipeAction $action, RecordMerchantAuditLogAction $recordAuditLog): ProductResource
     {
         $this->authorize('update', $product);
+
+        /** @var User $user */
+        $user = $request->user();
 
         /** @var list<array{ingredient_id: int, quantity: int, unit: string}> $lines */
         $lines = $request->validated('ingredients');
 
-        return new ProductResource($action->execute($product, $lines));
+        $updated = $action->execute($product, $lines);
+
+        $recordAuditLog->execute(
+            actor: $user,
+            merchant: $updated->merchant,
+            action: MerchantAuditAction::RecipeUpdated,
+            subject: $updated,
+            newValues: ['ingredients' => $lines],
+        );
+
+        return new ProductResource($updated);
     }
 }

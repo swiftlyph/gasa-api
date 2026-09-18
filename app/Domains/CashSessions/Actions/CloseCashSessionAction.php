@@ -6,6 +6,8 @@ use App\Domains\Auth\Models\User;
 use App\Domains\CashSessions\Enums\CashSessionStatus;
 use App\Domains\CashSessions\Exceptions\SessionClosed;
 use App\Domains\CashSessions\Models\CashSession;
+use App\Domains\Merchant\Actions\RecordMerchantAuditLogAction;
+use App\Domains\Merchant\Support\MerchantAuditAction;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -30,6 +32,7 @@ class CloseCashSessionAction
 {
     public function __construct(
         private readonly ReconcileCashSessionAction $reconcile,
+        private readonly RecordMerchantAuditLogAction $recordAuditLog,
     ) {}
 
     /**
@@ -59,6 +62,17 @@ class CloseCashSessionAction
             }
 
             $cashSession->save();
+
+            $this->recordAuditLog->execute(
+                actor: $closer,
+                merchant: $cashSession->merchant,
+                action: MerchantAuditAction::CashSessionClosed,
+                subject: $cashSession,
+                newValues: [
+                    'counted_cash_cents' => $cashSession->counted_cash_cents,
+                    'variance_cents' => $cashSession->variance_cents,
+                ],
+            );
 
             return $cashSession;
         });

@@ -7,6 +7,8 @@ use App\Domains\CashSessions\Enums\RemittanceStatus;
 use App\Domains\CashSessions\Exceptions\ConfirmationRequiresSecondUser;
 use App\Domains\CashSessions\Exceptions\RemittanceAlreadyConfirmed;
 use App\Domains\CashSessions\Models\CashRemittance;
+use App\Domains\Merchant\Actions\RecordMerchantAuditLogAction;
+use App\Domains\Merchant\Support\MerchantAuditAction;
 
 /**
  * Confirms a pending remittance — the entire segregation-of-duties control
@@ -19,6 +21,10 @@ use App\Domains\CashSessions\Models\CashRemittance;
  */
 class ConfirmRemittanceAction
 {
+    public function __construct(
+        private readonly RecordMerchantAuditLogAction $recordAuditLog,
+    ) {}
+
     /**
      * @throws ConfirmationRequiresSecondUser
      * @throws RemittanceAlreadyConfirmed
@@ -37,6 +43,13 @@ class ConfirmRemittanceAction
         $remittance->confirmed_by_user_id = $confirmer->getKey();
         $remittance->confirmed_at = now();
         $remittance->save();
+
+        $this->recordAuditLog->execute(
+            actor: $confirmer,
+            merchant: $remittance->merchant,
+            action: MerchantAuditAction::RemittanceConfirmed,
+            subject: $remittance,
+        );
 
         return $remittance;
     }

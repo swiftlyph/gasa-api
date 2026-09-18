@@ -4,6 +4,8 @@ namespace App\Domains\Orders\Actions;
 
 use App\Domains\Auth\Models\User;
 use App\Domains\Catalog\Actions\RestoreIngredientsForOrderAction;
+use App\Domains\Merchant\Actions\RecordMerchantAuditLogAction;
+use App\Domains\Merchant\Support\MerchantAuditAction;
 use App\Domains\Orders\Enums\OrderStatus;
 use App\Domains\Orders\Models\Order;
 use Illuminate\Support\Facades\DB;
@@ -30,6 +32,7 @@ class VoidOrderAction
 {
     public function __construct(
         private readonly RestoreIngredientsForOrderAction $restoreIngredients,
+        private readonly RecordMerchantAuditLogAction $recordAuditLog,
     ) {}
 
     public function execute(Order $order, User $voidedBy): Order
@@ -49,6 +52,14 @@ class VoidOrderAction
             $locked->save();
 
             $this->restoreIngredients->execute($locked);
+
+            $this->recordAuditLog->execute(
+                actor: $voidedBy,
+                merchant: $locked->merchant,
+                action: MerchantAuditAction::OrderVoided,
+                subject: $locked,
+                newValues: ['status' => OrderStatus::Voided->value],
+            );
 
             return $locked;
         });

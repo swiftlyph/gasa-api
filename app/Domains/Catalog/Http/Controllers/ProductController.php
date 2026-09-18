@@ -11,9 +11,13 @@ use App\Domains\Catalog\Http\Requests\StoreProductRequest;
 use App\Domains\Catalog\Http\Requests\UpdateProductRequest;
 use App\Domains\Catalog\Http\Resources\ProductResource;
 use App\Domains\Catalog\Models\Product;
+use App\Domains\Merchant\Actions\RecordMerchantAuditLogAction;
+use App\Domains\Merchant\Support\MerchantAuditAction;
 use App\Http\Controllers\Controller;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\AnonymousResourceCollection;
+use Illuminate\Support\Arr;
 
 /**
  * Thin by convention: validate (FormRequest), authorize
@@ -54,14 +58,24 @@ class ProductController extends Controller
         return ProductResource::collection($products);
     }
 
-    public function store(StoreProductRequest $request, CreateProductAction $action): JsonResponse
+    public function store(StoreProductRequest $request, CreateProductAction $action, RecordMerchantAuditLogAction $recordAuditLog): JsonResponse
     {
         $this->authorize('create', Product::class);
 
         /** @var User $user */
         $user = $request->user();
 
-        $product = $action->execute($user->merchant(), $request->validated());
+        $merchant = $user->merchant();
+
+        $product = $action->execute($merchant, $request->validated());
+
+        $recordAuditLog->execute(
+            actor: $user,
+            merchant: $merchant,
+            action: MerchantAuditAction::ProductCreated,
+            subject: $product,
+            newValues: $request->validated(),
+        );
 
         return (new ProductResource($product))->response()->setStatusCode(201);
     }
@@ -73,18 +87,49 @@ class ProductController extends Controller
         return new ProductResource($product->load('recipeItems.ingredient'));
     }
 
-    public function update(UpdateProductRequest $request, Product $product, UpdateProductAction $action): ProductResource
+    public function update(UpdateProductRequest $request, Product $product, UpdateProductAction $action, RecordMerchantAuditLogAction $recordAuditLog): ProductResource
     {
         $this->authorize('update', $product);
 
-        return new ProductResource($action->execute($product, $request->validated()));
+        /** @var User $user */
+        $user = $request->user();
+
+        $before = $product->getOriginal();
+
+        $updated = $action->execute($product, $request->validated());
+
+        $recordAuditLog->execute(
+            actor: $user,
+            merchant: $updated->merchant,
+            action: MerchantAuditAction::ProductUpdated,
+            subject: $updated,
+            oldValues: Arr::only($before, array_keys($request->validated())),
+            newValues: $request->validated(),
+        );
+
+        return new ProductResource($updated);
     }
 
-    public function destroy(Product $product, DeleteProductAction $action): JsonResponse
+    public function destroy(Request $request, Product $product, DeleteProductAction $action, RecordMerchantAuditLogAction $recordAuditLog): JsonResponse
     {
         $this->authorize('delete', $product);
 
+        /** @var User $user */
+        $user = $request->user();
+
+        $merchant = $product->merchant;
+        $productId = $product->getKey();
+        $productName = $product->name;
+
         $action->execute($product);
+
+        $recordAuditLog->execute(
+            actor: $user,
+            merchant: $merchant,
+            action: MerchantAuditAction::ProductDeleted,
+            subject: $product,
+            oldValues: ['id' => $productId, 'name' => $productName],
+        );
 
         return response()->json(null, 204);
     }
