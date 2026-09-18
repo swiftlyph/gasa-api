@@ -43,9 +43,7 @@ use Illuminate\Database\Eloquent\Relations\MorphTo;
 class MerchantAuditLog extends Model
 {
     /** @use HasFactory<MerchantAuditLogFactory> */
-    use HasFactory;
-
-    use BelongsToMerchant;
+    use BelongsToMerchant, HasFactory;
 
     public const UPDATED_AT = null;
 

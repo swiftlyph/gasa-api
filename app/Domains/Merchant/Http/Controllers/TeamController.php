@@ -16,6 +16,7 @@ use App\Domains\Merchant\Support\MerchantAuditAction;
 use App\Http\Controllers\Controller;
 use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
+use Illuminate\Database\Eloquent\Relations\Pivot;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
@@ -149,7 +150,15 @@ class TeamController extends Controller
             throw new AuthorizationException;
         }
 
-        $previousRole = $existingMember->pivot->role_in_merchant;
+        // See TeamMemberResource's docblock for why this reads via
+        // getAttribute() rather than magic property access: Pivot
+        // declares no `role_in_merchant` property of its own, so PHPStan
+        // can't see it through ->pivot->role_in_merchant directly.
+        /** @var Pivot $existingPivot */
+        $existingPivot = $existingMember->pivot;
+
+        /** @var string $previousRole */
+        $previousRole = $existingPivot->getAttribute('role_in_merchant');
 
         $action->execute($merchant, $user, $request->payload()['role_in_merchant']);
 
