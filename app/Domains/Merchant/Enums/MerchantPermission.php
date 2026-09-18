@@ -60,6 +60,8 @@ enum MerchantPermission: string
     case TeamView = 'team.view';
     case TeamManage = 'team.manage';
 
+    case AuditLogView = 'audit_log.view';
+
     /**
      * A short human label — for the frontend/docs, never used in
      * authorization logic itself (that's always the backed ->value).
@@ -86,6 +88,7 @@ enum MerchantPermission: string
             self::ProfileEdit => 'Edit the merchant profile',
             self::TeamView => 'View team members',
             self::TeamManage => 'Manage team members (add, change role, remove)',
+            self::AuditLogView => 'View the audit trail',
         };
     }
 

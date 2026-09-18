@@ -182,6 +182,9 @@ test('catalog coverage: every permission is enforced, directly or via the preset
         // catalog module's own endpoints.
         MerchantPermission::CatalogView->value => [$staffToken, fn ($t) => $this->withToken($t)->getJson('/api/v1/merchant/products')],
         MerchantPermission::CatalogManage->value => [$staffToken, fn ($t) => $this->withToken($t)->postJson('/api/v1/merchant/products', ['name' => 'X', 'category' => 'Drinks', 'price_cents' => 100])],
+
+        // The audit trail: owner/manager only — staff never holds it.
+        MerchantPermission::AuditLogView->value => [$staffToken, fn ($t) => $this->withToken($t)->getJson('/api/v1/merchant/audit-log')],
     ];
 
     foreach ($deniable as $permission => [$token, $call]) {
