@@ -2,6 +2,10 @@
 
 namespace App\Providers;
 
+use App\Domains\Catalog\Models\Ingredient;
+use App\Domains\Catalog\Models\Product;
+use App\Domains\Catalog\Observers\IngredientObserver;
+use App\Domains\Catalog\Observers\ProductObserver;
 use App\Domains\Shared\Concerns\TenantContext;
 use Illuminate\Cache\RateLimiting\Limit;
 use Illuminate\Database\Eloquent\Model;
@@ -60,5 +64,16 @@ class AppServiceProvider extends ServiceProvider
 
             return Limit::perMinute(5)->by($email.'|'.$request->ip());
         });
+
+        // The catalog module's half of MenuCache's cross-lane contract
+        // (see that class's docblock and README § "The POS menu, and its
+        // cache"): any create/update/delete on a product invalidates the
+        // POS till's cached menu for that merchant.
+        Product::observe(ProductObserver::class);
+
+        // Same contract, the ingredient side: a stock change can flip
+        // whether a product that uses it is sellable, so it invalidates
+        // the menu too — see IngredientObserver's docblock.
+        Ingredient::observe(IngredientObserver::class);
     }
 }

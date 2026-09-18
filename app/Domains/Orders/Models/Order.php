@@ -4,6 +4,7 @@ namespace App\Domains\Orders\Models;
 
 use App\Domains\Auth\Models\User;
 use App\Domains\CashSessions\Models\CashSession;
+use App\Domains\Catalog\Models\OrderIngredientDeduction;
 use App\Domains\Orders\Enums\OrderStatus;
 use App\Domains\Orders\Enums\PaymentMethod;
 use App\Domains\Orders\Policies\OrderPolicy;
@@ -175,6 +176,18 @@ class Order extends Model
     public function beneficiaries(): HasMany
     {
         return $this->hasMany(OrderBeneficiary::class);
+    }
+
+    /**
+     * The ingredient-stock snapshot checkout deducted for this order —
+     * what a void restores from. See
+     * App\Domains\Catalog\Models\OrderIngredientDeduction's docblock.
+     *
+     * @return HasMany<OrderIngredientDeduction, $this>
+     */
+    public function ingredientDeductions(): HasMany
+    {
+        return $this->hasMany(OrderIngredientDeduction::class);
     }
 
     /**

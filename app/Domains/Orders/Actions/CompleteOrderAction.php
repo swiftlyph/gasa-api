@@ -2,6 +2,9 @@
 
 namespace App\Domains\Orders\Actions;
 
+use App\Domains\Auth\Models\User;
+use App\Domains\Merchant\Actions\RecordMerchantAuditLogAction;
+use App\Domains\Merchant\Support\MerchantAuditAction;
 use App\Domains\Orders\Enums\OrderStatus;
 use App\Domains\Orders\Models\Order;
 use Illuminate\Support\Facades\DB;
@@ -27,9 +30,13 @@ use Illuminate\Support\Facades\DB;
  */
 class CompleteOrderAction
 {
-    public function execute(Order $order): Order
+    public function __construct(
+        private readonly RecordMerchantAuditLogAction $recordAuditLog,
+    ) {}
+
+    public function execute(Order $order, User $completedBy): Order
     {
-        return DB::transaction(function () use ($order): Order {
+        return DB::transaction(function () use ($order, $completedBy): Order {
             /** @var Order $locked */
             $locked = $order->newQuery()
                 ->whereKey($order->getKey())
@@ -41,6 +48,14 @@ class CompleteOrderAction
             $locked->status = OrderStatus::Completed;
             $locked->completed_at = now();
             $locked->save();
+
+            $this->recordAuditLog->execute(
+                actor: $completedBy,
+                merchant: $locked->merchant,
+                action: MerchantAuditAction::OrderCompleted,
+                subject: $locked,
+                newValues: ['status' => OrderStatus::Completed->value],
+            );
 
             return $locked;
         });

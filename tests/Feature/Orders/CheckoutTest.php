@@ -1,7 +1,11 @@
 <?php
 
 use App\Domains\Auth\Models\User;
+use App\Domains\Catalog\Enums\Unit;
+use App\Domains\Catalog\Models\Ingredient;
+use App\Domains\Catalog\Models\OrderIngredientDeduction;
 use App\Domains\Catalog\Models\Product;
+use App\Domains\Catalog\Models\RecipeItem;
 use App\Domains\Merchant\Models\Merchant;
 use App\Domains\Orders\Actions\GenerateOrderNumberAction;
 use App\Domains\Orders\Enums\OrderStatus;
@@ -354,6 +358,128 @@ test('a failure AFTER the counter moves rolls the counter back too', function ()
         ->and(OrderItem::query()->count())->toBe(0)
         ->and(DB::table('merchant_order_counters')->where('merchant_id', $this->merchant->id)->count())
         ->toBe(0);
+});
+
+/*
+|--------------------------------------------------------------------------
+| Ingredient deduction (P12) — see DeductIngredientsForOrderAction
+|--------------------------------------------------------------------------
+|
+| A recipe-bearing product's sale must deduct the right, UNIT-CONVERTED
+| amount from each ingredient it uses, atomically with the rest of the
+| order, and never oversell. See RecipeTest for attaching a recipe and
+| UnitTest for the conversion arithmetic itself.
+*/
+
+test('selling a recipe-bearing product deducts the exact converted amount from each ingredient, and snapshots what was taken', function () {
+    $matchaPowder = Ingredient::factory()->mass()->create(['merchant_id' => $this->merchant->id, 'name' => 'Matcha Powder', 'quantity_on_hand' => Unit::Kilogram->toBaseUnits(5)]);
+    $milk = Ingredient::factory()->volume()->create(['merchant_id' => $this->merchant->id, 'name' => 'Milk', 'quantity_on_hand' => Unit::Liter->toBaseUnits(5)]);
+    $cups = Ingredient::factory()->pieces()->create(['merchant_id' => $this->merchant->id, 'name' => 'Cups', 'quantity_on_hand' => 200]);
+
+    $matchaLatte = Product::factory()->create(['merchant_id' => $this->merchant->id, 'name' => 'Matcha Latte', 'price_cents' => 16500]);
+    RecipeItem::factory()->of(30, Unit::Gram)->create(['merchant_id' => $this->merchant->id, 'product_id' => $matchaLatte->id, 'ingredient_id' => $matchaPowder->id]);
+    RecipeItem::factory()->of(100, Unit::Milliliter)->create(['merchant_id' => $this->merchant->id, 'product_id' => $matchaLatte->id, 'ingredient_id' => $milk->id]);
+    RecipeItem::factory()->of(1, Unit::Piece)->create(['merchant_id' => $this->merchant->id, 'product_id' => $matchaLatte->id, 'ingredient_id' => $cups->id]);
+
+    $order = ($this->checkout)([
+        'payment_method' => 'cash',
+        'items' => [['product_id' => $matchaLatte->id, 'quantity' => 2]],
+    ])->assertCreated()->json();
+
+    // 30g * 2 = 60g deducted from a 5kg (5,000,000mg) stock.
+    expect($matchaPowder->fresh()->quantity_on_hand)->toBe(Unit::Kilogram->toBaseUnits(5) - Unit::Gram->toBaseUnits(60))
+        ->and($milk->fresh()->quantity_on_hand)->toBe(Unit::Liter->toBaseUnits(5) - Unit::Milliliter->toBaseUnits(200))
+        ->and($cups->fresh()->quantity_on_hand)->toBe(200 - 2);
+
+    $deductions = OrderIngredientDeduction::query()->where('order_id', $order['id'])->get()->keyBy('ingredient_id');
+
+    expect($deductions[$matchaPowder->id]->quantity_base_units)->toBe(Unit::Gram->toBaseUnits(60))
+        ->and($deductions[$matchaPowder->id]->ingredient_name)->toBe('Matcha Powder')
+        ->and($deductions[$matchaPowder->id]->restored_at)->toBeNull()
+        ->and($deductions[$milk->id]->quantity_base_units)->toBe(Unit::Milliliter->toBaseUnits(200))
+        ->and($deductions[$cups->id]->quantity_base_units)->toBe(2);
+});
+
+test('two different products sharing an ingredient are aggregated across the whole basket before checking stock', function () {
+    $milk = Ingredient::factory()->volume()->create(['merchant_id' => $this->merchant->id, 'name' => 'Milk', 'quantity_on_hand' => Unit::Milliliter->toBaseUnits(250)]);
+
+    $latteA = Product::factory()->create(['merchant_id' => $this->merchant->id, 'name' => 'Latte A', 'price_cents' => 10000]);
+    $latteB = Product::factory()->create(['merchant_id' => $this->merchant->id, 'name' => 'Latte B', 'price_cents' => 10000]);
+    RecipeItem::factory()->of(100, Unit::Milliliter)->create(['merchant_id' => $this->merchant->id, 'product_id' => $latteA->id, 'ingredient_id' => $milk->id]);
+    RecipeItem::factory()->of(100, Unit::Milliliter)->create(['merchant_id' => $this->merchant->id, 'product_id' => $latteB->id, 'ingredient_id' => $milk->id]);
+
+    // Each product alone would pass a naive per-line check against 250ml
+    // (100ml < 250ml), but together they need 200ml, which still fits —
+    // this proves the aggregation, not just that it under-requests.
+    ($this->checkout)([
+        'payment_method' => 'cash',
+        'items' => [
+            ['product_id' => $latteA->id, 'quantity' => 1],
+            ['product_id' => $latteB->id, 'quantity' => 1],
+        ],
+    ])->assertCreated();
+
+    expect($milk->fresh()->quantity_on_hand)->toBe(Unit::Milliliter->toBaseUnits(50));
+});
+
+test('insufficient stock is a 422 insufficient_ingredient_stock naming the short ingredient, and writes nothing at all', function () {
+    // Enough matcha powder for ONE latte (so Product::isSellable() — the
+    // fast, per-unit signal — says yes and lets this basket past the
+    // product_unavailable check) but not for the two this basket actually
+    // asks for. This is exactly the gap DeductIngredientsForOrderAction's
+    // row-locked, whole-basket check exists to close.
+    $matchaPowder = Ingredient::factory()->mass()->create(['merchant_id' => $this->merchant->id, 'name' => 'Matcha Powder', 'quantity_on_hand' => Unit::Gram->toBaseUnits(40)]);
+    $milk = Ingredient::factory()->volume()->create(['merchant_id' => $this->merchant->id, 'name' => 'Milk', 'quantity_on_hand' => Unit::Liter->toBaseUnits(5)]);
+
+    $matchaLatte = Product::factory()->create(['merchant_id' => $this->merchant->id, 'name' => 'Matcha Latte', 'price_cents' => 16500]);
+    RecipeItem::factory()->of(30, Unit::Gram)->create(['merchant_id' => $this->merchant->id, 'product_id' => $matchaLatte->id, 'ingredient_id' => $matchaPowder->id]);
+    RecipeItem::factory()->of(100, Unit::Milliliter)->create(['merchant_id' => $this->merchant->id, 'product_id' => $matchaLatte->id, 'ingredient_id' => $milk->id]);
+
+    ($this->checkout)([
+        'payment_method' => 'cash',
+        'items' => [['product_id' => $matchaLatte->id, 'quantity' => 2]],
+    ])->assertStatus(422)
+        ->assertJsonPath('code', 'insufficient_ingredient_stock')
+        ->assertJsonPath('errors.ingredients', ['Matcha Powder']);
+
+    // All-or-nothing: the order, its lines, AND every ingredient (even
+    // milk, which had plenty) are untouched.
+    expect(Order::query()->count())->toBe(0)
+        ->and(OrderItem::query()->count())->toBe(0)
+        ->and($matchaPowder->fresh()->quantity_on_hand)->toBe(Unit::Gram->toBaseUnits(40))
+        ->and($milk->fresh()->quantity_on_hand)->toBe(Unit::Liter->toBaseUnits(5))
+        ->and(OrderIngredientDeduction::query()->count())->toBe(0);
+});
+
+test('a product whose single-unit stock check passes but the requested quantity alone can\'t cover is a 422 product_unavailable, not a silent partial sale', function () {
+    // The complementary case to the one above: not enough for even ONE
+    // unit, so Product::isSellable() itself already says no, and the
+    // basket is rejected at the earlier, cheaper check — the deduction
+    // guard is never reached, and correctly so.
+    $matchaPowder = Ingredient::factory()->mass()->create(['merchant_id' => $this->merchant->id, 'name' => 'Matcha Powder', 'quantity_on_hand' => Unit::Gram->toBaseUnits(20)]);
+    $matchaLatte = Product::factory()->create(['merchant_id' => $this->merchant->id, 'name' => 'Matcha Latte', 'price_cents' => 16500]);
+    RecipeItem::factory()->of(30, Unit::Gram)->create(['merchant_id' => $this->merchant->id, 'product_id' => $matchaLatte->id, 'ingredient_id' => $matchaPowder->id]);
+
+    ($this->checkout)([
+        'payment_method' => 'cash',
+        'items' => [['product_id' => $matchaLatte->id, 'quantity' => 1]],
+    ])->assertStatus(422)
+        ->assertJsonPath('code', 'product_unavailable');
+
+    expect(Order::query()->count())->toBe(0)
+        ->and($matchaPowder->fresh()->quantity_on_hand)->toBe(Unit::Gram->toBaseUnits(20));
+});
+
+test('a product with no recipe (made to order) checks out without touching any ingredient', function () {
+    $sugar = Ingredient::factory()->mass()->create(['merchant_id' => $this->merchant->id, 'name' => 'Sugar', 'quantity_on_hand' => Unit::Kilogram->toBaseUnits(1)]);
+
+    ($this->checkout)([
+        'payment_method' => 'cash',
+        'items' => [['product_id' => $this->latte->id, 'quantity' => 3]],
+    ])->assertCreated();
+
+    expect($sugar->fresh()->quantity_on_hand)->toBe(Unit::Kilogram->toBaseUnits(1))
+        ->and(OrderIngredientDeduction::query()->count())->toBe(0);
 });
 
 test('a basket sent as a JSON object rather than an array is rejected', function () {

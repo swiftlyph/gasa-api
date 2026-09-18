@@ -4,6 +4,7 @@ namespace App\Domains\Merchant\Http\Controllers;
 
 use App\Domains\Auth\Models\User;
 use App\Domains\Merchant\Actions\AddTeamMemberAction;
+use App\Domains\Merchant\Actions\RecordMerchantAuditLogAction;
 use App\Domains\Merchant\Actions\RemoveTeamMemberAction;
 use App\Domains\Merchant\Actions\UpdateTeamMemberRoleAction;
 use App\Domains\Merchant\Http\Requests\AddTeamMemberRequest;
@@ -11,9 +12,11 @@ use App\Domains\Merchant\Http\Requests\UpdateTeamMemberRequest;
 use App\Domains\Merchant\Http\Resources\TeamMemberResource;
 use App\Domains\Merchant\Models\Merchant;
 use App\Domains\Merchant\Policies\TeamMemberPolicy;
+use App\Domains\Merchant\Support\MerchantAuditAction;
 use App\Http\Controllers\Controller;
 use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
+use Illuminate\Database\Eloquent\Relations\Pivot;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
@@ -67,7 +70,7 @@ class TeamController extends Controller
         return response()->json(['data' => $data]);
     }
 
-    public function store(AddTeamMemberRequest $request, AddTeamMemberAction $action): JsonResponse
+    public function store(AddTeamMemberRequest $request, AddTeamMemberAction $action, RecordMerchantAuditLogAction $recordAuditLog): JsonResponse
     {
         /** @var User $user */
         $user = $request->user();
@@ -84,6 +87,17 @@ class TeamController extends Controller
         /** @var User $member */
         $member = $result['user'];
         $invitation = $result['invitation'];
+
+        $recordAuditLog->execute(
+            actor: $user,
+            merchant: $merchant,
+            action: MerchantAuditAction::TeamMemberAdded,
+            subject: $member,
+            newValues: [
+                'email' => (string) $member->email,
+                'role_in_merchant' => $request->payload()['role_in_merchant'],
+            ],
+        );
 
         $payload = [
             'id' => $member->id,
@@ -112,6 +126,7 @@ class TeamController extends Controller
         UpdateTeamMemberRequest $request,
         User $user,
         UpdateTeamMemberRoleAction $action,
+        RecordMerchantAuditLogAction $recordAuditLog,
     ): TeamMemberResource {
         /** @var User $actingUser */
         $actingUser = $request->user();
@@ -125,7 +140,9 @@ class TeamController extends Controller
         // here. Always 404, never 403: a 403 would confirm the row exists
         // for another merchant, exactly the leak TenantLeakageTest guards
         // against for every other tenant-owned resource.
-        if (! $merchant->users()->where('users.id', $user->id)->exists()) {
+        $existingMember = $merchant->users()->where('users.id', $user->id)->first();
+
+        if ($existingMember === null) {
             throw new ModelNotFoundException;
         }
 
@@ -133,14 +150,33 @@ class TeamController extends Controller
             throw new AuthorizationException;
         }
 
+        // See TeamMemberResource's docblock for why this reads via
+        // getAttribute() rather than magic property access: Pivot
+        // declares no `role_in_merchant` property of its own, so PHPStan
+        // can't see it through ->pivot->role_in_merchant directly.
+        /** @var Pivot $existingPivot */
+        $existingPivot = $existingMember->pivot;
+
+        /** @var string $previousRole */
+        $previousRole = $existingPivot->getAttribute('role_in_merchant');
+
         $action->execute($merchant, $user, $request->payload()['role_in_merchant']);
 
         $member = $merchant->users()->where('users.id', $user->id)->first();
 
+        $recordAuditLog->execute(
+            actor: $actingUser,
+            merchant: $merchant,
+            action: MerchantAuditAction::TeamMemberRoleUpdated,
+            subject: $user,
+            oldValues: ['role_in_merchant' => $previousRole],
+            newValues: ['role_in_merchant' => $request->payload()['role_in_merchant']],
+        );
+
         return new TeamMemberResource($member, $merchant);
     }
 
-    public function destroy(Request $request, User $user, RemoveTeamMemberAction $action): JsonResponse
+    public function destroy(Request $request, User $user, RemoveTeamMemberAction $action, RecordMerchantAuditLogAction $recordAuditLog): JsonResponse
     {
         /** @var User $actingUser */
         $actingUser = $request->user();
@@ -158,6 +194,13 @@ class TeamController extends Controller
         }
 
         $action->execute($merchant, $user);
+
+        $recordAuditLog->execute(
+            actor: $actingUser,
+            merchant: $merchant,
+            action: MerchantAuditAction::TeamMemberRemoved,
+            subject: $user,
+        );
 
         // Mirrors AuthController::logout()'s confirmation shape/tone
         // exactly: a small 200 JSON body, never a bare 204.

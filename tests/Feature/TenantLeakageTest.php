@@ -6,6 +6,7 @@ use App\Domains\CashSessions\Models\CashSession;
 use App\Domains\CashSessions\Models\Register;
 use App\Domains\Catalog\Models\Product;
 use App\Domains\Merchant\Models\Merchant;
+use App\Domains\Merchant\Models\MerchantAuditLog;
 use App\Domains\Orders\Models\CheckoutIdempotencyKey;
 use App\Domains\Orders\Models\Order;
 use App\Domains\Orders\Models\OrderItem;
@@ -1417,6 +1418,38 @@ test('audit logs are unreachable outside admin.api', function () {
     $this->withToken($merchantToken)->getJson('/api/v1/admin/audit-logs')
         ->assertStatus(403)
         ->assertJson(['code' => 'forbidden']);
+});
+
+test('the merchant audit trail is unreachable by platform_admin and never leaks across merchants', function () {
+    // platform_admin does not hold role:merchant, so merchant.api's own
+    // role middleware rejects it before this endpoint (or its policy) is
+    // ever reached — the same wall every other merchant route relies on.
+    $admin = User::factory()->withRole('platform_admin')->create();
+    $adminToken = $admin->createToken('admin')->plainTextToken;
+
+    $this->withToken($adminToken)->getJson('/api/v1/merchant/audit-log')
+        ->assertStatus(403)
+        ->assertJson(['code' => 'forbidden']);
+
+    // Cross-tenant isolation: an entry recorded for merchant one must
+    // never appear in merchant two's own trail, matching every other
+    // BelongsToMerchant-scoped resource in this suite.
+    MerchantAuditLog::factory()->create([
+        'merchant_id' => $this->merchantOne->id,
+        'action' => 'product.created',
+    ]);
+
+    $merchantTwoToken = $this->merchantTwoUser->createToken('merchant')->plainTextToken;
+
+    $this->withToken($merchantTwoToken)->getJson('/api/v1/merchant/audit-log')
+        ->assertOk()
+        ->assertJsonCount(0, 'data');
+
+    $merchantOneToken = $this->merchantOneUser->createToken('merchant')->plainTextToken;
+
+    $this->withToken($merchantOneToken)->getJson('/api/v1/merchant/audit-log')
+        ->assertOk()
+        ->assertJsonCount(1, 'data');
 });
 
 /*

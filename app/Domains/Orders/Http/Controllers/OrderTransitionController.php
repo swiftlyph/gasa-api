@@ -25,11 +25,14 @@ use Illuminate\Http\Request;
  */
 class OrderTransitionController extends Controller
 {
-    public function complete(Order $order, CompleteOrderAction $action): OrderResource
+    public function complete(Request $request, Order $order, CompleteOrderAction $action): OrderResource
     {
         $this->authorize('complete', $order);
 
-        $completed = $action->execute($order);
+        /** @var User $user */
+        $user = $request->user();
+
+        $completed = $action->execute($order, $user);
 
         return new OrderResource($completed->load(['items.addOns', 'beneficiaries']));
     }

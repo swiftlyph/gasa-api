@@ -37,6 +37,13 @@ enum MerchantPermission: string
     case QueueView = 'queue.view';
     case MenuView = 'menu.view';
 
+    // The catalog module: viewing/managing the merchant's own product
+    // catalog (name, category, price, inventory tracking) - distinct
+    // from menu.view, which only lets the POS/till READ the shared
+    // products table for its tiles.
+    case CatalogView = 'catalog.view';
+    case CatalogManage = 'catalog.manage';
+
     case DrawerView = 'drawer.view';
     case DrawerOpen = 'drawer.open';
     case DrawerClose = 'drawer.close';
@@ -53,6 +60,8 @@ enum MerchantPermission: string
     case TeamView = 'team.view';
     case TeamManage = 'team.manage';
 
+    case AuditLogView = 'audit_log.view';
+
     /**
      * A short human label — for the frontend/docs, never used in
      * authorization logic itself (that's always the backed ->value).
@@ -66,6 +75,8 @@ enum MerchantPermission: string
             self::OrdersVoid => 'Void orders',
             self::QueueView => 'View the kitchen queue',
             self::MenuView => 'View the menu',
+            self::CatalogView => 'View the product catalog',
+            self::CatalogManage => 'Manage the product catalog (add, edit, delete products)',
             self::DrawerView => 'View cash sessions',
             self::DrawerOpen => 'Open the drawer',
             self::DrawerClose => 'Close the drawer',
@@ -77,6 +88,7 @@ enum MerchantPermission: string
             self::ProfileEdit => 'Edit the merchant profile',
             self::TeamView => 'View team members',
             self::TeamManage => 'Manage team members (add, change role, remove)',
+            self::AuditLogView => 'View the audit trail',
         };
     }
 

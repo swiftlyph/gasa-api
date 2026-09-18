@@ -176,6 +176,15 @@ test('catalog coverage: every permission is enforced, directly or via the preset
         MerchantPermission::ProfileEdit->value => [$managerToken, fn ($t) => $this->withToken($t)->patchJson('/api/v1/merchant/profile', ['legal_name' => 'X'])],
         MerchantPermission::TeamView->value => [$staffToken, fn ($t) => $this->withToken($t)->getJson('/api/v1/merchant/team')],
         MerchantPermission::TeamManage->value => [$managerToken, fn ($t) => $this->withToken($t)->postJson('/api/v1/merchant/team', ['name' => 'X', 'email' => 'covered@merchantone.test', 'role_in_merchant' => 'staff'])],
+
+        // The catalog module (P11): staff gets neither permission — the
+        // till-facing subset uses menu.view to browse the POS, not the
+        // catalog module's own endpoints.
+        MerchantPermission::CatalogView->value => [$staffToken, fn ($t) => $this->withToken($t)->getJson('/api/v1/merchant/products')],
+        MerchantPermission::CatalogManage->value => [$staffToken, fn ($t) => $this->withToken($t)->postJson('/api/v1/merchant/products', ['name' => 'X', 'category' => 'Drinks', 'price_cents' => 100])],
+
+        // The audit trail: owner/manager only — staff never holds it.
+        MerchantPermission::AuditLogView->value => [$staffToken, fn ($t) => $this->withToken($t)->getJson('/api/v1/merchant/audit-log')],
     ];
 
     foreach ($deniable as $permission => [$token, $call]) {

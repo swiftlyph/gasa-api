@@ -8,6 +8,8 @@ use App\Domains\CashSessions\Exceptions\RemittanceExceedsCash;
 use App\Domains\CashSessions\Exceptions\SessionClosed;
 use App\Domains\CashSessions\Models\CashRemittance;
 use App\Domains\CashSessions\Models\CashSession;
+use App\Domains\Merchant\Actions\RecordMerchantAuditLogAction;
+use App\Domains\Merchant\Support\MerchantAuditAction;
 
 /**
  * Records a remittance as PENDING. Confirmation — the second half of the
@@ -25,6 +27,7 @@ class CreateRemittanceAction
 {
     public function __construct(
         private readonly ReconcileCashSessionAction $reconcile,
+        private readonly RecordMerchantAuditLogAction $recordAuditLog,
     ) {}
 
     /**
@@ -62,6 +65,14 @@ class CreateRemittanceAction
         // reads status->value from immediately after this call.
         $remittance->status = RemittanceStatus::Pending;
         $remittance->save();
+
+        $this->recordAuditLog->execute(
+            actor: $creator,
+            merchant: $cashSession->merchant,
+            action: MerchantAuditAction::RemittanceCreated,
+            subject: $remittance,
+            newValues: ['amount_cents' => $remittance->amount_cents],
+        );
 
         return $remittance;
     }

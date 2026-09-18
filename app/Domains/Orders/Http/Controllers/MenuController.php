@@ -75,14 +75,29 @@ class MenuController extends Controller
      * move) would hit unserialisable rows already in the cache. Arrays
      * survive that; the Resource still owns the shape.
      *
+     * `->where('is_available', true)` is only the merchant's manual
+     * toggle — a SQL-level pre-filter, cheap, but blind to ingredient
+     * stock. The REAL "can this actually be sold" question is
+     * Product::isSellable(), which also asks the recipe, and can only be
+     * answered in PHP once recipeItems.ingredient is loaded — so the
+     * default (available-only) listing filters AGAIN, in memory, after
+     * the query. `?include_unavailable=1` skips both filters and instead
+     * reports each tile's real isSellable() in the resource, so a manager
+     * screen can tell "I turned this off" apart from "we ran out".
+     *
      * @return array<int, array<string, mixed>>
      */
     private function buildMenu(IndexMenuRequest $request, bool $includeUnavailable): array
     {
         $products = Product::query()
+            ->with('recipeItems.ingredient')
             ->when(! $includeUnavailable, fn ($query) => $query->where('is_available', true))
             ->orderBy('name')
             ->get();
+
+        if (! $includeUnavailable) {
+            $products = $products->filter(fn (Product $product): bool => $product->isSellable())->values();
+        }
 
         return MenuItemResource::collection($products)->toArray($request);
     }

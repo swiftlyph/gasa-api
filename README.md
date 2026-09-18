@@ -36,7 +36,7 @@ The per-audience middleware groups are filled:
 | Group          | Middleware                          |
 | -------------- | ------------------------------------ |
 | `admin.api`    | `auth:sanctum`, `role:platform_admin`, `AllowsAdminContext` |
-| `company.api`  | `auth:sanctum`, `role:company_admin`  |
+| `company.api`  | `auth:sanctum`, `role:company_admin`, `EnsureCompanyActive` |
 | `employee.api` | `auth:sanctum`, `role:employee`       |
 | `merchant.api` | `auth:sanctum`, `role:merchant`, `EnsureMerchantActive` |
 | `public.api`   | *(none)*                              |
@@ -46,9 +46,10 @@ Order matters in the two tenant-aware groups. `AllowsAdminContext` runs
 request that already proved it's an admin. `EnsureMerchantActive` runs
 **after** `role:merchant`, so a non-merchant gets a plain `forbidden`
 rather than `merchant_inactive` — the latter would confirm the route exists
-for merchants and invite probing.
+for merchants and invite probing. `EnsureCompanyActive` sits after
+`role:company_admin` in `company.api` for the same reason.
 
-Both `role:` and `EnsureMerchantActive` are also registered in the
+`role:`, `EnsureMerchantActive` and `EnsureCompanyActive` are all registered in the
 **middleware priority list** (`bootstrap/app.php`) ahead of
 `SubstituteBindings`, so they run before route-model binding. Without that,
 Laravel resolves `{order}` first, and a suspended merchant hitting
@@ -64,8 +65,9 @@ registered once under `auth:sanctum` — never duplicated per audience file.
 
 Each portal file also currently has a `GET /whoami` route returning
 `{ "portal": "<name>" }` — a temporary placeholder proving its middleware
-stack actually enforces the right role. It gets replaced by real endpoints
-later; until then it's harmless and safe to leave in place.
+stack actually enforces the right role. Real endpoints land alongside it
+phase by phase (the merchant and company files already have them); it is
+harmless and stays in place.
 
 ### Domains folder rules
 
@@ -148,10 +150,13 @@ header — never a redirect.
 | 403    | `portal_forbidden`     | `/auth/login` — valid credentials, but wrong `portal` for role  |
 | 403    | `forbidden`            | Authenticated, but role/policy check failed (e.g. wrong portal's `/whoami`) |
 | 403    | `merchant_inactive`    | Merchant portal, but the user has no merchant or theirs isn't `active` |
+| 403    | `company_inactive`     | Company portal, but the user has no company or theirs isn't `active` (see § Company & employees) |
 | 404    | `not_found`            | Route or model not found                                        |
 | 422    | `validation_failed`    | FormRequest validation failure                                  |
 | 422    | `invalid_transition`   | Order status change the transition map forbids (e.g. completing a voided order), OR a merchant status change `PATCH /admin/merchants/{merchant}/status` forbids (e.g. `pending` → `pending`) — one shared code across both, see § Platform admin |
-| 422    | `product_unavailable`  | Checkout referenced a product that is missing, not the caller's, or flagged unavailable — `errors.product_ids` lists them |
+| 422    | `product_unavailable`  | Checkout referenced a product that is missing, not the caller's, flagged unavailable, or lacks enough of a recipe ingredient for even one unit — `errors.product_ids` lists them |
+| 422    | `insufficient_ingredient_stock` | Checkout's whole-basket ingredient requirement exceeds stock, even though each product individually looked sellable — `errors.ingredients` names the short ones (see § Ingredients & recipes) |
+| 409    | `ingredient_in_use`    | `DELETE /merchant/ingredients/{id}` — the ingredient is still referenced by a product's recipe |
 | 422    | `discount_exceeds_subtotal` | Checkout promo discount is larger than the server-computed post-statutory subtotal (see § Tax & statutory discounts) |
 | 422    | `beneficiary_unused`   | Checkout declared a senior/PWD beneficiary that no line was assigned to — `errors.beneficiaries` names the indexes |
 | 422    | `split_mismatch`       | Split payment whose `cash_cents` + `gcash_cents` don't equal the server-computed total |
@@ -166,6 +171,14 @@ header — never a redirect.
 | 422    | `email_unavailable`    | `POST /merchant/team` — the email belongs to a user not already on this merchant (never reveals which merchant); also `POST /admin/merchants` — the owner email already belongs to any user |
 | 422    | `cannot_remove_owner`  | `DELETE /merchant/team/{user}` — the target is the merchant's owner |
 | 422    | `cannot_demote_owner`  | `PATCH /merchant/team/{user}` — the target is the merchant's owner, and the new `role_in_merchant` isn't `owner` |
+| 422    | `employee_email_taken` | `POST`/`PATCH /company/employees`: the email is already on another employee of this company; `errors.email` names it (see § Company & employees) |
+| 422    | `employee_number_taken` | Same, for `employee_no`; `errors.employee_no` names it |
+| 422    | `invalid_department`   | An employee write whose `department_id` isn't one of the caller's own departments (another company's and a non-existent id are never told apart) |
+| 422    | `department_name_taken` | `POST`/`PATCH /company/departments`: the company already has a department with that name, case-insensitively |
+| 422    | `department_in_use`    | `DELETE /company/departments/{department}`: employees are still assigned to it |
+| 422    | `employee_not_eligible` | `POST /company/employees/{employee}/allowance/grants`: the employee is inactive or separated |
+| 409    | `idempotency_key_reuse` | The allowance grant key was already used with different grant details |
+| 422    | `invalid_import_file`  | `POST /company/employees/import`: the CSV can't be read at all (empty, a required column missing, more than 1000 rows). Bad ROWS are not an error; they come back in the 200 report |
 | 403    | `permission_denied`    | The caller's `role_in_merchant` preset doesn't carry the permission a merchant Policy requires — `errors.permission` names it (see § Permissions) |
 | 422    | `invalid_invite`       | `/auth/accept-invite` — token missing, already used, or expired (never distinguished) |
 | 429    | `too_many_attempts`    | `/auth/login` — 6th+ attempt from the same email+IP within a minute |
@@ -222,6 +235,7 @@ regression from the `withoutWrapping()` call above.
   "email": "merchant@gasa.test",
   "roles": ["merchant"],
   "merchant": { "id": 1, "name": "Merchant One", "status": "active", "role_in_merchant": "owner" },
+  "company": null,
   "permissions": ["orders.view", "orders.create", "..."]
 }
 ```
@@ -233,6 +247,10 @@ that applies. That's deliberate: a suspended merchant is blocked from every
 merchant route with 403 `merchant_inactive`, but `/auth/me` keeps working so
 the frontend can read `merchant.status` and render a suspended screen rather
 than bouncing the user back to login.
+
+`company` is the same idea for the other tenant type: `{ id, name, status }`,
+present regardless of status, `null` for any user with no company (platform
+admins, merchants). A user has one or the other. See § Company & employees.
 
 `permissions` (P8) is **empty, not merely absent, for any account with no
 ACTIVE merchant** — a `pending`/`suspended` merchant's `permissions` is
@@ -443,6 +461,7 @@ per role, idempotent (`updateOrCreate` by email, safe to re-run):
 | ----------------------- | ---------- | ---------------- |
 | `admin@gasa.test`       | `password` | `platform_admin` |
 | `company@gasa.test`     | `password` | `company_admin`  |
+| `company2@gasa.test`    | `password` | `company_admin`  |
 | `employee@gasa.test`    | `password` | `employee`       |
 | `merchant@gasa.test`    | `password` | `merchant`       |
 | `merchant2@gasa.test`   | `password` | `merchant`       |
@@ -474,7 +493,10 @@ draws a fresh number from the merchant's counter.
 
 ## Tenancy
 
-Merchant is the first tenant type. Tenant identity **always** derives from
+Merchant was the first tenant type and Company is the second (see § Company &
+employees). `BelongsToCompany` mirrors `BelongsToMerchant` exactly, with
+`company_id` and `User::activeCompany()` in place of `merchant_id` and
+`User::merchant()`; everything below applies to both. Tenant identity **always** derives from
 the authenticated user — nothing in the tenancy path reads request input,
 so a `merchant_id` in a payload is never authoritative.
 
@@ -515,7 +537,8 @@ asserts isolation through the actual HTTP endpoints, which is the surface
 an attacker really has.
 
 Tenant-owned tables so far: `merchants` (the tenant itself), `products`,
-`orders`. `order_items` and `order_item_add_ons` deliberately have **no**
+`orders`; and on the company side `companies` (the tenant itself), `departments`
+and `employees`. `order_items` and `order_item_add_ons` deliberately have **no**
 `merchant_id` — they inherit tenancy structurally, since they are only ever
 reachable through a scoped order. A second owner column on those tables
 would be a second source of truth that could disagree with the first.
@@ -945,11 +968,17 @@ return the same tickets in the same order.
 Available items only by default; `?include_unavailable=1` returns
 everything, for a manager screen that needs to see the greyed-out ones.
 
+`is_available` is `Product::isSellable()`, not the raw column: the
+merchant's manual toggle **and**, for a recipe-bearing product, enough of
+every recipe ingredient in stock for at least one unit — see §
+Ingredients & recipes below. A depleted ingredient greys out every
+product that uses it automatically, with no merchant action required.
+
 It is a **read-only projection** of the shared `products` table, owned by
 the POS lane and living in `App\Domains\Orders` for that reason. Product
-management — categories, images, availability rules — belongs to the
-catalog module and will arrive in its own namespace. Nothing in the POS
-lane writes to `products`.
+management (categories, codes, images, availability rules) belongs to the
+catalog module — see § Catalog below. Nothing in the POS lane writes to
+`products`.
 
 **The cache key is namespaced by merchant, and nothing may bypass that.**
 
@@ -980,10 +1009,11 @@ two, and assert the key shape as well as the behaviour.
 `products` is a deliberately minimal table (`merchant_id`, `name`,
 `price_cents`, `currency`, `is_available`) created here only because orders
 need something to FK against and checkout needs a server-side price to
-read. **The catalog module owns it** and extends it with its own
-migrations; the POS lane never widens it, and
-`App\Domains\Catalog\Models\Product` stays a bare model with no controller,
-policy, or resource.
+read. **The catalog module owns it** and has extended it with its own
+migrations (`category`, `code`, `description` — see § Catalog); the POS
+lane never widens it. `App\Domains\Catalog\Models\Product` now carries a
+controller, policies, resources, and an observer, all in the catalog
+module's own files — nothing here in the Orders lane changed.
 
 `ProductSeeder` fills it with demo menus — data only, not a module. The two
 merchants get **deliberately different** catalogs: identical ones would make
@@ -1783,6 +1813,8 @@ and `TenantLeakageTest.php`).
 | `orders.void` | Void orders |
 | `queue.view` | View the kitchen queue |
 | `menu.view` | View the menu |
+| `catalog.view` | View the product catalog |
+| `catalog.manage` | Manage the product catalog (add, edit, delete products) |
 | `drawer.view` | View cash sessions |
 | `drawer.open` | Open the drawer |
 | `drawer.close` | Close the drawer |
@@ -1799,7 +1831,7 @@ and `TenantLeakageTest.php`).
 
 | Preset | Permissions |
 | --- | --- |
-| `owner` | **All** 17 catalog permissions. |
+| `owner` | **All** 19 catalog permissions. |
 | `manager` | Every permission **except** `profile.edit` and `team.manage`. |
 | `staff` | `orders.view`, `orders.create`, `orders.complete`, `queue.view`, `menu.view`, `drawer.view`, `drawer.open`, `drawer.movements`, `remittances.create`. **Not** `orders.void`, `drawer.close`, `remittances.confirm` (all three are "someone signs off" actions), **not** `reports.view`, and **not** `profile.*`/`team.*`. |
 
@@ -1814,6 +1846,11 @@ and `TenantLeakageTest.php`).
 | `OrderPolicy` | `viewKitchenQueue` | `queue.view` |
 | `OrderPolicy` | `viewReports` | `reports.view` |
 | — (`MenuController`, no Policy class) | `hasMerchantPermission()` directly | `menu.view` |
+| `ProductPolicy` | `viewAny`, `view` | `catalog.view` |
+| `ProductPolicy` | `create`, `update`, `delete` | `catalog.manage` |
+| `ProductPolicy` | `update` (also gates `RecipeController@update`) | `catalog.manage` |
+| `IngredientPolicy` | `viewAny`, `view` | `catalog.view` |
+| `IngredientPolicy` | `create`, `update`, `delete` | `catalog.manage` |
 | `CashSessionPolicy` | `viewAny`, `view` | `drawer.view` |
 | `CashSessionPolicy` | `create` | `drawer.open` |
 | `CashSessionPolicy` | `close` | `drawer.close` |
@@ -1896,6 +1933,275 @@ EnsureDefaultRegisterAction`, invoked from `Merchant::booted()`'s
 **narrows** when `DefaultRegister`'s `NoRegisterConfigured` fallback (see
 § Registers) can be hit — it does not replace it; a merchant created
 before this phase shipped still falls through to that graceful behavior.
+
+## Catalog
+
+`App\Domains\Catalog` (P11/P12) — full product management (create, edit,
+delete, browse), each product's **recipe**, and the **ingredients** that
+recipe draws stock from, owned by the module the POS lane's `products`
+migration and `MenuController`'s docblocks always pointed at ("the
+catalog module... will bring its own management endpoints"). It
+**extends** that shared contract table rather than replacing it — see
+`database/migrations/2026_09_09_040000_create_products_table.php`'s
+docblock and `App\Domains\Catalog\Models\Product`, the same model class
+the Orders and Menu lanes already depend on.
+
+| Method | Path | Controller | Permission |
+| --- | --- | --- | --- |
+| GET | `/merchant/catalog/categories` | `CategoryController@index` | `catalog.view` |
+| GET | `/merchant/products` | `ProductController@index` | `catalog.view` |
+| POST | `/merchant/products` | `ProductController@store` → `CreateProductAction` | `catalog.manage` |
+| GET | `/merchant/products/{id}` | `ProductController@show` | `catalog.view` |
+| PUT/PATCH | `/merchant/products/{id}` | `ProductController@update` → `UpdateProductAction` | `catalog.manage` |
+| DELETE | `/merchant/products/{id}` | `ProductController@destroy` → `DeleteProductAction` | `catalog.manage` |
+| PUT | `/merchant/products/{id}/recipe` | `RecipeController@update` → `UpdateRecipeAction` | `catalog.manage` |
+| GET | `/merchant/ingredients` | `IngredientController@index` | `catalog.view` |
+| POST | `/merchant/ingredients` | `IngredientController@store` → `CreateIngredientAction` | `catalog.manage` |
+| GET | `/merchant/ingredients/{id}` | `IngredientController@show` | `catalog.view` |
+| PUT/PATCH | `/merchant/ingredients/{id}` | `IngredientController@update` → `UpdateIngredientAction` | `catalog.manage` |
+| DELETE | `/merchant/ingredients/{id}` | `IngredientController@destroy` → `DeleteIngredientAction` | `catalog.manage` |
+
+`{product}`/`{ingredient}` resolve through their merchant-scoped models,
+so a foreign id is a 404 on every verb, never a 403 (see § Tenancy).
+`ProductResource`:
+
+```json
+{
+  "id": 20, "code": "DRK-004", "name": "Matcha Latte", "category": "Drinks",
+  "description": null, "currency": "PHP",
+  "price_cents": 16500, "price_formatted": "₱165.00",
+  "status": "active", "in_stock": true,
+  "recipe": [
+    { "id": 1, "ingredient_id": 1, "ingredient_code": "0001", "ingredient_name": "Matcha Powder", "quantity": 30, "unit": "g", "ingredient_stock_status": "in_stock" },
+    { "id": 2, "ingredient_id": 2, "ingredient_code": "0002", "ingredient_name": "Milk", "quantity": 100, "unit": "ml", "ingredient_stock_status": "in_stock" },
+    { "id": 3, "ingredient_id": 3, "ingredient_code": "0003", "ingredient_name": "Cups (16oz)", "quantity": 1, "unit": "pcs", "ingredient_stock_status": "in_stock" }
+  ],
+  "created_at": "…", "updated_at": "…"
+}
+```
+
+### Product codes
+
+Every catalog-created product gets a human-facing **code** (`DRK-001`) —
+the category's prefix (`config/catalog.php`) plus a per-merchant counter,
+issued by `App\Domains\Catalog\Support\ProductCodeGenerator` inside the
+same transaction as the insert, under a `FOR UPDATE` row lock on
+`product_code_sequences`, so two concurrent creates in the same category
+can never collide. `id` stays the plain numeric key used in URLs; `code`
+is what a person reads.
+
+A code always matches the product's **current** category: changing
+category on update (`UpdateProductAction`) issues a fresh code from the
+new prefix, replacing the old one — a Drinks product moved to Food gets a
+new `FOD-###` rather than keeping a now-mismatched `DRK-###` on a shelf
+label. Client input is still never trusted for the value itself: `code`
+isn't accepted in any request body, on create or update. Vacated numbers
+are **never reused**: moving `DRK-003` out of Drinks leaves that number
+permanently unused, the same as deleting a product does — the next new
+Drinks product is still `DRK-004`. A product NOT created through this
+module (`ProductSeeder`'s demo menu, another domain's factory row) has a
+`null` code and category, and is still a perfectly valid row on the
+shared table — `code`/`category` are nullable specifically so those rows
+never need one; if an update later gives such a product a category, it
+gets its first code by the same rule ("category changed" also covers
+null → something).
+
+### `status` vs `is_available`
+
+The catalog API's own vocabulary (`"active"`/`"inactive"`) sits over the
+shared table's `is_available` boolean — `ProductResource` and the
+FormRequests translate at the boundary; nothing outside this module ever
+sees `"active"`/`"inactive"`, and this module never invents a second
+availability column.
+
+`in_stock` (on `ProductResource`) is a **different statement** from
+`status`: it says nothing about the merchant's manual toggle, only
+whether every recipe ingredient currently has enough on hand for one
+more unit — `every($item => ingredient.quantity_on_hand >= item.quantity_base_units)`
+over an empty recipe is vacuously `true`, so a plain resale item with no
+recipe is always "in stock". This is the same computation
+`Product::isSellable()` does for the POS menu's `is_available` (see §
+"The POS menu, and its cache"), just without also checking the manual
+toggle — a manager browsing the product list wants to know "would this
+sell right now if I turned it on", not "is it on".
+
+### Ingredients & recipes
+
+Ingredients **are** this merchant's inventory now — a product itself
+carries no stock of its own; only its `Ingredient` rows do
+(`App\Domains\Catalog\Models\Ingredient` / `RecipeItem`, replacing an
+earlier per-product `inventory_items` design entirely — see the
+`2026_09_18_000400_drop_inventory_items_table` migration).
+
+**The example that shaped this design:**
+
+```
+Product: Matcha Latte (category: Drinks)
+Recipe:  Matcha Powder  30 g
+         Milk           100 ml
+         Cup (16oz)     1 pcs
+
+Ingredient: Matcha Powder — id 1, code "0001", unit_type mass, display_unit kg,
+            quantity_on_hand 5 kg, low_stock_threshold 1 kg
+```
+
+Ice and hot water are deliberately **not** recipe lines — they aren't
+stock-tracked, so a made-to-order Americano or Iced Latte can have no
+recipe at all and simply always be "in stock" (see above).
+
+**Ingredients** (`IngredientResource`):
+
+```json
+{
+  "id": 1, "code": "0001", "name": "Matcha Powder",
+  "unit_type": "mass", "display_unit": "kg",
+  "quantity_on_hand": 5000000, "quantity_on_hand_formatted": "5 kg",
+  "low_stock_threshold": 1000000, "low_stock_threshold_formatted": "1 kg",
+  "stock_status": "in_stock", "available_units": ["mg", "g", "kg"],
+  "created_at": "…", "updated_at": "…"
+}
+```
+
+- `code` is a **display-only, zero-padded rendering of the numeric id**
+  (`str_pad($id, 4, '0', STR_PAD_LEFT)`, so "0001", "0002", …) — there is
+  no separate generated sequence the way `Product::code` has one; the
+  auto-incrementing id already *is* the unique identifier a merchant
+  asked for. It is not guaranteed to start at `0001` on a given
+  merchant/environment (ids are a single global sequence across every
+  merchant, unlike `Product::code`'s per-merchant counter).
+- `quantity_on_hand` / `low_stock_threshold` are always stored as
+  **integers in the unit family's smallest ("base") unit** — milligrams
+  for mass, milliliters for volume, pieces for count — never as a float,
+  exactly like every money column in this codebase is integer cents (see
+  § Money). `display_unit` is purely which unit a merchant reads them
+  back in; entering/updating a quantity converts through it once, on the
+  way in (`CreateIngredientAction`/`UpdateIngredientAction`), and every
+  later reader (deduction, sellability, the resource's `_formatted`
+  strings) only ever touches the base-unit integer.
+- `unit_type` is **immutable after creation** — every stock quantity and
+  every recipe line pointing at this ingredient is already stored in its
+  base unit; changing the family after the fact would silently redefine
+  what the existing numbers mean. `UpdateIngredientRequest` doesn't even
+  accept the field. A merchant who genuinely needs a different family
+  creates a new ingredient and retires the old one.
+- `stock_status` is **derived, never stored** — `Ingredient::stockStatus()`
+  is the PHP rule and `scopeWithStockStatus()` its SQL twin for `GET
+  /merchant/ingredients?status=`; change both together or neither. `<= 0`
+  → `out_of_stock`, `<= low_stock_threshold` → `low_stock`, else
+  `in_stock`.
+- Deleting an ingredient still referenced by any recipe is refused
+  (`409 ingredient_in_use`) — see `DeleteIngredientAction`.
+
+**Unit conversion — the part this feature exists to get right.** Every
+unit belongs to exactly one family (`App\Domains\Catalog\Enums\UnitType`:
+`mass`, `volume`, `count`), and `App\Domains\Catalog\Enums\Unit`
+**structurally refuses to convert across families**: there is no code
+path anywhere that turns a volume quantity into a mass one, because doing
+so would require guessing a density this system doesn't collect —
+exactly the "30ml of matcha powder against a kg-tracked ingredient"
+mistake a merchant could type by accident. `Unit::fromFamily()` throws
+rather than coercing, and every validator that accepts a `(quantity,
+unit)` pair against a specific ingredient — `StoreIngredientRequest`,
+`UpdateIngredientRequest`, `UpdateRecipeRequest` — checks the unit's
+family against the ingredient's `unit_type` before anything is saved. All
+conversion is **exact integer multiplication** (1 kg is always exactly
+1,000,000 mg), never a float division, so it can never drift across
+thousands of deductions; `Unit::formatQuantity()` divides only to build a
+*display* string, the same one-way rule `Money::format()` already follows
+for prices.
+
+**Recipes** — `PUT /merchant/products/{id}/recipe` replaces a product's
+**entire** recipe in one call (`UpdateRecipeAction`, inside a
+transaction: delete every existing line, insert the new set), the
+simplest shape for a recipe-builder form that's really editing one list.
+Sending `"ingredients": []` clears the recipe. Each line's `unit` must
+belong to the *referenced ingredient's own* `unit_type` — this is the
+check that makes the "ml against a kg-tracked ingredient" mistake
+impossible to save, enforced in `UpdateRecipeRequest::withValidator()`,
+not left to the database. `quantity_base_units` is computed **once**,
+here, from the (quantity, unit) pair; every later reader (deduction,
+sellability) only ever reads that integer, never re-converts.
+
+### Selling a recipe — deduction, and the two-layer stock guard
+
+Selling a recipe-bearing product must deduct exactly the right,
+unit-converted amount from every ingredient it uses, and must never
+oversell. Two layers, deliberately:
+
+1. **`Product::isSellable()`** — a fast, unlocked, moment-in-time signal:
+   the manual `is_available` toggle **and** enough of every recipe
+   ingredient on hand for at least **one** unit. This is what
+   `MenuItemResource.is_available` and `ProductResource.in_stock` report,
+   and what greys out a POS tile before a cashier even taps it. It is
+   only ever a *signal* — two terminals can both see "sellable" and both
+   reach for the last cup of milk a beat apart.
+2. **`DeductIngredientsForOrderAction`** — the real guard, called from
+   inside `CheckoutAction`'s transaction, after pricing but before the
+   order commits. It aggregates every ingredient's requirement across the
+   **whole basket** first (two different drinks that both use matcha
+   powder are summed together, not checked line-by-line — a basket that
+   would individually pass but overshoot in aggregate is still caught),
+   locks every needed `Ingredient` row (`lockForUpdate()`, sorted by id
+   so two concurrent checkouts sharing ingredients can never deadlock
+   each other), and only then checks sufficiency. **Nothing is deducted
+   until every ingredient in the basket is verified** — the same
+   all-or-nothing rule the rest of checkout already follows. Falling
+   short throws `InsufficientIngredientStock` (`422
+   insufficient_ingredient_stock`, `errors.ingredients` names the short
+   ones), which rolls back the entire order — same as `ProductUnavailable`.
+
+   A product can pass layer 1 (enough for **one**) and still fail layer 2
+   (not enough for the **two** this particular basket asked for) — that
+   gap is exactly what layer 2 exists to close.
+
+Each successful deduction writes an `OrderIngredientDeduction` snapshot
+row (`ingredient_id` nullable + `nullOnDelete`, `ingredient_name` frozen
+at sale time, `quantity_base_units` taken, `restored_at`) — the same
+"snapshot, don't re-derive" pattern `order_items` already uses for
+product name/price. **Voiding an order** (`VoidOrderAction` →
+`RestoreIngredientsForOrderAction`) reads that snapshot, not the
+product's *current* recipe (which could reference different ingredients
+by now, or none), and adds each `quantity_base_units` back under the same
+row-locked, sorted-by-id discipline; `restored_at` makes it idempotent
+per deduction row, and a deduction whose ingredient was since deleted is
+skipped rather than erroring.
+
+### The POS menu cache, invalidated automatically
+
+This is the module's half of the cross-lane contract `MenuCache`'s
+docblock describes (see § "The POS menu, and its cache" above), and it
+has **two** observers now, since a product's sellability depends on both
+the product row and its ingredients' stock:
+
+- `App\Domains\Catalog\Observers\ProductObserver`, on `Product::observe()`
+  — calls `MenuCache::forget($product->merchant_id)` on every
+  `saved`/`deleted` event, **scoped to catalog-managed rows only**
+  (`code !== null`): a raw Eloquent write on a non-catalog product
+  (`ProductSeeder`'s menu, a test fixture) does *not* auto-invalidate,
+  which is deliberate — `tests/Feature/Orders/MenuTest.php`'s "a stale
+  menu is served until the cache is invalidated" case exists specifically
+  to prove the cache needs an *explicit* `forget()` there, and a blanket
+  observer would make that assertion false.
+- `App\Domains\Catalog\Observers\IngredientObserver`, on
+  `Ingredient::observe()` — **unscoped**, fires on every `saved`/`deleted`
+  event unconditionally (a manual stock correction, a checkout deduction,
+  a void restoration): there is no "non-catalog ingredient" the way
+  there's a "non-catalog product", so there's no precedent to preserve.
+
+### Demo data
+
+`CatalogDemoSeeder` (called from `DevSeeder`, guarded so it only runs
+once per fresh database) gives Merchant One its catalog products,
+ingredients, and the Matcha Latte / Croissant / Bagel / Blueberry Muffin
+recipes (in a mix of stock states — in stock, low, and out — so the demo
+account shows all three at a glance), and Merchant Two four plain,
+recipe-less products. Everything is issued through the real
+`CreateProductAction` / `CreateIngredientAction` / `UpdateRecipeAction` —
+the seeded codes, ids, and quantities are exactly what a client hitting
+the endpoints would produce, never a parallel fake scheme. Separate from,
+and never overlapping, `ProductSeeder`'s plain POS menu (no
+category/code/recipe) — the two exist for different lanes and neither
+touches the other's rows.
 
 ## Platform admin
 
@@ -2035,6 +2341,247 @@ A `platform_admin` token gets a plain `403 forbidden` from
 itself a bypass — see § Tenancy), and a `merchant` token gets the same
 `403 forbidden` from `role:platform_admin` on every route in this
 section, including `/admin/audit-logs`.
+
+## Company & employees
+
+The company portal's first vertical, and the second tenant type. Built as
+the Merchant domain's twin so the two read alike: `BelongsToCompany`
+mirrors `BelongsToMerchant`, `EnsureCompanyActive` mirrors
+`EnsureMerchantActive`, and the employee endpoints follow the team
+endpoints' shape. Every route below sits behind the `company.api` group
+(`auth:sanctum` + `role:company_admin` + `EnsureCompanyActive`).
+
+| Method   | Route                                  | Notes |
+| -------- | -------------------------------------- | ----- |
+| `GET`    | `/api/v1/company/profile`              | The caller's own company, flat, every profile field |
+| `GET`    | `/api/v1/company/employees`            | Paginated; filterable by `status`, `employment_type`, `department_id` and `search`; `per_page` capped at 100 |
+| `POST`   | `/api/v1/company/employees`            | Add an employee: `{ first_name, last_name, email, employee_no?, middle_name?, suffix?, mobile?, birthdate?, department_id?, job_title?, employment_type?, hired_at? }` |
+| `GET`    | `/api/v1/company/employees/{employee}` | One employee, flat |
+| `PATCH`  | `/api/v1/company/employees/{employee}` | Partial update: the same fields plus `status` (`active` \| `inactive` \| `separated`) and `separated_at` |
+| `DELETE` | `/api/v1/company/employees/{employee}` | Soft-deletes the record; `200 { message, code: "employee_removed" }` |
+| `GET`    | `/api/v1/company/employees/export`     | The filtered roster as CSV (see § Import and export) |
+| `POST`   | `/api/v1/company/employees/import`     | CSV upsert with a `preview` / `commit` mode (see § Import and export) |
+| `GET`, `POST`, `PATCH`, `DELETE` | `/api/v1/company/departments[/{department}]` | See § Departments |
+| `GET`    | `/api/v1/company/employees/{employee}/allowance` | Current allowance balance and the 20 latest ledger entries |
+| `POST`   | `/api/v1/company/employees/{employee}/allowance/grants` | Grant `{ amount_cents, reason, idempotency_key }` to an active employee |
+
+### Employee allowance
+
+Allowance is an employer-funded spending entitlement, not stored money or
+e-money. The employee row contains identity and eligibility only. A grant
+creates an append-only `allowance_ledger_entries` row linked to the employee's
+company-scoped `allowance_accounts` row. The balance is the sum of the ledger's
+signed `amount_cents`, and every entry records the balance after that movement.
+
+`POST /api/v1/company/employees/{employee}/allowance/grants` accepts positive
+integer cents up to 1,000,000 pesos, a required reason, and a client-generated
+idempotency key. Repeating the exact request is safe; changing the amount or
+reason for an existing key returns `409 idempotency_key_reuse`. Only active
+employees can receive a grant. The current slice records grants and exposes
+the ledger; merchant checkout consumption, reversals, expiry, and allowance
+plans are later phases.
+
+### Companies
+
+`companies` is shaped like `merchants`: `name`, `status` (`pending` |
+`active` | `suspended`, CHECK-constrained, typed by
+`App\Domains\Company\Enums\CompanyStatus`), `owner_user_id` (the first
+company admin), and nullable profile columns (`legal_name`, address,
+`phone`, `contact_email`, `tax_identifier`).
+
+Membership is **`users.company_id`**, not a pivot. The column has been on
+`users` since the first migration waiting for this phase, and a company
+admin or an employee belongs to exactly one company. `User::company()` is
+the plain relation (any status, for `/auth/me`); `User::activeCompany()`
+is the tenancy resolver (active only, memoized), the twin of
+`User::merchant()`.
+
+There is no company provisioning endpoint yet: companies come from the
+seeders (`DevSeeder`, `StagingCompanySeeder`). The platform-admin
+provisioning phase adds `POST /admin/companies` and the status transition
+map, mirroring § Platform admin.
+
+Only an `active` company may use the portal. A pending or suspended
+company's admin gets `403 company_inactive` on every `/company/*` route,
+while `/auth/me` keeps working and carries the status:
+
+```json
+{ "company": { "id": 1, "name": "Company One", "status": "active" } }
+```
+
+`company` is `null` for any user with no company (platform admins,
+merchants). It sits alongside `merchant`; a user has one or the other.
+
+### Employees
+
+An employee is an **HR record, not a login.** `employees` carries
+`employee_no`, the name (`first_name`, `middle_name`, `last_name`,
+`suffix`), `email`, `mobile`, `birthdate`, `department_id`, `job_title`,
+`employment_type`, `hired_at`, `status` with `separated_at`
+(`App\Domains\Company\Enums\EmployeeStatus`), and a nullable `user_id`
+that stays null until a later phase invites the employee into the
+employee portal, the same order the merchant vertical shipped in
+(profile first, team after). `has_account` in the payload is that
+`user_id`, surfaced early so the frontend can branch on it before the
+invite phase lands.
+
+`employees` is tenant-owned (`BelongsToCompany`, non-nullable
+`company_id`): `{employee}` resolves through the global scope, so
+another company's id is a `404`, never a `403`.
+
+`email` and `employee_no` are unique **per company** and only among
+non-deleted rows (partial unique indexes on Postgres), so the same
+person can be on two rosters and a rehire can reuse both values. A
+collision inside the caller's own company is `422 employee_email_taken`
+or `422 employee_number_taken`, with the field named in `errors`. Unlike
+`email_unavailable` there is nothing to hide here: the roster is the
+caller's own. Email is lowercased on write. Both checks live in the
+Actions, not the FormRequests (see `AddTeamMemberRequest` for the rule).
+
+Employees are **soft-deleted**, never hard-deleted: a future wallet
+ledger references them. `DELETE` returns `200 { message, code }` like
+every other confirmation in this API, never a bare 204.
+
+The list is ordered by `last_name`, `first_name`, `id` and paginated
+(`{ data, links, meta }`, default 25 per page). `search` matches first
+name, last name, email or employee number, case-insensitively.
+
+#### The employee payload
+
+```json
+{
+  "id": 1,
+  "employee_no": "EMP-0001",
+  "first_name": "Maria",
+  "middle_name": "Reyes",
+  "last_name": "Santos",
+  "suffix": null,
+  "full_name": "Maria Santos",
+  "email": "maria.santos@companyone.test",
+  "mobile": "+639170000001",
+  "birthdate": "1992-05-14",
+  "department_id": 3,
+  "department": { "id": 3, "name": "Finance" },
+  "job_title": "Accountant",
+  "employment_type": "regular",
+  "hired_at": "2024-03-01",
+  "status": "active",
+  "separated_at": null,
+  "has_account": false,
+  "created_at": "2026-09-16T00:00:00.000000Z",
+  "updated_at": "2026-09-16T00:00:00.000000Z"
+}
+```
+
+### Status, separation and what the record is for
+
+The employee record holds **identity and eligibility only**. What an
+employee may spend is never a column here: the allowance balance, the
+allowance rules and the QR/card credential are (future) records that point
+at the employee, so every peso stays explainable and none of it can be
+changed by editing a profile.
+
+`status` is `active`, `inactive` (a pause: leave, suspension) or
+`separated` (left the company). `separated_at` and `status` move together,
+and `UpdateEmployeeAction` is the only place that decides how: a separated
+employee always has a date (the one sent, else the one already stored, else
+today in `config('company.day_timezone')`), and any other status never has
+one. That transition is where the allowance module will stop grants and
+expire what is left.
+
+`employment_type` (`regular`, `probationary`, `contractual`, `part_time`,
+`intern`; default `regular`) and the department exist because allowance
+will be targeted by them.
+
+`mobile` is normalized to E.164 before validation
+(`App\Domains\Company\Support\PhoneNumber`): `0917 123 4567`, `9171234567`
+and `+63 917 123 4567` all store as `+639171234567`. A number without a
+country code is read as a Philippine mobile.
+
+### Departments
+
+| Method   | Route                                      | Notes |
+| -------- | ------------------------------------------ | ----- |
+| `GET`    | `/api/v1/company/departments`              | Unpaginated `{ data: [...] }`, ordered by name, each with `employees_count` |
+| `POST`   | `/api/v1/company/departments`              | `{ name }`, returns 201 flat |
+| `PATCH`  | `/api/v1/company/departments/{department}` | Rename; employees follow, they point at the row |
+| `DELETE` | `/api/v1/company/departments/{department}` | Only an empty one; `200 { message, code: "department_deleted" }` |
+
+A table rather than the free text it replaced, because "Finance",
+"finance" and "Fin." are three groups to a query. Names are unique per
+company, case-insensitively (`(company_id, lower(name))`): a duplicate is
+`422 department_name_taken`. A department that still has employees can't be
+deleted (`422 department_in_use`): un-grouping people behind the caller's
+back would change who an allowance reaches. An employee write whose
+`department_id` is not one of the caller's own departments is
+`422 invalid_department`, whether the id belongs to another company or to
+nobody; the two are never told apart. It is checked in the Actions, since
+an `exists:` rule is not tenant-scoped.
+
+### Import and export
+
+`POST /api/v1/company/employees/import` takes a multipart `file` (CSV, 1 MB,
+at most 1000 rows) and a `mode`: `preview` (the default) or `commit`. Both
+run the **same code inside a transaction**; preview rolls it back, commit
+commits it, so a preview can never promise what the commit then does
+differently. The response is always a 200 report:
+
+```json
+{
+  "mode": "preview",
+  "summary": { "total": 3, "create": 1, "update": 1, "unchanged": 0, "invalid": 1 },
+  "ignored_columns": ["Notes"],
+  "rows": [
+    { "line": 2, "action": "create", "employee_no": "EMP-0009", "first_name": "Ana", "last_name": "Cruz", "email": "ana.cruz@companyone.test", "errors": null },
+    { "line": 4, "action": "invalid", "employee_no": null, "first_name": "Jo", "last_name": null, "email": "not-an-email", "errors": { "last_name": ["The last name field is required."], "email": ["The email field must be a valid email address."] } }
+  ]
+}
+```
+
+- Columns: `first_name`, `last_name`, `email` are required; `employee_no`,
+  `middle_name`, `suffix`, `mobile`, `department`, `job_title`,
+  `employment_type`, `hired_at`, `birthdate` are optional, in any order.
+  Common header variants (`Surname`, `Position`, `Date Hired`, ...) are
+  mapped; anything else is listed in `ignored_columns`.
+- Rows are **upserts**: matched by `employee_no` when the row has one, else
+  by `email`. A column that is in the file is authoritative (an empty cell
+  clears the field); a column that is not is left alone. `status` is never
+  imported.
+- `department` is a NAME, found case-insensitively or created.
+- Every row passes the same rules (`EmployeeFieldRules`) and the same
+  Actions as the form. A bad row is `invalid` with its `errors` and is
+  skipped; the rest still import. The same email or employee number twice
+  in one file is invalid on its second appearance.
+- Only a file that can't be read at all (empty, a required column missing,
+  too many rows) is refused: `422 invalid_import_file`.
+
+`GET /api/v1/company/employees/export` streams the roster as CSV and takes
+the same query string as the list. Its first columns are the import's, in
+order, so an exported file re-imports unchanged; `status` and
+`separated_at` follow for the reader and are ignored on the way back in.
+Cells a spreadsheet would execute (a leading `=` or `@`) are prefixed with
+an apostrophe.
+
+### Seeding
+
+`DevSeeder` gives `company@gasa.test` **Company One** and the new
+`company2@gasa.test` **Company Two**, both `active`, each with a small
+roster. Two companies for the same reason there are two merchants: with
+one, correct scoping and no scoping look identical. `employee@gasa.test`
+is linked to Company One as an employee row with `user_id` set, so
+`has_account: true` has one real example.
+
+`StagingCompanySeeder` is the manual staging fixture (never wired into
+`DatabaseSeeder`): idempotent, keyed on email, safe to re-run. The admin
+password is read from a real process environment variable, so it works
+with a cached config:
+
+```bash
+STAGING_SEED_PASSWORD='<choose one>' php artisan db:seed --class=StagingCompanySeeder --force
+```
+
+Account: `company.staging@gasa.test`, role `company_admin`, company
+"Staging Company" (`active`), five employees.
 
 ## Local setup
 

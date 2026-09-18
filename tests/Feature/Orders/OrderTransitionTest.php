@@ -1,6 +1,11 @@
 <?php
 
 use App\Domains\Auth\Models\User;
+use App\Domains\Catalog\Enums\Unit;
+use App\Domains\Catalog\Models\Ingredient;
+use App\Domains\Catalog\Models\OrderIngredientDeduction;
+use App\Domains\Catalog\Models\Product;
+use App\Domains\Catalog\Models\RecipeItem;
 use App\Domains\Merchant\Models\Merchant;
 use App\Domains\Orders\Enums\OrderStatus;
 use App\Domains\Orders\Models\Order;
@@ -60,6 +65,56 @@ test('pending to voided stamps voided_at and records who voided it', function ()
         // reason this column exists.
         ->and($order->voided_by_user_id)->toBe($this->user->id)
         ->and($order->completed_at)->toBeNull();
+});
+
+test('voiding an order restores exactly the ingredient stock its checkout deducted', function () {
+    $matchaPowder = Ingredient::factory()->mass()->create(['merchant_id' => $this->merchant->id, 'name' => 'Matcha Powder', 'quantity_on_hand' => Unit::Kilogram->toBaseUnits(5)]);
+    $matchaLatte = Product::factory()->create(['merchant_id' => $this->merchant->id, 'name' => 'Matcha Latte', 'price_cents' => 16500]);
+    RecipeItem::factory()->of(30, Unit::Gram)->create(['merchant_id' => $this->merchant->id, 'product_id' => $matchaLatte->id, 'ingredient_id' => $matchaPowder->id]);
+
+    $order = $this->withToken($this->token)->postJson('/api/v1/merchant/orders', [
+        'payment_method' => 'cash',
+        'items' => [['product_id' => $matchaLatte->id, 'quantity' => 2]],
+    ])->assertCreated()->json();
+
+    // 60g deducted for the sale.
+    expect($matchaPowder->fresh()->quantity_on_hand)->toBe(Unit::Kilogram->toBaseUnits(5) - Unit::Gram->toBaseUnits(60));
+
+    $this->withToken($this->token)
+        ->postJson("/api/v1/merchant/orders/{$order['id']}/void")
+        ->assertOk()
+        ->assertJsonPath('status', 'voided');
+
+    expect($matchaPowder->fresh()->quantity_on_hand)->toBe(Unit::Kilogram->toBaseUnits(5));
+
+    $deduction = OrderIngredientDeduction::query()->where('order_id', $order['id'])->where('ingredient_id', $matchaPowder->id)->firstOrFail();
+    expect($deduction->restored_at)->not->toBeNull();
+});
+
+test('voiding an order whose ingredient was since deleted skips it rather than erroring', function () {
+    $milk = Ingredient::factory()->volume()->create(['merchant_id' => $this->merchant->id, 'name' => 'Milk', 'quantity_on_hand' => Unit::Liter->toBaseUnits(5)]);
+    $matchaLatte = Product::factory()->create(['merchant_id' => $this->merchant->id, 'name' => 'Matcha Latte', 'price_cents' => 16500]);
+    RecipeItem::factory()->of(100, Unit::Milliliter)->create(['merchant_id' => $this->merchant->id, 'product_id' => $matchaLatte->id, 'ingredient_id' => $milk->id]);
+
+    $order = $this->withToken($this->token)->postJson('/api/v1/merchant/orders', [
+        'payment_method' => 'cash',
+        'items' => [['product_id' => $matchaLatte->id, 'quantity' => 1]],
+    ])->assertCreated()->json();
+
+    // Delete the recipe line first (the ingredient can't be deleted while
+    // in use — see DeleteIngredientAction), then the ingredient itself.
+    RecipeItem::withoutGlobalScope('merchant')->where('product_id', $matchaLatte->id)->delete();
+    $milk->delete();
+
+    $this->withToken($this->token)
+        ->postJson("/api/v1/merchant/orders/{$order['id']}/void")
+        ->assertOk()
+        ->assertJsonPath('status', 'voided');
+
+    $deduction = OrderIngredientDeduction::query()->where('order_id', $order['id'])->firstOrFail();
+    expect($deduction->ingredient_id)->toBeNull()
+        ->and($deduction->ingredient_name)->toBe('Milk')
+        ->and($deduction->restored_at)->toBeNull();
 });
 
 /**

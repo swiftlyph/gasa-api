@@ -31,7 +31,7 @@ class AcceptInviteController
 
         return response()->json([
             'token' => $result['token']->plainTextToken,
-            'user' => new UserResource($result['user']->load(['roles', 'merchants'])),
+            'user' => new UserResource($result['user']->load(['roles', 'merchants', 'company'])),
         ]);
     }
 }
