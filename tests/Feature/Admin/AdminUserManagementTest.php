@@ -3,6 +3,9 @@
 use App\Domains\Auth\Models\User;
 use App\Domains\Merchant\Models\Merchant;
 use App\Domains\Merchant\Models\TeamInvitation;
+use App\Domains\Platform\Actions\ChangeUserRoleAction;
+use App\Domains\Platform\Actions\DeactivateUserAction;
+use App\Domains\Platform\Exceptions\LastPlatformAdmin;
 use App\Domains\Platform\Models\AuditLog;
 use App\Domains\Platform\Support\PortalRole;
 use Database\Seeders\RoleSeeder;
@@ -157,10 +160,10 @@ test('GUARD: the last platform admin cannot be demoted (Action level)', function
 
     expect(User::role(PortalRole::PLATFORM_ADMIN)->count())->toBe(1);
 
-    $action = app(\App\Domains\Platform\Actions\ChangeUserRoleAction::class);
+    $action = app(ChangeUserRoleAction::class);
 
     expect(fn () => $action->execute($last, PortalRole::MERCHANT, $this->otherAdmin))
-        ->toThrow(\App\Domains\Platform\Exceptions\LastPlatformAdmin::class);
+        ->toThrow(LastPlatformAdmin::class);
 
     expect($last->fresh()->hasRole(PortalRole::PLATFORM_ADMIN))->toBeTrue();
 });
@@ -171,10 +174,10 @@ test('GUARD: the last platform admin cannot be deactivated (Action level)', func
 
     expect(User::role(PortalRole::PLATFORM_ADMIN)->count())->toBe(1);
 
-    $action = app(\App\Domains\Platform\Actions\DeactivateUserAction::class);
+    $action = app(DeactivateUserAction::class);
 
     expect(fn () => $action->execute($last, $this->otherAdmin))
-        ->toThrow(\App\Domains\Platform\Exceptions\LastPlatformAdmin::class);
+        ->toThrow(LastPlatformAdmin::class);
 
     expect($last->fresh()->trashed())->toBeFalse();
 });

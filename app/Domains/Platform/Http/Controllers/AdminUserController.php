@@ -15,6 +15,7 @@ use App\Domains\Platform\Http\Resources\AdminUserDetailResource;
 use App\Domains\Platform\Http\Resources\AdminUserListResource;
 use App\Domains\Platform\Models\AuditLog;
 use App\Http\Controllers\Controller;
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\AnonymousResourceCollection;
@@ -178,9 +179,9 @@ class AdminUserController extends Controller
      * This user's own admin-action history, drawn from audit_logs the same
      * way AdminMerchantController reads a merchant's status history.
      *
-     * @return \Illuminate\Database\Eloquent\Collection<int, AuditLog>
+     * @return Collection<int, AuditLog>
      */
-    private function historyFor(User $user): \Illuminate\Database\Eloquent\Collection
+    private function historyFor(User $user): Collection
     {
         return AuditLog::query()
             ->with('actor')
